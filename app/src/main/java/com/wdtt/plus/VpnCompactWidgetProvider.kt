@@ -43,9 +43,24 @@ class VpnCompactWidgetProvider : AppWidgetProvider() {
         val waiting = TrustedWifiManager.state.value.waiting
         scope.launch {
             val settingsStore = SettingsStore(context)
-            val activeProfile = settingsStore.activeProfile.first().coerceIn(0, 2)
+            val selectedProfile = settingsStore.activeProfile.first().coerceIn(0, 2)
+            val activeTunnelProfile = TunnelManager.activeTunnelProfile.value
+                ?: settingsStore.activeTunnelProfile.first()
+            val displayedProfile = displayedTunnelProfile(
+                selectedProfile = selectedProfile,
+                activeTunnelProfile = activeTunnelProfile,
+                running = running,
+                trustedWifiWaiting = waiting,
+            )
             val profileNames = settingsStore.profileNames.first()
-            val profileName = vpnProfileDisplayName(activeProfile, profileNames)
+            val profileName = vpnProfileDisplayName(displayedProfile, profileNames)
+            val accessLifecycle =
+                settingsStore.accessLifecycleForProfile(displayedProfile).toUiState()
+            val accessBlocked =
+                accessLifecycle.managed &&
+                    !accessLifecycle.allowConnect &&
+                    !running &&
+                    !waiting
 
             appWidgetIds.forEach { appWidgetId ->
                 val views = RemoteViews(context.packageName, R.layout.vpn_widget_compact)
@@ -56,7 +71,12 @@ class VpnCompactWidgetProvider : AppWidgetProvider() {
                 )
                 views.setTextViewText(
                     R.id.compact_widget_profile,
-                    if (waiting) "Ожидание" else profileName
+                    when {
+                        waiting -> "Ожидание"
+                        accessBlocked ->
+                            accessLifecycle.title.ifBlank { accessLifecycle.fallbackTitle() }
+                        else -> profileName
+                    }
                 )
 
                 val toggleIntent = Intent(context, VpnWidgetProvider::class.java).apply {

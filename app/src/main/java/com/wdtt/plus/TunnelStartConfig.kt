@@ -2,62 +2,141 @@ package com.wdtt.plus
 
 import android.content.Context
 import android.content.Intent
-import kotlinx.coroutines.flow.first
 
-suspend fun buildTunnelParamsFromSettings(context: Context): TunnelParams? {
+internal const val TUNNEL_PROFILE_INDEX_EXTRA = "profile_index"
+internal const val MANAGED_CONFIG_FIRST_START_EXTRA = "managed_config_first_start"
+
+internal data class TransportRecoveryPolicy(
+    val networkSettleDelayMs: Long,
+    val reconnectMinIntervalMs: Long,
+    val processRestartDelayMs: Long,
+    val forceRestart: Boolean,
+)
+
+internal fun transportRecoveryPolicy(
+    managedConfigFirstStart: Boolean,
+): TransportRecoveryPolicy = if (managedConfigFirstStart) {
+    TransportRecoveryPolicy(
+        networkSettleDelayMs = 3_000L,
+        reconnectMinIntervalMs = 8_000L,
+        processRestartDelayMs = 250L,
+        forceRestart = true,
+    )
+} else {
+    TransportRecoveryPolicy(
+        networkSettleDelayMs = 15_000L,
+        reconnectMinIntervalMs = 2 * 60_000L,
+        processRestartDelayMs = 2_500L,
+        forceRestart = false,
+    )
+}
+
+internal enum class TunnelToggleAction {
+    START,
+    STOP,
+    REQUEST_VPN_PERMISSION,
+}
+
+internal fun tunnelToggleAction(
+    running: Boolean,
+    trustedWifiWaiting: Boolean,
+    vpnPermissionRequired: Boolean,
+): TunnelToggleAction = when {
+    running || trustedWifiWaiting -> TunnelToggleAction.STOP
+    vpnPermissionRequired -> TunnelToggleAction.REQUEST_VPN_PERMISSION
+    else -> TunnelToggleAction.START
+}
+
+internal fun displayedTunnelProfile(
+    selectedProfile: Int,
+    activeTunnelProfile: Int?,
+    running: Boolean,
+    trustedWifiWaiting: Boolean,
+): Int = if (running || trustedWifiWaiting) {
+    activeTunnelProfile ?: selectedProfile
+} else {
+    selectedProfile
+}.coerceIn(0, 2)
+
+internal fun shouldUseManagedConfigFirstStart(
+    remoteManaged: Boolean,
+    profileMaxWorkers: Int,
+): Boolean = remoteManaged && profileMaxWorkers == TUNNEL_WORKERS_PER_GROUP
+
+suspend fun buildTunnelParamsFromSettings(
+    context: Context,
+    profileIndex: Int? = null,
+): TunnelParams? {
     val store = SettingsStore(context.applicationContext)
-    val linkMode = store.wdttLinkMode.first()
-    val workersPerHash = store.workersPerHash.first()
-    val sni = store.sni.first()
-    val protocol = store.protocol.first()
-    val vkCallsPreflight = store.vkCallsPreflight.first()
-    val captchaMode = sanitizeTunnelCaptchaMode(store.captchaMode.first())
-    val captchaSolveMethod = store.captchaSolveMethod.first()
-    val fingerprint = store.selectedFingerprint.first()
-    val clientIds = store.activeClientIds.first()
+    val saved = store.tunnelProfileSnapshot(profileIndex)
+    return buildTunnelParams(saved)
+}
 
-    return if (linkMode) {
-        val parts = WdttDeepLink.validate(store.wdttLink.first()).parts ?: return null
+internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
+    val workersPerHash = normalizeTunnelWorkerCount(
+        saved.workersPerHash,
+        saved.profileMaxWorkers
+    )
+    val managedConfigFirstStart = shouldUseManagedConfigFirstStart(
+        remoteManaged = saved.remoteManaged,
+        profileMaxWorkers = saved.profileMaxWorkers,
+    )
+    val linkParts = saved.link
+        .takeIf { saved.linkMode }
+        ?.let { WdttDeepLink.validate(it).parts }
+
+    return if (linkParts != null) {
         TunnelParams(
-            peer = "${parts.host}:${parts.dtlsPort}",
-            vkHashes = parts.hashes,
+            peer = "${linkParts.host}:${linkParts.dtlsPort}",
+            vkHashes = linkParts.hashes,
             secondaryVkHash = "",
             workersPerHash = workersPerHash,
-            port = parts.localPort,
-            sni = sni,
-            connectionPassword = parts.password,
-            protocol = protocol,
-            vkCallsPreflight = vkCallsPreflight,
-            captchaMode = captchaMode,
-            captchaSolveMethod = captchaSolveMethod,
-            fingerprint = fingerprint,
-            clientIds = clientIds
+            port = linkParts.localPort,
+            sni = saved.sni,
+            connectionPassword = linkParts.password,
+            protocol = saved.protocol,
+            vkCallsPreflight = saved.vkCallsPreflight,
+            captchaMode = sanitizeTunnelCaptchaMode(saved.captchaMode),
+            captchaSolveMethod = saved.captchaSolveMethod,
+            fingerprint = saved.fingerprint,
+            clientIds = saved.clientIds,
+            customVkCredentialsEnabled = saved.customVkCredentialsEnabled,
+            customVkClientId = saved.customVkClientId,
+            customVkClientSecret = saved.customVkClientSecret,
+            profileMaxWorkers = saved.profileMaxWorkers,
+            managedConfigFirstStart = managedConfigFirstStart,
+            profileIndex = saved.profileIndex,
         )
     } else {
-        val basePeer = store.peer.first().trim()
-        val hashes = store.vkHashes.first().trim()
-        val password = store.connectionPassword.first()
+        val basePeer = saved.peer.trim()
+        val hashes = saved.vkHashes.trim()
+        val password = saved.connectionPassword
         if (basePeer.isBlank() || hashes.isBlank() || password.isBlank()) return null
 
-        val manualPortsEnabled = store.manualPortsEnabled.first()
-        val serverDtlsPort = if (manualPortsEnabled) store.serverDtlsPort.first() else 56000
-        val localPort = if (manualPortsEnabled) store.listenPort.first() else 9000
+        val serverDtlsPort = if (saved.manualPortsEnabled) saved.serverDtlsPort else 56000
+        val localPort = if (saved.manualPortsEnabled) saved.listenPort else 9000
         val peerWithPort = if (basePeer.contains(":")) basePeer else "$basePeer:$serverDtlsPort"
 
         TunnelParams(
             peer = peerWithPort,
             vkHashes = hashes,
-            secondaryVkHash = store.secondaryVkHash.first(),
+            secondaryVkHash = saved.secondaryVkHash,
             workersPerHash = workersPerHash,
             port = localPort,
-            sni = sni,
+            sni = saved.sni,
             connectionPassword = password,
-            protocol = protocol,
-            vkCallsPreflight = vkCallsPreflight,
-            captchaMode = captchaMode,
-            captchaSolveMethod = captchaSolveMethod,
-            fingerprint = fingerprint,
-            clientIds = clientIds
+            protocol = saved.protocol,
+            vkCallsPreflight = saved.vkCallsPreflight,
+            captchaMode = sanitizeTunnelCaptchaMode(saved.captchaMode),
+            captchaSolveMethod = saved.captchaSolveMethod,
+            fingerprint = saved.fingerprint,
+            clientIds = saved.clientIds,
+            customVkCredentialsEnabled = saved.customVkCredentialsEnabled,
+            customVkClientId = saved.customVkClientId,
+            customVkClientSecret = saved.customVkClientSecret,
+            profileMaxWorkers = saved.profileMaxWorkers,
+            managedConfigFirstStart = managedConfigFirstStart,
+            profileIndex = saved.profileIndex,
         )
     }
 }
@@ -79,6 +158,12 @@ suspend fun buildTunnelStartIntentFromSettings(context: Context): Intent? {
         putExtra("captcha_solve_method", params.captchaSolveMethod)
         putExtra("fingerprint", params.fingerprint)
         putExtra("client_ids", params.clientIds)
+        putExtra("custom_vk_credentials_enabled", params.customVkCredentialsEnabled)
+        putExtra("custom_vk_client_id", params.customVkClientId)
+        putExtra("custom_vk_client_secret", params.customVkClientSecret)
+        putExtra("profile_max_workers", params.profileMaxWorkers)
+        putExtra(MANAGED_CONFIG_FIRST_START_EXTRA, params.managedConfigFirstStart)
+        putExtra(TUNNEL_PROFILE_INDEX_EXTRA, params.profileIndex)
     }
 }
 

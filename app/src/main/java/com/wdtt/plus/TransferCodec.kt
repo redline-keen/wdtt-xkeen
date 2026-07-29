@@ -45,6 +45,12 @@ object WdttTransferCodec {
         normalizeVpnProfileName(parts.profileName)
             .takeIf { it.isNotBlank() }
             ?.let { values["name"] = it }
+        parts.maxWorkers
+            .takeIf {
+                it in TUNNEL_WORKERS_PER_GROUP..APP_MAX_WORKERS &&
+                    it % TUNNEL_WORKERS_PER_GROUP == 0
+            }
+            ?.let { values["max_workers"] = it.toString() }
         return "wdtt://connect?" + values.entries.joinToString("&") { (key, value) ->
             "${encode(key)}=${encode(value)}"
         }
@@ -66,6 +72,12 @@ object WdttTransferCodec {
             }
             .toMap()
         if (values["v"] != "1") return null
+        val maxWorkers = values["max_workers"]?.takeIf { it.isNotBlank() }?.let { raw ->
+            raw.toIntOrNull()?.takeIf {
+                it in TUNNEL_WORKERS_PER_GROUP..APP_MAX_WORKERS &&
+                    it % TUNNEL_WORKERS_PER_GROUP == 0
+            } ?: return null
+        } ?: 0
         return WdttLinkParts(
             host = values["host"].orEmpty(),
             dtlsPort = values["dtls"]?.toIntOrNull() ?: return null,
@@ -73,7 +85,8 @@ object WdttTransferCodec {
             localPort = values["local"]?.toIntOrNull() ?: return null,
             password = values["password"].orEmpty(),
             hashes = values["hashes"].orEmpty(),
-            profileName = values["name"].orEmpty()
+            profileName = values["name"].orEmpty(),
+            maxWorkers = maxWorkers
         )
     }
 

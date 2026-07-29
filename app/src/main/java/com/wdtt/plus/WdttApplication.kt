@@ -37,6 +37,12 @@ class WdttApplication : Application() {
         }
 
         val settingsStore = SettingsStore(this)
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            RemoteActionCatalogGateway.fetch(force = true)
+        }
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            AccessLifecycleCoordinator.refreshAllIfStale(this@WdttApplication)
+        }
 
         // Реактивно обновляем виджеты при изменении туннеля, активного профиля или его названия.
         CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
@@ -45,8 +51,9 @@ class WdttApplication : Application() {
                     TunnelManager.running,
                     TrustedWifiManager.state,
                     settingsStore.activeProfile,
-                    settingsStore.profileNames
-                ) { _, _, _, _ -> Unit }.collect {
+                    settingsStore.profileNames,
+                    settingsStore.activeAccessLifecycle
+                ) { _, _, _, _, _ -> Unit }.collect {
                     VpnWidgetProvider.updateAllWidgets(this@WdttApplication)
                 }
             } catch (e: Exception) {

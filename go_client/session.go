@@ -27,10 +27,19 @@ const (
 	socketBufSize                = 625 * 1024
 	keepaliveByte                = 0xFF // DTLS-level keepalive marker
 	keepaliveInterval            = 15 * time.Second
+	defaultHandshakeTimeout      = 20 * time.Second
+	wrapHandshakeTimeout         = 8 * time.Second
 )
 
 // Handshake semaphore: limit to 3 concurrent DTLS handshakes
 var handshakeSem = make(chan struct{}, 3)
+
+func dtlsHandshakeTimeout(useWrap bool) time.Duration {
+	if useWrap {
+		return wrapHandshakeTimeout
+	}
+	return defaultHandshakeTimeout
+}
 
 // NullLoggerFactory подавляет логи pion
 type NullLoggerFactory struct{}
@@ -55,53 +64,57 @@ type connectedUDPConn struct{ *net.UDPConn }
 
 func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) { return c.Write(p) }
 
-func RunSession(
+func openTURNAllocation(
 	ctx context.Context,
-	tp *TurnParams,
+	endpoint turnEndpoint,
 	peer *net.UDPAddr,
-	d *Dispatcher,
-	localPort string,
-	getConfig bool,
-	configCh chan<- string,
-	sessionID int,
 	creds *Credentials,
-	deviceID, password, deviceInfo string,
-	stats *Stats,
-) (bool, error) {
-	configDelivered := false
+	sessionID int,
+) (*turn.Client, net.PacketConn, error) {
+	turnAddr := endpoint.address()
 
-	if len(creds.TurnURLs) == 0 {
-		return false, fmt.Errorf("нет TURN URL в учетных данных")
+	var turnConn net.PacketConn
+	switch endpoint.Transport {
+	case turnTransportUDP:
+		resolved, err := net.ResolveUDPAddr("udp", turnAddr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("TURN UDP резолв %s: %w", turnAddr, err)
+		}
+		c, err := net.DialUDP("udp", nil, resolved)
+		if err != nil {
+			return nil, nil, fmt.Errorf("TURN UDP подключение %s: %w", turnAddr, err)
+		}
+		_ = c.SetReadBuffer(socketBufSize)
+		_ = c.SetWriteBuffer(socketBufSize)
+		turnConn = &connectedUDPConn{c}
+	case turnTransportTCP:
+		dialCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		defer cancel()
+		dialer := &net.Dialer{Timeout: 6 * time.Second, KeepAlive: 30 * time.Second}
+		conn, err := dialer.DialContext(dialCtx, "tcp", turnAddr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("TURN TCP подключение %s: %w", turnAddr, err)
+		}
+		turnConn = turn.NewSTUNConn(conn)
+	case turnTransportTLS:
+		dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+		if net.ParseIP(endpoint.Host) == nil {
+			tlsConfig.ServerName = endpoint.Host
+		}
+		dialer := &tls.Dialer{
+			NetDialer: &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second},
+			Config:    tlsConfig,
+		}
+		conn, err := dialer.DialContext(dialCtx, "tcp", turnAddr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("TURN TLS подключение %s: %w", turnAddr, err)
+		}
+		turnConn = turn.NewSTUNConn(conn)
+	default:
+		return nil, nil, fmt.Errorf("неподдерживаемый TURN transport: %s", endpoint.Transport)
 	}
-	selectedURL := creds.TurnURLs[sessionID%len(creds.TurnURLs)]
-
-	urlhost, urlport, err := net.SplitHostPort(selectedURL)
-	if err != nil {
-		return false, fmt.Errorf("разбор TURN URL %q: %w", selectedURL, err)
-	}
-	if tp.Host != "" {
-		urlhost = tp.Host
-	}
-	if tp.Port != "" {
-		urlport = tp.Port
-	}
-	turnAddr := net.JoinHostPort(urlhost, urlport)
-
-	// Транспорт: всегда UDP
-	resolved, err := net.ResolveUDPAddr("udp", turnAddr)
-	if err != nil {
-		return false, fmt.Errorf("резолв TURN: %w", err)
-	}
-	c, err := net.DialUDP("udp", nil, resolved)
-	if err != nil {
-		return false, fmt.Errorf("подключение TURN UDP: %w", err)
-	}
-	defer c.Close()
-	_ = c.SetReadBuffer(socketBufSize)
-	_ = c.SetWriteBuffer(socketBufSize)
-	var turnConn net.PacketConn = &connectedUDPConn{c}
-
-	log.Printf("[СЕССИЯ #%d] TURN UDP (%s)", sessionID, turnAddr)
 
 	// RequestedAddressFamily
 	var addrFamily turn.RequestedAddressFamily
@@ -111,7 +124,6 @@ func RunSession(
 		addrFamily = turn.RequestedAddressFamilyIPv6
 	}
 
-	// TURN Client (pion/turn/v5)
 	tc, err := turn.NewClient(&turn.ClientConfig{
 		STUNServerAddr:         turnAddr,
 		TURNServerAddr:         turnAddr,
@@ -122,12 +134,13 @@ func RunSession(
 		LoggerFactory:          &NullLoggerFactory{},
 	})
 	if err != nil {
-		return false, fmt.Errorf("TURN клиент: %w", err)
+		_ = turnConn.Close()
+		return nil, nil, fmt.Errorf("TURN %s клиент %s: %w", endpoint.label(), turnAddr, err)
 	}
-	defer tc.Close()
 
 	if err = tc.Listen(); err != nil {
-		return false, fmt.Errorf("TURN Listen: %w", err)
+		tc.Close()
+		return nil, nil, fmt.Errorf("TURN %s Listen %s: %w", endpoint.label(), turnAddr, err)
 	}
 
 	relay, err := tc.Allocate()
@@ -137,16 +150,88 @@ func RunSession(
 		}
 		errStr := err.Error()
 		if strings.Contains(errStr, "Quota") || strings.Contains(errStr, "486") {
-			return false, fmt.Errorf("TURN квота: %w", err)
+			tc.Close()
+			return nil, nil, fmt.Errorf("TURN квота: %w", err)
 		}
-		return false, fmt.Errorf("TURN Allocate: %w", err)
+		tc.Close()
+		return nil, nil, fmt.Errorf("TURN %s Allocate %s: %w", endpoint.label(), turnAddr, err)
 	}
+
+	return tc, relay, nil
+}
+
+func isCredentialTURNError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "turn квота") ||
+		strings.Contains(text, "turn allocate auth") ||
+		strings.Contains(text, "invalid credential") ||
+		strings.Contains(text, "stale nonce") ||
+		strings.Contains(text, "allocation mismatch") ||
+		strings.Contains(text, "attribute not found") ||
+		strings.Contains(text, "error 508") ||
+		strings.Contains(text, "quota")
+}
+
+func RunSession(
+	ctx context.Context,
+	tp *TurnParams,
+	peer *net.UDPAddr,
+	d *Dispatcher,
+	localPort string,
+	getConfig bool,
+	configCh chan<- string,
+	requireConfig bool,
+	onConfigDelivered func(),
+	sessionID int,
+	creds *Credentials,
+	deviceID, password, deviceInfo, transportSession string,
+	stats *Stats,
+) (bool, error) {
+	configDelivered := false
+
+	if len(creds.TurnURLs) == 0 {
+		return false, fmt.Errorf("нет TURN URL в учетных данных")
+	}
+	candidates := sessionTURNCandidates(creds.TurnURLs, sessionID, tp)
+	if len(candidates) == 0 {
+		return false, fmt.Errorf("нет пригодных TURN URL в учетных данных")
+	}
+
+	var tc *turn.Client
+	var relay net.PacketConn
+	var selectedEndpoint turnEndpoint
+	var lastTURNErr error
+	var err error
+	for idx, candidate := range candidates {
+		if idx == 0 {
+			log.Printf("[СЕССИЯ #%d] TURN %s (%s)", sessionID, candidate.label(), candidate.address())
+		} else {
+			log.Printf("[СЕССИЯ #%d] [TURN] Резервный путь %s (%s) после ошибки: %v", sessionID, candidate.label(), candidate.address(), lastTURNErr)
+		}
+
+		tc, relay, err = openTURNAllocation(ctx, candidate, peer, creds, sessionID)
+		if err == nil {
+			selectedEndpoint = candidate
+			break
+		}
+		lastTURNErr = err
+		if isCredentialTURNError(err) {
+			return false, err
+		}
+	}
+	if lastTURNErr != nil && relay == nil {
+		return false, lastTURNErr
+	}
+	defer tc.Close()
 	defer relay.Close()
 
 	// Reset error count on successful allocation
 	getStreamCache(creds.CacheStreamID).errorCount.Store(0)
 
-	log.Printf("[СЕССИЯ #%d] Relay: %s", sessionID, relay.LocalAddr())
+	log.Printf("[СЕССИЯ #%d] Relay: %s через TURN %s", sessionID, relay.LocalAddr(), selectedEndpoint.label())
 
 	// Pipe для DTLS ↔ TURN relay
 	pipeA, pipeB := connutil.AsyncPacketPipe()
@@ -279,7 +364,7 @@ func RunSession(
 	}
 	defer dtlsConn.Close()
 
-	hctx, hcancel := context.WithTimeout(sessCtx, 20*time.Second)
+	hctx, hcancel := context.WithTimeout(sessCtx, dtlsHandshakeTimeout(useWrap))
 	log.Printf("[ВОРКЕР #%d] [DTLS] Рукопожатие (Handshake)...", sessionID)
 	err = dtlsConn.HandshakeContext(hctx)
 	hcancel()
@@ -289,12 +374,20 @@ func RunSession(
 		if useWrap {
 			errStr := strings.ToLower(err.Error())
 			if strings.Contains(errStr, "deadline") || strings.Contains(errStr, "timeout") {
-				return false, fmt.Errorf("WRAP_AUTH_TIMEOUT: DTLS timeout, пароль/WRAP не подтверждён")
+				return false, fmt.Errorf("WRAP_AUTH_TIMEOUT: отдельный DTLS-канал не ответил вовремя")
 			}
 		}
-		return false, fmt.Errorf("DTLS хендшейк: %w", err)
+		return false, fmt.Errorf("DTLS хендшейк до VPS %s не прошёл: %w", peer.String(), err)
 	}
 	log.Printf("[ВОРКЕР #%d] [DTLS] Соединение установлено ✓", sessionID)
+
+	// Отмена должна прерывать и стартовый GETCONF. Раньше deadline
+	// устанавливался только после получения конфига, поэтому остановка во время
+	// подключения могла ждать принудительного завершения процесса на Android.
+	stopDTLS := context.AfterFunc(sessCtx, func() {
+		_ = dtlsConn.SetDeadline(time.Now())
+	})
+	defer stopDTLS()
 
 	stats.ActiveConnections.Add(1)
 	globalActiveConnections.Add(1)
@@ -305,11 +398,25 @@ func RunSession(
 
 	// Запрос конфига
 	if getConfig && configCh != nil {
-		conf, confErr := RequestConfig(dtlsConn, localPort, deviceID, password, deviceInfo)
+		conf, confErr := RequestConfig(
+			sessCtx,
+			dtlsConn,
+			localPort,
+			deviceID,
+			password,
+			deviceInfo,
+			transportSession,
+		)
 		if confErr != nil {
+			if _, limited := workerPolicyLimit(confErr); limited {
+				return false, confErr
+			}
 			errStr := confErr.Error()
 			if strings.Contains(errStr, "FATAL_AUTH") {
 				return false, confErr
+			}
+			if requireConfig {
+				return false, fmt.Errorf("регистрация нового подключения: %w", confErr)
 			}
 			log.Printf("[ВОРКЕР #%d] Ошибка конфига: %v", sessionID, confErr)
 		} else if conf != "" {
@@ -321,7 +428,13 @@ func RunSession(
 				configDelivered = true
 				log.Printf("[ВОРКЕР #%d] Конфиг уже был доставлен другим воркером", sessionID)
 			}
+			if onConfigDelivered != nil {
+				onConfigDelivered()
+			}
 		} else {
+			if requireConfig {
+				return false, fmt.Errorf("сервер ещё не выдал WireGuard-конфиг")
+			}
 			log.Printf("[ВОРКЕР #%d] Сервер ещё не выдал WireGuard-конфиг, повторим позже", sessionID)
 		}
 	}
@@ -340,15 +453,11 @@ func RunSession(
 	lastServerRxAt.Store(time.Now().UnixNano())
 	var lastUserTrafficAt atomic.Int64
 	var keepalivePongSeen atomic.Int32
+	policyLimitCh := make(chan int, 1)
 
 	// Proxy DTLS ↔ Dispatcher
 	var proxyWg sync.WaitGroup
 	proxyWg.Add(4) // writer + reader + keepalive + health monitor
-
-	stopDTLS := context.AfterFunc(sessCtx, func() {
-		_ = dtlsConn.SetDeadline(time.Now())
-	})
-	defer stopDTLS()
 
 	// DTLS Keepalive: prevents TURN allocation timeout and DTLS idle disconnect
 	go func() {
@@ -448,6 +557,17 @@ func RunSession(
 
 			lastServerRxAt.Store(time.Now().UnixNano())
 
+			if _, policyErr := parseConfigResponse(string(pkt[:n])); policyErr != nil {
+				if maxWorkers, limited := workerPolicyLimit(policyErr); limited {
+					select {
+					case policyLimitCh <- maxWorkers:
+					default:
+					}
+					putPktBuf(pkt)
+					return
+				}
+			}
+
 			// Skip keepalive pong from server
 			if n == 1 && pkt[0] == keepaliveByte {
 				keepalivePongSeen.Store(1)
@@ -472,5 +592,10 @@ func RunSession(
 	_ = pipeA.Close()
 	_ = pipeB.Close()
 	log.Printf("[СЕССИЯ #%d] Завершена", sessionID)
+	select {
+	case maxWorkers := <-policyLimitCh:
+		return configDelivered, &workerPolicyLimitError{maxWorkers: maxWorkers}
+	default:
+	}
 	return configDelivered, nil
 }

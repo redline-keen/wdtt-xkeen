@@ -21,7 +21,7 @@ data class ServerAdminProfileInfo(
     val vkHashes: String = "",
     val secondaryVkHash: String = "",
     val profileName: String = "",
-    val workersPerHash: Int = 16,
+    val workersPerHash: Int = 18,
     val protocol: String = "udp",
     val listenPort: Int = 9000,
     val sni: String = "",
@@ -42,6 +42,7 @@ data class ServerAdminState(
     val maxPasswords: Int,
     val passwordCount: Int,
     val deviceCount: Int,
+    val ownerDeviceCount: Int,
     val expiredCount: Int,
     val orphanDeviceCount: Int,
     val orphanDevices: List<ServerDeviceInfo>,
@@ -393,6 +394,13 @@ object ServerAdminClient {
             maxPasswords = server.optInt("max_passwords", 50),
             passwordCount = server.optInt("password_count", clients.size),
             deviceCount = server.optInt("device_count", 0),
+            ownerDeviceCount = server.optInt(
+                "owner_device_count",
+                server.optJSONObject("admin_profile")
+                    ?.optJSONArray("device_ids")
+                    ?.length()
+                    ?: 0
+            ),
             expiredCount = server.optInt("expired_count", 0),
             orphanDeviceCount = server.optInt("orphan_device_count", 0),
             orphanDevices = buildList {
@@ -423,7 +431,7 @@ object ServerAdminClient {
             vkHashes = json?.optString("vk_hashes", "").orEmpty().trim(),
             secondaryVkHash = json?.optString("secondary_vk_hash", "").orEmpty().trim(),
             profileName = vpnProfileRestorableName(json?.optString("profile_name", "").orEmpty()),
-            workersPerHash = (json?.optInt("workers_per_hash", 16) ?: 16).coerceIn(1, 128),
+            workersPerHash = (json?.optInt("workers_per_hash", 18) ?: 18).coerceIn(1, 128),
             protocol = json?.optString("protocol", "udp").orEmpty().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
             listenPort = listenPort,
             sni = json?.optString("sni", "").orEmpty().trim(),
@@ -565,7 +573,7 @@ internal fun buildAdminProfilePatchArgs(profile: ServerAdminProfileInfo): List<S
         add("--profile-name")
         add(it)
     }
-    profile.workersPerHash.coerceIn(1, 128).takeIf { it != 16 }?.let {
+    profile.workersPerHash.coerceIn(1, 128).takeIf { it != 18 }?.let {
         add("--workers")
         add(it.toString())
     }
@@ -655,7 +663,8 @@ fun buildServerConnectionLink(
     publicHost: String,
     profileName: String = ""
 ): String? {
-    if (hashes.isBlank() || password.isBlank()) return null
+    if (password.isBlank()) return null
+    val normalizedHashes = VkJoinLink.normalizeHashes(hashes) ?: return null
     val parts = ports.split(",").map { it.trim().toIntOrNull() }
     if (parts.size != 3) return null
     val dtls = parts[0]?.takeIf { it in 1..65535 } ?: return null
@@ -670,7 +679,7 @@ fun buildServerConnectionLink(
             wgPort = wg,
             localPort = local,
             password = password,
-            hashes = hashes,
+            hashes = normalizedHashes,
             profileName = profileName
         )
     )

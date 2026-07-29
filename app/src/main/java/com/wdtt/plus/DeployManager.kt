@@ -17,6 +17,7 @@ object DeployManager {
     val deployProgress = MutableStateFlow(0f)
     val currentStep = MutableStateFlow("")
     val lastResult = MutableStateFlow("") // "success", "error: ...", ""
+    val installedServerVersion = MutableStateFlow("")
 
     @Volatile
     var activeSession: com.jcraft.jsch.Session? = null
@@ -59,6 +60,7 @@ object DeployManager {
         deployProgress.value = 0f
         currentStep.value = "Инициализация..."
         lastResult.value = ""
+        installedServerVersion.value = ""
     }
 
     fun stopDeploy(result: String = "") {

@@ -1,11 +1,52 @@
+import java.io.File
 import java.util.Properties
+import org.gradle.api.DefaultTask
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.TaskAction
+
+abstract class VerifyReleaseConfiguration : DefaultTask() {
+    @get:Input
+    abstract val keystorePath: Property<String>
+
+    @get:Input
+    abstract val credentialsComplete: Property<Boolean>
+
+    @get:Input
+    abstract val productionDomain: Property<Boolean>
+
+    @get:Input
+    abstract val releaseAuditRequired: Property<Boolean>
+
+    @get:Input
+    abstract val releaseAuditPath: Property<String>
+
+    @TaskAction
+    fun verify() {
+        require(File(keystorePath.get()).isFile) {
+            "Release signing keystore is required."
+        }
+        require(credentialsComplete.get()) {
+            "Complete release signing credentials are required."
+        }
+        require(productionDomain.get()) {
+            "Release builds must use the production WDTT Plus domain."
+        }
+        require(
+            !releaseAuditRequired.get() ||
+                File(releaseAuditPath.get()).let { it.isFile && it.canExecute() }
+        ) {
+            "The local release audit is required but unavailable."
+        }
+    }
+}
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = "11"
+val appVersionName = "12"
 val releaseApkBaseName = "WDTT-Plus"
 
 val localProperties = Properties()
@@ -14,17 +55,47 @@ if (localPropertiesFile.exists()) {
     localProperties.load(localPropertiesFile.inputStream())
 }
 
+fun buildConfigString(value: String): String =
+    "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+val wdttPlusDomain = localProperties.getProperty("WDTT_PLUS_DOMAIN")
+    ?.trim()
+    ?.trimEnd('/')
+    ?.takeIf { it.isNotBlank() }
+    ?: "wdttplus.ru"
+val remoteActionPreview = providers.gradleProperty("REMOTE_ACTION_PREVIEW")
+    .orNull
+    ?.toBooleanStrictOrNull()
+    ?: false
+val releaseKeystoreProperty = localProperties.getProperty("KEYSTORE_FILE")
+    ?.trim()
+    .orEmpty()
+val releaseKeystoreFile = when {
+    releaseKeystoreProperty.startsWith("..") ->
+        rootDir.resolve(releaseKeystoreProperty.removePrefix("../"))
+    releaseKeystoreProperty.isNotBlank() -> file(releaseKeystoreProperty)
+    else -> null
+}
+val releaseCredentialsComplete =
+    listOf("KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD")
+        .all { !localProperties.getProperty(it).isNullOrBlank() }
+val localReleaseAuditRequired = rootProject.file("release.keystore").exists()
+val localReleaseAudit = rootProject.file("release-audit")
+
 android {
     namespace = "com.wdtt.plus"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.wdtt.plus"
         minSdk = 28
         targetSdk = 35
-        versionCode = 11
+        versionCode = 12
         versionName = appVersionName
-        buildConfigField("String", "MOD_RELEASE_DATE", "\"07.07.2026\"")
+        buildConfigField("String", "MOD_RELEASE_DATE", "\"29.07.2026\"")
+        buildConfigField("String", "WDTT_PLUS_DOMAIN", buildConfigString(wdttPlusDomain))
+        manifestPlaceholders["wdttPlusDomain"] = wdttPlusDomain
+        manifestPlaceholders["appLabel"] = "WDTT Plus"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -47,23 +118,11 @@ android {
 
     signingConfigs {
         create("release") {
-            val keyFile = localProperties.getProperty("KEYSTORE_FILE")
-            if (keyFile != null) {
-                // Резолвим путь: если начинается с "..", берём от корня проекта
-                val resolvedFile = if (keyFile.startsWith("..")) {
-                    // ../release.keystore -> корень проекта / release.keystore
-                    file(rootDir.resolve(keyFile.substring(3)))
-                } else {
-                    file(keyFile)
-                }
-                if (resolvedFile.exists()) {
-                    storeFile = resolvedFile
-                    storePassword = localProperties.getProperty("KEYSTORE_PASSWORD")
-                    keyAlias = localProperties.getProperty("KEY_ALIAS")
-                    keyPassword = localProperties.getProperty("KEY_PASSWORD")
-                } else {
-                    println("WARNING: Keystore file not found: $keyFile (resolved: ${resolvedFile.absolutePath})")
-                }
+            if (releaseKeystoreFile?.isFile == true) {
+                storeFile = releaseKeystoreFile
+                storePassword = localProperties.getProperty("KEYSTORE_PASSWORD")
+                keyAlias = localProperties.getProperty("KEY_ALIAS")
+                keyPassword = localProperties.getProperty("KEY_PASSWORD")
             }
             enableV1Signing = true
             enableV2Signing = true
@@ -72,27 +131,30 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            applicationIdSuffix = ".preview"
+            versionNameSuffix = "-preview"
+            manifestPlaceholders["appLabel"] = "WDTT Plus Preview"
+            buildConfigField("boolean", "REMOTE_ACTION_PREVIEW", remoteActionPreview.toString())
+        }
         getByName("release") {
+            buildConfigField("boolean", "REMOTE_ACTION_PREVIEW", "false")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            val keyFile = localProperties.getProperty("KEYSTORE_FILE")
-            val resolvedFile = if (keyFile != null && keyFile.startsWith("..")) {
-                file(rootDir.resolve(keyFile.substring(3)))
-            } else if (keyFile != null) {
-                file(keyFile)
-            } else null
-            
-            if (resolvedFile != null && resolvedFile.exists()) {
+            if (releaseKeystoreFile?.isFile == true) {
                 signingConfig = signingConfigs.getByName("release")
-                println("✅ Signing config applied: ${resolvedFile.absolutePath}")
-            } else {
-                println("⚠️ WARNING: Keystore not found, using debug signing")
-                println("   Looked for: ${resolvedFile?.absolutePath ?: keyFile}")
             }
+        }
+        create("preview") {
+            initWith(getByName("release"))
+            versionNameSuffix = "-preview-ui2"
+            manifestPlaceholders["appLabel"] = "WDTT Plus Preview"
+            buildConfigField("boolean", "REMOTE_ACTION_PREVIEW", "true")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
@@ -113,8 +175,8 @@ android {
     }
 
     lint {
-        checkReleaseBuilds = false
-        abortOnError = false
+        checkReleaseBuilds = true
+        abortOnError = true
     }
 
     compileOptions {
@@ -127,6 +189,19 @@ android {
             jniLibs.setSrcDirs(listOf("src/main/jniLibs"))
         }
     }
+}
+
+val verifyReleaseConfiguration =
+    tasks.register<VerifyReleaseConfiguration>("verifyReleaseConfiguration") {
+        keystorePath.set(releaseKeystoreFile?.absolutePath.orEmpty())
+        credentialsComplete.set(releaseCredentialsComplete)
+        productionDomain.set(wdttPlusDomain == "wdttplus.ru")
+        releaseAuditRequired.set(localReleaseAuditRequired)
+        releaseAuditPath.set(localReleaseAudit.absolutePath)
+    }
+
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    dependsOn(verifyReleaseConfiguration)
 }
 
 val goClientDir = rootProject.layout.projectDirectory.dir("go_client")
@@ -174,11 +249,11 @@ tasks.register<Exec>("buildNativeClient") {
                 mkdir -p "${'$'}jni_dir/${'$'}abi"
                 if [ -n "${'$'}goarm" ]; then
                     env GOOS=android GOARCH="${'$'}goarch" GOARM="${'$'}goarm" CGO_ENABLED=1 CC="${'$'}ndk_bin/${'$'}cc" \
-                        go build -trimpath -ldflags="-s -w -checklinkname=0" -buildmode=pie \
+                        go build -buildvcs=false -trimpath -ldflags="-s -w -checklinkname=0" -buildmode=pie \
                         -o "${'$'}jni_dir/${'$'}abi/libclient.so" .
                 else
                     env GOOS=android GOARCH="${'$'}goarch" CGO_ENABLED=1 CC="${'$'}ndk_bin/${'$'}cc" \
-                        go build -trimpath -ldflags="-s -w -checklinkname=0" -buildmode=pie \
+                        go build -buildvcs=false -trimpath -ldflags="-s -w -checklinkname=0" -buildmode=pie \
                         -o "${'$'}jni_dir/${'$'}abi/libclient.so" .
                 fi
             }
@@ -220,7 +295,7 @@ tasks.register<Exec>("buildServerAsset") {
             out="${'$'}1"
             mkdir -p "$(dirname "${'$'}out")"
             env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-                go build -trimpath -ldflags="-s -w" -o "${'$'}out" .
+                go build -buildvcs=false -trimpath -ldflags="-s -w" -o "${'$'}out" .
         """.trimIndent(),
         "bash",
         serverAssetFile.asFile.absolutePath
@@ -233,9 +308,17 @@ tasks.matching {
     dependsOn("buildServerAsset")
 }
 
-tasks.register<Exec>("nameReleaseApks") {
+// Lint reads the source asset/native folders directly. During assembleRelease
+// the generators are in the same task graph, so make their order explicit
+// without forcing public source-only lint runs to build private local artifacts.
+tasks.matching { it.name.contains("Lint", ignoreCase = true) }.configureEach {
+    mustRunAfter("buildServerAsset", "buildNativeClient")
+}
+
+val nameReleaseApks = tasks.register<Exec>("nameReleaseApks") {
     group = "build"
     description = "Copies release APKs to filenames with app name and version."
+    dependsOn("packageRelease")
 
     val releaseDir = layout.buildDirectory.dir("outputs/apk/release")
     val namedReleaseDir = layout.buildDirectory.dir("outputs/apk/release/named")
@@ -266,8 +349,28 @@ tasks.register<Exec>("nameReleaseApks") {
     )
 }
 
+val auditReleaseApks = tasks.register<Exec>("auditReleaseApks") {
+    group = "verification"
+    description = "Runs the configured local source and APK publication audit."
+    dependsOn(nameReleaseApks)
+    enabled = localReleaseAuditRequired
+
+    val namedReleaseDir = layout.buildDirectory.dir("outputs/apk/release/named").get().asFile
+    val variants = listOf("universal", "arm64-v8a", "armeabi-v7a", "x86_64")
+    val releaseApks = variants.map { abi ->
+        namedReleaseDir.resolve("$releaseApkBaseName-v$appVersionName-$abi-release.apk")
+    }
+    inputs.files(releaseApks)
+    commandLine(
+        listOf(
+            localReleaseAudit.absolutePath,
+            rootDir.absolutePath,
+        ) + releaseApks.map(File::getAbsolutePath)
+    )
+}
+
 tasks.matching { it.name == "assembleRelease" }.configureEach {
-    finalizedBy("nameReleaseApks")
+    finalizedBy(auditReleaseApks)
 }
 
 dependencies {
@@ -281,6 +384,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.browser:browser:1.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")

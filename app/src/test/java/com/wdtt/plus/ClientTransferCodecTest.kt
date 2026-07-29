@@ -27,6 +27,20 @@ class ClientTransferCodecTest {
         assertFalse(encoded.contains("host"))
     }
 
+    @Test
+    fun clientTransfer_roundTripsWithoutVkHashes() {
+        val source = ClientTransferPayload(
+            password = "ABCDEFGHJKLMNPQR",
+            label = "Без хеша",
+            vkHash = "",
+            expiresAt = 0,
+            deactivated = false,
+            createdAt = 12345
+        )
+
+        assertEquals(source, ClientTransferCodec.decode(ClientTransferCodec.encode(source)))
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun clientTransfer_rejectsUnsafePassword() {
         ClientTransferCodec.decode(

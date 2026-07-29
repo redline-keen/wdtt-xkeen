@@ -12,6 +12,7 @@ import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -19,7 +20,6 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -37,7 +37,11 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wdtt.plus.SettingsStore
+import com.wdtt.plus.TunnelManager
+import com.wdtt.plus.TunnelStopCoordinator
+import com.wdtt.plus.TunnelStopResult
 import com.wdtt.plus.sanitizeVpnProfileNameInput
+import com.wdtt.plus.vpnProfileDefaultName
 import com.wdtt.plus.vpnProfileDisplayName
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -56,6 +60,12 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import android.widget.Toast
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+private const val PROFILE_RESET_TIMEOUT_MS = 10_000L
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
@@ -65,6 +75,7 @@ fun FloatingToolbar(
     onActiveProfileChange: (Int) -> Unit,
     onProfileNameChange: (Int, String) -> Unit,
     interfaceRole: String,
+    adminModeAllowed: Boolean,
     onInterfaceRoleChange: (String) -> Unit,
     currentTheme: String,
     onThemeChange: (String) -> Unit,
@@ -80,10 +91,19 @@ fun FloatingToolbar(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val settingsStore = remember { SettingsStore(context) }
     val trustedWifiEnabled by settingsStore.trustedWifiEnabled.collectAsStateWithLifecycle(initialValue = false)
     val trustedWifiSsids by settingsStore.trustedWifiSsids.collectAsStateWithLifecycle(initialValue = emptyList())
     val trustedWifiRuntime by com.wdtt.plus.TrustedWifiManager.state.collectAsStateWithLifecycle()
+    val customVkCredentialsEnabled by settingsStore.customVkCredentialsEnabled.collectAsStateWithLifecycle(initialValue = false)
+    val customVkCredentialsComplete by settingsStore.customVkCredentialsComplete.collectAsStateWithLifecycle(initialValue = false)
+    val savedToolbarYFraction by settingsStore.floatingToolbarYFraction.collectAsStateWithLifecycle(
+        initialValue = -2f
+    )
+    val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
+    val tunnelTransition by TunnelManager.transition.collectAsStateWithLifecycle()
+    val connectedProfile by TunnelManager.activeTunnelProfile.collectAsStateWithLifecycle()
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
     val screenHeightPx = remember(configuration.screenHeightDp, density) {
@@ -96,19 +116,39 @@ fun FloatingToolbar(
     var parentWidthPx by remember { mutableFloatStateOf(0f) }
     var parentHeightPx by remember { mutableFloatStateOf(0f) }
 
-    var offsetY by rememberSaveable { mutableFloatStateOf(-1f) }
+    var offsetY by remember { mutableFloatStateOf(-1f) }
+    var toolbarPositionRestored by remember { mutableStateOf(false) }
     var isRightSide by rememberSaveable { mutableStateOf(true) }
     var isExpanded by rememberSaveable { mutableStateOf(false) }
     var tabHeightPx by remember { mutableFloatStateOf(0f) }
     var panelHeightPx by remember { mutableFloatStateOf(0f) }
     var renamingProfile by remember { mutableStateOf<Int?>(null) }
+    var resettingProfile by remember { mutableStateOf<Int?>(null) }
+    var resetCountdown by remember { mutableIntStateOf(5) }
+    var resetInProgress by remember { mutableStateOf(false) }
     var profileNameInput by rememberSaveable { mutableStateOf("") }
     var showTrustedWifiSettings by rememberSaveable { mutableStateOf(false) }
+    var showVkClientSettings by rememberSaveable { mutableStateOf(false) }
 
     val tabWidthDp = 42.dp
     val tabHeightDp = 52.dp
     val panelWidthDp = 220.dp
-    val isAdminRole = interfaceRole != "user"
+    // Move the thumb immediately on tap instead of waiting for the DataStore round trip.
+    // The persisted value still remains the source of truth and resynchronizes this state.
+    var displayedInterfaceRole by remember(interfaceRole, adminModeAllowed) {
+        mutableStateOf(if (adminModeAllowed) interfaceRole else "user")
+    }
+    val isAdminRole = adminModeAllowed && displayedInterfaceRole == "admin"
+
+    LaunchedEffect(resettingProfile) {
+        resetCountdown = 5
+        if (resettingProfile != null) {
+            while (resetCountdown > 0) {
+                delay(1_000L)
+                resetCountdown--
+            }
+        }
+    }
 
     val tabWidthPx = remember(density) { with(density) { tabWidthDp.toPx() } }
     val fallbackTabHeightPx = remember(density) { with(density) { tabHeightDp.toPx() } }
@@ -128,7 +168,7 @@ fun FloatingToolbar(
     val minOffsetY = safeTopPx + edgePaddingPx
     val maxOffsetY = (currentParentHeight - safeBottomPx - floatingHeightPx - edgePaddingPx)
         .coerceAtLeast(minOffsetY)
-    val defaultOffsetY = (currentParentHeight * 0.24f).coerceIn(minOffsetY, maxOffsetY)
+    val defaultOffsetY = (currentParentHeight * 0.30f).coerceIn(minOffsetY, maxOffsetY)
 
     val targetXPx = if (isRightSide) currentParentWidth - tabWidthPx else 0f
 
@@ -138,8 +178,29 @@ fun FloatingToolbar(
         label = "tab_shift"
     )
 
-    LaunchedEffect(minOffsetY, maxOffsetY) {
-        offsetY = if (offsetY < 0f) defaultOffsetY else offsetY.coerceIn(minOffsetY, maxOffsetY)
+    LaunchedEffect(savedToolbarYFraction, minOffsetY, maxOffsetY) {
+        if (savedToolbarYFraction < -1f) return@LaunchedEffect
+        offsetY = if (!toolbarPositionRestored || offsetY < 0f) {
+            if (savedToolbarYFraction >= 0f && maxOffsetY > minOffsetY) {
+                minOffsetY + (maxOffsetY - minOffsetY) * savedToolbarYFraction
+            } else {
+                defaultOffsetY
+            }
+        } else {
+            offsetY.coerceIn(minOffsetY, maxOffsetY)
+        }
+        toolbarPositionRestored = true
+    }
+
+    fun persistToolbarPosition() {
+        if (!toolbarPositionRestored) return
+        val availableRange = maxOffsetY - minOffsetY
+        val fraction = if (availableRange > 0f) {
+            ((offsetY - minOffsetY) / availableRange).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+        scope.launch { settingsStore.saveFloatingToolbarYFraction(fraction) }
     }
 
     Box(
@@ -159,6 +220,8 @@ fun FloatingToolbar(
                 }
                 .pointerInput(minOffsetY, maxOffsetY) {
                     detectDragGestures(
+                        onDragEnd = { persistToolbarPosition() },
+                        onDragCancel = { persistToolbarPosition() },
                         onDrag = { change, dragAmount ->
                             change.consume()
                             offsetY = (offsetY + dragAmount.y).coerceIn(minOffsetY, maxOffsetY)
@@ -248,7 +311,10 @@ fun FloatingToolbar(
                                     .widthIn(min = 72.dp, max = 180.dp)
                                     .clip(profileShape)
                                     .combinedClickable(
-                                        onClick = { onActiveProfileChange(profile) },
+                                        onClick = {
+                                            onActiveProfileChange(profile)
+                                            isExpanded = false
+                                        },
                                         onLongClick = {
                                             renamingProfile = profile
                                             profileNameInput = profileLabel
@@ -280,7 +346,7 @@ fun FloatingToolbar(
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Text(" Передать или получить", fontSize = 12.sp)
+                        Text(" Получить или передать", fontSize = 12.sp)
                     }
 
                     HorizontalDivider(
@@ -340,7 +406,14 @@ fun FloatingToolbar(
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
-                                if (isAdminRole) "VPN и настройка своего сервера" else "Подключение и работа VPN",
+                                when {
+                                    !adminModeAllowed ->
+                                        "Режим «Админ» доступен для самостоятельного профиля"
+                                    isAdminRole ->
+                                        "VPN и настройка своего сервера"
+                                    else ->
+                                        "Подключение и работа VPN"
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 lineHeight = 15.sp
@@ -348,7 +421,14 @@ fun FloatingToolbar(
                         }
                         Switch(
                             checked = isAdminRole,
-                            onCheckedChange = { checked -> onInterfaceRoleChange(if (checked) "admin" else "user") },
+                            onCheckedChange = { checked ->
+                                val role = if (checked) "admin" else "user"
+                                if (role != displayedInterfaceRole) {
+                                    displayedInterfaceRole = role
+                                    onInterfaceRoleChange(role)
+                                }
+                            },
+                            enabled = adminModeAllowed,
                             modifier = Modifier.scale(0.85f)
                         )
                     }
@@ -501,94 +581,41 @@ fun FloatingToolbar(
                         color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
                     )
 
-                    Text(
-                        "Client IDs",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(start = 4.dp, bottom = 4.dp)
-                    )
-
-                    val scope = rememberCoroutineScope()
-                    val clientIdsList = activeClientIds.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-                    
-                    val checkResultsJson by settingsStore.clientIdCheckResults.collectAsStateWithLifecycle(initialValue = "{}")
-                    
-                    var checkResults by remember(checkResultsJson) { 
-                        mutableStateOf(try {
-                            val json = org.json.JSONObject(checkResultsJson)
-                            val map = mutableMapOf<String, Boolean>()
-                            val keys = json.keys()
-                            while (keys.hasNext()) {
-                                val key = keys.next() as String
-                                map[key] = json.getBoolean(key)
-                            }
-                            map
-                        } catch (e: Exception) { emptyMap() })
-                    }
-
-                    var isChecking by remember { mutableStateOf(false) }
-
-                    val knownIds = listOf("6287487", "8202606")
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        knownIds.forEach { id ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Checkbox(
-                                        checked = clientIdsList.contains(id),
-                                        onCheckedChange = { checked ->
-                                            val newList = if (checked) {
-                                                if (!clientIdsList.contains(id)) clientIdsList + id else clientIdsList
-                                            } else {
-                                                clientIdsList - id
-                                            }
-                                            if (newList.isNotEmpty()) {
-                                                onClientIdsChange(newList.joinToString(","))
-                                            }
-                                        },
-                                        modifier = Modifier.scale(0.8f)
-                                    )
-                                    Text(
-                                        text = id,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                }
-                                if (checkResults.containsKey(id)) {
-                                    Text(
-                                        text = if (checkResults[id] == true) "✅" else "❌",
-                                        fontSize = 12.sp
-                                    )
-                                }
-                            }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showVkClientSettings = true }
+                            .padding(horizontal = 4.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                            Text(
+                                "Клиенты VK",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                when {
+                                    !customVkCredentialsEnabled -> "VKCalls → встроенный резерв"
+                                    customVkCredentialsComplete -> "VKCalls → свой → встроенный резерв"
+                                    else -> "Заполните резервные реквизиты"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (customVkCredentialsEnabled && !customVkCredentialsComplete) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                                lineHeight = 15.sp
+                            )
                         }
-                        
-                        Button(
-                            onClick = {
-                                isChecking = true
-                                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                                    val results = checkResults.toMutableMap()
-                                    knownIds.forEach { id ->
-                                        results[id] = checkVkClientId(id)
-                                    }
-                                    
-                                    val newJson = org.json.JSONObject()
-                                    results.forEach { (k, v) -> newJson.put(k, v) }
-                                    settingsStore.saveClientIdCheckResults(newJson.toString())
-                                    
-                                    isChecking = false
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
-                            enabled = !isChecking,
-                            contentPadding = PaddingValues(0.dp)
-                        ) {
-                            Text(if (isChecking) "Checking..." else "Проверить", fontSize = 12.sp)
-                        }
+                        Switch(
+                            checked = customVkCredentialsEnabled,
+                            onCheckedChange = null,
+                            modifier = Modifier.scale(0.85f)
+                        )
                     }
                 }
             }
@@ -596,38 +623,72 @@ fun FloatingToolbar(
     }
 
     renamingProfile?.let { profile ->
-        AlertDialog(
-            onDismissRequest = { renamingProfile = null },
-            title = {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Название профиля")
-                    IconButton(onClick = { renamingProfile = null }) {
-                        Icon(Icons.Filled.Close, contentDescription = "Закрыть")
-                    }
-                }
+        ProfileMenuDialog(
+            profileNameInput = profileNameInput,
+            onProfileNameInputChange = { profileNameInput = sanitizeVpnProfileNameInput(it) },
+            onResetRequested = {
+                resetCountdown = 5
+                resettingProfile = profile
             },
-            text = {
-                OutlinedTextField(
-                    value = profileNameInput,
-                    onValueChange = { profileNameInput = sanitizeVpnProfileNameInput(it) },
-                    label = { Text("Название") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+            onSave = {
+                onProfileNameChange(profile, profileNameInput)
+                renamingProfile = null
             },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        onProfileNameChange(profile, profileNameInput)
+            onDismiss = { renamingProfile = null }
+        )
+    }
+
+    resettingProfile?.let { profile ->
+        val profileLabel = vpnProfileDisplayName(profile, profileNames)
+        val potentiallyConnectedProfile = profile == (connectedProfile ?: activeProfile)
+        val resetsConnectedProfile = potentiallyConnectedProfile &&
+            (tunnelRunning || tunnelTransition != com.wdtt.plus.TunnelTransition.IDLE)
+        ProfileResetDialog(
+            profileLabel = profileLabel,
+            defaultProfileLabel = vpnProfileDefaultName(profile),
+            countdown = resetCountdown,
+            inProgress = resetInProgress,
+            disconnectsActiveVpn = resetsConnectedProfile,
+            onConfirm = {
+                if (resetCountdown > 0 || resetInProgress) return@ProfileResetDialog
+                resetInProgress = true
+                scope.launch {
+                    runCatching {
+                        if (potentiallyConnectedProfile) {
+                            val stopResult = TunnelStopCoordinator.stopAndAwait(context)
+                            check(stopResult.succeeded) {
+                                when (stopResult) {
+                                    TunnelStopResult.TIMED_OUT ->
+                                        "VPN не остановился за отведённое время"
+                                    else -> "Не удалось остановить VPN"
+                                }
+                            }
+                        }
+                        val resetCompleted = withTimeoutOrNull(PROFILE_RESET_TIMEOUT_MS) {
+                            settingsStore.resetProfile(profile)
+                            true
+                        } == true
+                        check(resetCompleted) {
+                            "Очистка профиля не завершилась за 10 секунд. Повторите попытку."
+                        }
+                    }.onSuccess {
+                        profileNameInput = vpnProfileDefaultName(profile)
+                        resettingProfile = null
                         renamingProfile = null
+                        isExpanded = false
+                        Toast.makeText(context, "Профиль «$profileLabel» очищен", Toast.LENGTH_SHORT).show()
+                    }.onFailure { error ->
+                        Toast.makeText(
+                            context,
+                            error.message ?: "Не удалось очистить профиль",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
-                ) {
-                    Text("Сохранить")
+                    resetInProgress = false
                 }
+            },
+            onDismiss = {
+                if (!resetInProgress) resettingProfile = null
             }
         )
     }
@@ -638,36 +699,250 @@ fun FloatingToolbar(
             onDismiss = { showTrustedWifiSettings = false }
         )
     }
+
+    if (showVkClientSettings) {
+        VkClientSettingsDialog(
+            settingsStore = settingsStore,
+            activeClientIds = activeClientIds,
+            onClientIdsChange = onClientIdsChange,
+            onDismiss = { showVkClientSettings = false }
+        )
+    }
 }
 }
 
-private fun checkVkClientId(appId: String): Boolean {
-    for (i in 0..1) {
-        try {
-            val url = java.net.URL("https://oauth.vk.com/authorize?client_id=$appId&display=mobile&response_type=token")
-            val conn = url.openConnection() as java.net.HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
-            
-            val code = conn.responseCode
-            val stream = if (code >= 400) conn.errorStream else conn.inputStream
-            val response = stream?.bufferedReader()?.readText() ?: ""
-            
-            // If it returns a json error like {"error":"invalid_client"...}
-            if (response.contains("\"error\"") && (response.contains("invalid_client") || response.contains("invalid_request"))) {
-                return false
+@Composable
+private fun ProfileMenuDialog(
+    profileNameInput: String,
+    onProfileNameInputChange: (String) -> Unit,
+    onResetRequested: () -> Unit,
+    onSave: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.92f)
+                    .widthIn(max = 560.dp)
+                    .heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 8.dp
+            ) {
+                Box {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(22.dp)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        Text(
+                            "Профиль",
+                            modifier = Modifier.padding(end = 48.dp),
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        OutlinedTextField(
+                            value = profileNameInput,
+                            onValueChange = onProfileNameInputChange,
+                            label = { Text("Название") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = onResetRequested,
+                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                shape = RoundedCornerShape(16.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                            ) {
+                                Text("Очистить", fontWeight = FontWeight.SemiBold)
+                            }
+                            Button(
+                                onClick = onSave,
+                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                shape = RoundedCornerShape(16.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                            ) {
+                                Text("Сохранить", fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                    }
+
+                    ProfileDialogCloseButton(
+                        contentDescription = "Вернуться в настройки",
+                        onClick = onDismiss,
+                        modifier = Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 10.dp)
+                    )
+                }
             }
-            // If it returns HTML (login form or captcha), it's a valid client ID
-            return true
-        } catch (e: Exception) {
-            // Error, will retry
         }
     }
-    return false
 }
 
+@Composable
+private fun ProfileResetDialog(
+    profileLabel: String,
+    defaultProfileLabel: String,
+    countdown: Int,
+    inProgress: Boolean,
+    disconnectsActiveVpn: Boolean,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = { if (!inProgress) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.92f)
+                    .widthIn(max = 560.dp)
+                    .heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 8.dp
+            ) {
+                Box {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(22.dp)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        Text(
+                            "Очистить профиль?",
+                            modifier = Modifier.padding(end = 48.dp),
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.error
+                        )
 
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp),
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            contentColor = MaterialTheme.colorScheme.onErrorContainer
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(15.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    "Будет полностью очищена вся локальная информация профиля «$profileLabel».",
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                                Text(
+                                    "Удалятся настройки подключения, VK-хеши, ссылки, пароли и SSH-ключи, параметры сервера, списки приложений и остальные данные этого профиля.",
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(
+                                    "Название вернётся к стандартному: «$defaultProfileLabel». Операция необратима. Вы уверены?",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f)
+                        ) {
+                            Text(
+                                buildString {
+                                    append("На самом VPS и в других профилях ничего не удаляется.")
+                                    if (disconnectsActiveVpn) append(" Активное VPN-подключение этого профиля будет остановлено.")
+                                },
+                                modifier = Modifier.padding(14.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        Button(
+                            onClick = onConfirm,
+                            enabled = countdown <= 0 && !inProgress,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
+                            shape = RoundedCornerShape(16.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.error,
+                                contentColor = MaterialTheme.colorScheme.onError,
+                                disabledContainerColor = MaterialTheme.colorScheme.errorContainer,
+                                disabledContentColor = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.68f)
+                            )
+                        ) {
+                            Text(
+                                when {
+                                    inProgress -> "Очищаю профиль…"
+                                    countdown > 0 -> "Очистить через $countdown с"
+                                    else -> "Полностью очистить профиль"
+                                },
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                    }
+
+                    ProfileDialogCloseButton(
+                        contentDescription = "Вернуться к профилю",
+                        onClick = onDismiss,
+                        enabled = !inProgress,
+                        modifier = Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 10.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileDialogCloseButton(
+    contentDescription: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true
+) {
+    IconButton(onClick = onClick, modifier = modifier, enabled = enabled) {
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.78f),
+            modifier = Modifier.size(34.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = contentDescription,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+        }
+    }
+}
 
 @Composable
 private fun ThemeOption(

@@ -90,13 +90,11 @@ object ClientTransferCodec {
         val clean = value.trim()
         if (clean.isBlank()) return ""
         require(clean.length <= 4096 && clean.none(Char::isISOControl)) { "Поле VK-хешей повреждено." }
-        val hashes = clean.split(Regex("[,\\s]+"))
-            .map { VkJoinLink.extractHash(it) }
-            .filter { it.isNotBlank() }
-        require(hashes.isNotEmpty() && hashes.all { it.length >= 16 } && hashes.none { it.contains('/') || it.contains('\\') }) {
+        val hashes = VkJoinLink.normalizeHashes(clean)
+        require(hashes != null) {
             "VK-хеши в переносе имеют неверный формат."
         }
-        return hashes.distinct().joinToString(",")
+        return hashes
     }
 }
 

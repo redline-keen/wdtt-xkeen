@@ -12,8 +12,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+)
 
-	"golang.zx2c4.com/wireguard/device"
+const (
+	botThreeProxyVersion      = "0.9.7"
+	botThreeProxySourceURL    = "https://github.com/3proxy/3proxy/archive/refs/tags/0.9.7.tar.gz"
+	botThreeProxySourceSHA256 = "efe862ef8b7c0ddf7b1c45d6b5d72f0b7cd0a3c54447419c7f1bd2239a06fc30"
 )
 
 func defaultPortsSpec() string {
@@ -141,7 +145,7 @@ func normalizePasswordLabel(input string) string {
 }
 
 func createBotClient(
-	wgDev *device.Device,
+	wgDev wgDevice,
 	requestedPassword string,
 	days int,
 	expiresAt int64,
@@ -226,7 +230,7 @@ func createBotClient(
 	return password, entry, nil
 }
 
-func changeBotClientPassword(wgDev *device.Device, oldPassword, requested string) (string, error) {
+func changeBotClientPassword(wgDev wgDevice, oldPassword, requested string) (string, error) {
 	newPassword, err := normalizeClientPassword(requested)
 	if err != nil {
 		return "", err
@@ -246,7 +250,7 @@ func changeBotClientPassword(wgDev *device.Device, oldPassword, requested string
 	if _, exists := db.Passwords[newPassword]; exists {
 		return "", errors.New("клиент с таким паролем уже существует")
 	}
-	if !entry.IsDeactivated && !isPasswordExpired(entry) {
+	if !entry.IsDeactivated && !isPasswordPurgeable(entry) {
 		if err := serverWrapKeys.AddPassword(newPassword); err != nil {
 			return "", fmt.Errorf("не удалось добавить новый WRAP-ключ: %w", err)
 		}
@@ -430,8 +434,14 @@ func botScriptErrorText(err error, output string) string {
 		return "Не удалось собрать 3proxy: на сервере нет компилятора gcc/cc, и пакетный менеджер не смог его поставить."
 	case "3proxy_source_no_openssl_headers":
 		return "Не удалось собрать 3proxy: на сервере нет OpenSSL-заголовков. Нужен пакет libssl-dev, openssl-devel, libopenssl-devel или openssl-dev в зависимости от Linux-дистрибутива."
+	case "3proxy_source_no_pcre2_headers":
+		return "Не удалось собрать актуальный 3proxy: на сервере нет заголовков PCRE2. Нужен пакет libpcre2-dev или pcre2-devel."
+	case "3proxy_source_no_sha256sum":
+		return "Не удалось безопасно проверить архив 3proxy: на сервере нет sha256sum."
 	case "3proxy_source_download_failed":
-		return "Не удалось скачать исходники 3proxy с GitHub. Проверьте, открывается ли github.com с сервера и не блокирует ли сеть исходящие HTTPS-подключения."
+		return "Не удалось скачать закреплённый выпуск 3proxy с GitHub. Проверьте, открывается ли github.com с сервера и не блокирует ли сеть исходящие HTTPS-подключения."
+	case "3proxy_source_checksum_failed":
+		return "Контрольная сумма архива 3proxy не совпала с закреплённым выпуском. Архив не был распакован или запущен."
 	case "3proxy_source_unpack_failed":
 		return "Архив 3proxy скачался, но сервер не смог его распаковать. Возможен битый архив, нехватка места или проблема с tar/gzip."
 	case "3proxy_source_build_failed":
@@ -441,7 +451,7 @@ func botScriptErrorText(err error, output string) string {
 	case "3proxy_source_install_failed":
 		return "3proxy собрался, но сервер не дал записать файл в /usr/local/bin. Проверьте root-права пользователя и sudo."
 	case "3proxy_install_failed":
-		return "Не удалось установить 3proxy: пакет не найден в репозиториях сервера, а сборка из исходников не дала готовый файл. Повторите установку: теперь бот покажет конкретный шаг, на котором она сорвалась."
+		return "Не удалось установить закреплённый выпуск 3proxy из проверенных исходников. Повторите установку: бот покажет конкретный шаг, на котором она сорвалась."
 	case "systemd_required":
 		return "Для прокси на этом сервере нужна systemd-служба. На сервере не найден systemctl, поэтому бот не может безопасно запустить 3proxy как сервис."
 	case "curl_not_installed":
@@ -450,10 +460,16 @@ func botScriptErrorText(err error, output string) string {
 		return "Внешний прокси не ответил. Проверьте тип, адрес, порт, логин и пароль."
 	case "external_proxy_service_inactive":
 		return "Служба перенаправления через внешний прокси не запустилась. Бот откатил правила и вернул прямой выход, чтобы интернет через VPN не остался сломанным."
+	case "external_proxy_route_install_failed":
+		return "Служба внешнего прокси запустилась, но постоянное правило маршрутизации WDTT не применилось. Режим отключён."
+	case "external_proxy_test_rule_failed":
+		return "Сервер не разрешил создать временное правило для проверки пути WDTT через внешний прокси. Режим не считается проверенным."
 	case "external_proxy_apply_failed":
 		return botTextWithRemoteTail("Внешний прокси отвечает напрямую, но путь WDTT через redsocks не заработал. Бот откатил правила и вернул прямой выход, чтобы VPN-интернет не пропал.", output)
 	case "iptables_required":
 		return "На сервере не найдены правила межсетевого экрана iptables. Без них нельзя направить подключения WDTT через прокси."
+	case "direct_cleanup_failed":
+		return "Сервер не подтвердил полную остановку прежнего WireGuard/прокси-выхода. Выполните диагностику перед включением другого режима."
 	case "local_proxy_check_failed":
 		return "Проверка не устанавливает прокси: она подключается к уже запущенному SOCKS5 на 127.0.0.1 с сохранёнными логином и паролем. Подключение не удалось. Создайте или обновите прокси."
 	case "local_proxy_config_not_found":
@@ -464,6 +480,8 @@ func botScriptErrorText(err error, output string) string {
 		return "Служба wdtt-3proxy не запущена. Создайте или обновите прокси на сервере."
 	case "local_proxy_service_still_active":
 		return "Команда остановки выполнена, но служба wdtt-3proxy всё ещё запущена. Проверьте права пользователя SSH или остановите службу вручную."
+	case "local_proxy_firewall_failed":
+		return "Прокси запустился, но сервер не смог открыть его порты в firewall. Служба остановлена."
 	case "redsocks_not_installed":
 		return "Не удалось установить компонент перенаправления через внешний прокси. Проверьте доступ сервера к интернету и пакетному менеджеру."
 	case "wdtt_iface_not_found":
@@ -500,7 +518,10 @@ func isFriendlyBotScriptError(err error) bool {
 		"3proxy_source_no_make",
 		"3proxy_source_no_compiler",
 		"3proxy_source_no_openssl_headers",
+		"3proxy_source_no_pcre2_headers",
+		"3proxy_source_no_sha256sum",
 		"3proxy_source_download_failed",
+		"3proxy_source_checksum_failed",
 		"3proxy_source_unpack_failed",
 		"3proxy_source_build_failed",
 		"3proxy_source_binary_missing",
@@ -510,13 +531,17 @@ func isFriendlyBotScriptError(err error) bool {
 		"curl_not_installed",
 		"external_proxy_check_failed",
 		"external_proxy_service_inactive",
+		"external_proxy_route_install_failed",
+		"external_proxy_test_rule_failed",
 		"external_proxy_apply_failed",
 		"iptables_required",
+		"direct_cleanup_failed",
 		"local_proxy_check_failed",
 		"local_proxy_config_not_found",
 		"local_proxy_credentials_missing",
 		"local_proxy_service_inactive",
 		"local_proxy_service_still_active",
+		"local_proxy_firewall_failed",
 		"redsocks_not_installed",
 		"wdtt_iface_not_found",
 		"wdtt_test_source_missing",
@@ -612,16 +637,19 @@ wdtt_clear_external_out() {
   systemctl disable --now wdtt-warp-watchdog.timer 2>/dev/null || true
   systemctl disable --now wdtt-wg-exit.service 2>/dev/null || true
   if command -v iptables >/dev/null 2>&1; then
-    iptables -t nat -D PREROUTING -i "$WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null || true
+    while iptables -t nat -D PREROUTING -i "$WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; do :; done
     iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
     iptables -t nat -X WDTT_PROXY_OUT 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -s "$WDTT_SUBNET" -o "$WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null || true
+    while iptables -t nat -D POSTROUTING -s "$WDTT_SUBNET" -o "$WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null; do :; done
   fi
-  ip rule del from "$WDTT_SUBNET" table "$WDTT_TABLE" priority 100 2>/dev/null || true
+  while ip rule del from "$WDTT_SUBNET" table "$WDTT_TABLE" priority 100 2>/dev/null; do :; done
   ip route flush table "$WDTT_TABLE" 2>/dev/null || true
   systemctl disable --now wdtt-redsocks 2>/dev/null || systemctl stop wdtt-redsocks 2>/dev/null || true
   wdtt_kill_redsocks_listener
-  wg-quick down "$WDTT_WG_IFACE" 2>/dev/null || true
+  if ! wg-quick down "$WDTT_WG_IFACE" 2>/dev/null; then
+    ip link delete "$WDTT_WG_IFACE" 2>/dev/null || true
+  fi
+  rm -f /etc/wdtt-plus/wg-exit/owner
 }
 wdtt_kill_redsocks_listener() {
   rm -f /run/wdtt-redsocks.pid 2>/dev/null || true
@@ -646,24 +674,32 @@ wdtt_proxy_reserved_returns() {
   [ -n "$proxy_ip" ] && iptables -t nat -A "$chain" -d "$proxy_ip" -j RETURN 2>/dev/null || true
 }
 wdtt_cleanup_proxy_test() {
+  cleanup_test_source="${WDTT_PROXY_TEST_SOURCE:-}"
+  [ -n "$cleanup_test_source" ] && iptables -t nat -D OUTPUT -s "$cleanup_test_source" -p tcp -j WDTT_PROXY_TEST 2>/dev/null || true
+  # Удаляем также правило старых версий, если предыдущая проверка была прервана.
   iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner 0 -j WDTT_PROXY_TEST 2>/dev/null || true
   iptables -t nat -F WDTT_PROXY_TEST 2>/dev/null || true
   iptables -t nat -X WDTT_PROXY_TEST 2>/dev/null || true
+  WDTT_PROXY_TEST_SOURCE=""
 }
 wdtt_test_redsocks_path() {
   proxy_ip="$1"
   systemctl is-active --quiet wdtt-redsocks || { echo WDTT_ERROR=external_proxy_service_inactive; return 1; }
   command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; return 1; }
+  test_source="$(wdtt_test_source)"
+  [ -n "$test_source" ] || { echo WDTT_ERROR=wdtt_iface_not_found; return 1; }
   wdtt_cleanup_proxy_test
+  WDTT_PROXY_TEST_SOURCE="$test_source"
   iptables -t nat -N WDTT_PROXY_TEST 2>/dev/null || true
   iptables -t nat -F WDTT_PROXY_TEST
   wdtt_proxy_reserved_returns WDTT_PROXY_TEST "$proxy_ip"
   iptables -t nat -A WDTT_PROXY_TEST -p tcp -j REDIRECT --to-ports 12345
-  if ! iptables -t nat -I OUTPUT -p tcp -m owner --uid-owner 0 -j WDTT_PROXY_TEST 2>/dev/null; then
+  if ! iptables -t nat -I OUTPUT -s "$test_source" -p tcp -j WDTT_PROXY_TEST 2>/dev/null; then
     wdtt_cleanup_proxy_test
-    return 0
+    echo WDTT_ERROR=external_proxy_test_rule_failed
+    return 1
   fi
-  test_ip="$(curl -4fsS --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/tmp/wdtt-redsocks-test.err || true)"
+  test_ip="$(curl --interface "$test_source" -4fsS --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/tmp/wdtt-redsocks-test.err || true)"
   wdtt_cleanup_proxy_test
   [ -n "$test_ip" ] || { echo WDTT_ERROR=external_proxy_apply_failed; tail -n 20 /var/log/wdtt-redsocks.log 2>/dev/null || true; cat /tmp/wdtt-redsocks-test.err 2>/dev/null || true; return 1; }
   echo "Проверка пути через внешний прокси успешна. IP через прокси: $test_ip"
@@ -711,17 +747,35 @@ echo "Подсеть клиентов WDTT: $WDTT_SUBNET"
 echo "Интерфейс клиентов: $WDTT_IFACE"
 echo "Внешний IP самого сервера: $SERVER_IP"
 if systemctl is-active wdtt-3proxy >/dev/null 2>&1; then echo "Прокси на этом сервере: служба запущена"; else echo "Прокси на этом сервере: служба остановлена"; fi
-EXTERNAL_ACTIVE=0
-if systemctl is-active wdtt-redsocks >/dev/null 2>&1; then EXTERNAL_ACTIVE=1; echo "Внешний прокси для WDTT: включён"; else echo "Внешний прокси для WDTT: выключен"; fi
-WG_ACTIVE=0
+if systemctl is-enabled wdtt-3proxy >/dev/null 2>&1; then echo "Автозапуск прокси на этом сервере: включён"; else echo "Автозапуск прокси на этом сервере: выключен"; fi
+EXTERNAL_SERVICE=0
+if systemctl is-active wdtt-redsocks >/dev/null 2>&1; then EXTERNAL_SERVICE=1; echo "Служба внешнего прокси: запущена"; else echo "Служба внешнего прокси: остановлена"; fi
+if systemctl is-enabled wdtt-redsocks >/dev/null 2>&1; then echo "Автозапуск внешнего прокси: включён"; else echo "Автозапуск внешнего прокси: выключен"; fi
+EXTERNAL_ROUTE=0
+if command -v iptables >/dev/null 2>&1 &&
+   iptables -t nat -C PREROUTING -i "$WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; then
+  EXTERNAL_ROUTE=1
+  echo "Маршрут TCP-трафика WDTT через внешний прокси: применён"
+else
+  echo "Маршрут TCP-трафика WDTT через внешний прокси: отсутствует"
+fi
+WG_INTERFACE=0
 if command -v wg >/dev/null 2>&1 && wg show "$WDTT_WG_IFACE" >/dev/null 2>&1; then
-  WG_ACTIVE=1
+  WG_INTERFACE=1
   echo "WireGuard $WDTT_WG_IFACE:"
   wg show "$WDTT_WG_IFACE" | sed -E 's/(private key: ).*/\1(скрыт)/'
 else
   echo "WireGuard $WDTT_WG_IFACE: не запущен"
 fi
-if [ "$EXTERNAL_ACTIVE" = 1 ] && [ "$WG_ACTIVE" = 1 ]; then
+if systemctl is-active wdtt-wg-exit.service >/dev/null 2>&1; then echo "Служба WireGuard-выхода: запущена"; else echo "Служба WireGuard-выхода: остановлена"; fi
+if systemctl is-enabled wdtt-wg-exit.service >/dev/null 2>&1; then echo "Автозапуск WireGuard-выхода: включён"; else echo "Автозапуск WireGuard-выхода: выключен"; fi
+WG_ROUTE=0
+ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup $WDTT_TABLE([[:space:]]|$)|from [^ ]+ lookup wdtt-exit([[:space:]]|$)" && WG_ROUTE=1
+ip route show table "$WDTT_TABLE" 2>/dev/null | grep -Eq "^default([[:space:]].*)? dev $WDTT_WG_IFACE([[:space:]]|$)" && WG_ROUTE=1
+if command -v iptables >/dev/null 2>&1; then
+  iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- "-o $WDTT_WG_IFACE .*--comment WDTT_EXIT .*MASQUERADE" && WG_ROUTE=1
+fi
+if [ "$EXTERNAL_ROUTE" = 1 ] && { [ "$WG_INTERFACE" = 1 ] || [ "$WG_ROUTE" = 1 ]; }; then
   echo "Внимание: одновременно активны внешний TCP-прокси и WireGuard-выход. Верните прямой выход или выполните диагностику перед новым переключением."
 fi
 if [ "$MODE" = "warp_free" ]; then
@@ -789,6 +843,17 @@ tail -n 20 /var/log/wdtt-redsocks.log 2>/dev/null || echo "Лог redsocks пу�
 func outboundDisableScript() string {
 	return outboundBotPrelude() + `
 wdtt_clear_external_out
+CLEANUP_LEFT=0
+(command -v wg >/dev/null 2>&1 && wg show "$WDTT_WG_IFACE" >/dev/null 2>&1) && CLEANUP_LEFT=1
+systemctl is-active --quiet wdtt-wg-exit.service 2>/dev/null && CLEANUP_LEFT=1
+systemctl is-active --quiet wdtt-redsocks.service 2>/dev/null && CLEANUP_LEFT=1
+ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup $WDTT_TABLE([[:space:]]|$)|from [^ ]+ lookup wdtt-exit([[:space:]]|$)" && CLEANUP_LEFT=1
+ip route show table "$WDTT_TABLE" 2>/dev/null | grep -Eq "^default([[:space:]].*)? dev $WDTT_WG_IFACE([[:space:]]|$)" && CLEANUP_LEFT=1
+if command -v iptables >/dev/null 2>&1; then
+  iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "-i $WDTT_IFACE .* -j WDTT_PROXY_OUT" && CLEANUP_LEFT=1
+  iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- "-o $WDTT_WG_IFACE .*--comment WDTT_EXIT .*MASQUERADE" && CLEANUP_LEFT=1
+fi
+[ "$CLEANUP_LEFT" = 0 ] || { echo WDTT_ERROR=direct_cleanup_failed; exit 3; }
 wdtt_write_mode "direct" "прямой выход через текущий сервер"
 echo "Внешний прокси или WireGuard-выход отключён. WDTT-пользователи снова идут напрямую через текущий сервер."
 `
@@ -900,6 +965,9 @@ HTTP_PORT=%d
 ADMIN_PORT=%d
 PROXY_LOGIN=%s
 PROXY_PASSWORD=%s
+THREEPROXY_VERSION=%s
+THREEPROXY_SOURCE_URL=%s
+THREEPROXY_SOURCE_SHA256=%s
 install_pkg() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y >/dev/null 2>&1 || true
@@ -920,17 +988,17 @@ install_pkg() {
 }
 install_3proxy_build_deps() {
   if command -v apt-get >/dev/null 2>&1; then
-    install_pkg curl ca-certificates tar gzip make gcc libc6-dev libssl-dev
+    install_pkg curl ca-certificates tar gzip make gcc coreutils libc6-dev libssl-dev libpcre2-dev
   elif command -v dnf >/dev/null 2>&1; then
-    install_pkg curl ca-certificates tar gzip make gcc glibc-devel openssl-devel
+    install_pkg curl ca-certificates tar gzip make gcc coreutils glibc-devel openssl-devel pcre2-devel
   elif command -v yum >/dev/null 2>&1; then
-    install_pkg curl ca-certificates tar gzip make gcc glibc-devel openssl-devel
+    install_pkg curl ca-certificates tar gzip make gcc coreutils glibc-devel openssl-devel pcre2-devel
   elif command -v zypper >/dev/null 2>&1; then
-    install_pkg curl ca-certificates tar gzip make gcc glibc-devel libopenssl-devel
+    install_pkg curl ca-certificates tar gzip make gcc coreutils glibc-devel libopenssl-devel pcre2-devel
   elif command -v apk >/dev/null 2>&1; then
-    install_pkg curl ca-certificates tar gzip make gcc musl-dev linux-headers openssl-dev
+    install_pkg curl ca-certificates tar gzip make gcc coreutils musl-dev linux-headers openssl-dev pcre2-dev
   elif command -v pacman >/dev/null 2>&1; then
-    install_pkg curl ca-certificates tar gzip make gcc glibc openssl
+    install_pkg curl ca-certificates tar gzip make gcc coreutils glibc openssl pcre2
   else
     return 1
   fi
@@ -944,24 +1012,30 @@ install_3proxy_from_source() {
   command -v tar >/dev/null 2>&1 || { echo WDTT_ERROR=3proxy_source_no_tar; exit 2; }
   command -v gzip >/dev/null 2>&1 || { echo WDTT_ERROR=3proxy_source_no_gzip; exit 2; }
   command -v make >/dev/null 2>&1 || { echo WDTT_ERROR=3proxy_source_no_make; exit 2; }
+  command -v sha256sum >/dev/null 2>&1 || { echo WDTT_ERROR=3proxy_source_no_sha256sum; exit 2; }
   (command -v gcc >/dev/null 2>&1 || command -v cc >/dev/null 2>&1) || { echo WDTT_ERROR=3proxy_source_no_compiler; exit 2; }
   [ -f /usr/include/openssl/evp.h ] || [ -f /usr/local/include/openssl/evp.h ] || { echo WDTT_ERROR=3proxy_source_no_openssl_headers; exit 2; }
+  [ -f /usr/include/pcre2.h ] || [ -f /usr/local/include/pcre2.h ] || { echo WDTT_ERROR=3proxy_source_no_pcre2_headers; exit 2; }
   cd "$TMP_DIR"
-  curl -fsSL -o 3proxy.tar.gz https://github.com/3proxy/3proxy/archive/refs/heads/master.tar.gz || { echo WDTT_ERROR=3proxy_source_download_failed; exit 2; }
+  curl -fsSL --retry 2 --connect-timeout 12 --max-time 180 -o 3proxy.tar.gz "$THREEPROXY_SOURCE_URL" || { echo WDTT_ERROR=3proxy_source_download_failed; exit 2; }
+  ACTUAL_SOURCE_SHA256="$(sha256sum 3proxy.tar.gz | awk '{print $1}')"
+  [ "$ACTUAL_SOURCE_SHA256" = "$THREEPROXY_SOURCE_SHA256" ] || { echo WDTT_ERROR=3proxy_source_checksum_failed; exit 2; }
   tar -xzf 3proxy.tar.gz || { echo WDTT_ERROR=3proxy_source_unpack_failed; exit 2; }
-  cd 3proxy-*
+  cd "3proxy-$THREEPROXY_VERSION"
   ln -sf Makefile.Linux Makefile
   make >/tmp/wdtt-3proxy-build.log 2>&1 || { echo WDTT_ERROR=3proxy_source_build_failed; tail -n 20 /tmp/wdtt-3proxy-build.log; exit 2; }
   BUILT_BIN="$(find . -type f -name 3proxy -perm -111 | head -n1)"
   [ -n "$BUILT_BIN" ] || { echo WDTT_ERROR=3proxy_source_binary_missing; exit 2; }
   install -m 755 "$BUILT_BIN" /usr/local/bin/3proxy || { echo WDTT_ERROR=3proxy_source_install_failed; exit 2; }
+  printf '%%s\n' "$THREEPROXY_VERSION" >/etc/wdtt/3proxy-version
+  chmod 600 /etc/wdtt/3proxy-version
 }
 command -v systemctl >/dev/null 2>&1 || { echo WDTT_ERROR=systemd_required; exit 2; }
 install_pkg curl ca-certificates || true
-install_pkg 3proxy || true
 THREEPROXY_BIN="$(command -v 3proxy || true)"
-if [ -z "$THREEPROXY_BIN" ]; then
-  install_3proxy_from_source || true
+INSTALLED_THREEPROXY_VERSION="$(cat /etc/wdtt/3proxy-version 2>/dev/null || true)"
+if [ -z "$THREEPROXY_BIN" ] || [ "$INSTALLED_THREEPROXY_VERSION" != "$THREEPROXY_VERSION" ]; then
+  install_3proxy_from_source
   THREEPROXY_BIN="$(command -v 3proxy || true)"
 fi
 [ -n "$THREEPROXY_BIN" ] || { echo WDTT_ERROR=3proxy_install_failed; exit 2; }
@@ -979,6 +1053,26 @@ proxy -p$HTTP_PORT -i0.0.0.0 -e0.0.0.0
 admin -p$ADMIN_PORT -i0.0.0.0
 EOF
 chmod 600 /etc/wdtt/3proxy.cfg
+mkdir -p /usr/local/lib/wdtt
+cat >/usr/local/lib/wdtt/local-proxy-firewall <<EOF
+#!/bin/sh
+set -eu
+action="\${1:-}"
+cleanup() {
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -S INPUT 2>/dev/null | grep 'WDTT_LOCAL_PROXY' | sed 's/^-A /iptables -D /' |
+      while read -r cmd; do \$cmd 2>/dev/null || true; done
+  fi
+}
+if [ "\$action" = down ]; then cleanup; exit 0; fi
+[ "\$action" = up ] || exit 2
+command -v iptables >/dev/null 2>&1 || exit 0
+cleanup
+iptables -I INPUT -p tcp --dport $PROXY_PORT -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+iptables -I INPUT -p tcp --dport $HTTP_PORT -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+iptables -I INPUT -p tcp --dport $ADMIN_PORT -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+EOF
+chmod 700 /usr/local/lib/wdtt/local-proxy-firewall
 cat >/etc/systemd/system/wdtt-3proxy.service <<EOF
 [Unit]
 Description=WDTT Plus authenticated proxy
@@ -988,6 +1082,8 @@ Wants=network-online.target
 [Service]
 Type=forking
 ExecStart=$THREEPROXY_BIN /etc/wdtt/3proxy.cfg
+ExecStartPost=/usr/local/lib/wdtt/local-proxy-firewall up
+ExecStopPost=/usr/local/lib/wdtt/local-proxy-firewall down
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 
@@ -995,13 +1091,16 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now wdtt-3proxy >/dev/null
-systemctl is-active --quiet wdtt-3proxy || { echo WDTT_ERROR=local_proxy_service_inactive; exit 3; }
-if command -v iptables >/dev/null 2>&1; then
-  iptables -C INPUT -p tcp --dport "$PROXY_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$PROXY_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
-  iptables -C INPUT -p tcp --dport "$HTTP_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$HTTP_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
-  iptables -C INPUT -p tcp --dport "$ADMIN_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$ADMIN_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+if ! systemctl enable wdtt-3proxy >/dev/null ||
+   ! systemctl restart wdtt-3proxy >/dev/null ||
+   ! systemctl is-active --quiet wdtt-3proxy; then
+  systemctl stop wdtt-3proxy 2>/dev/null || true
+  echo WDTT_ERROR=local_proxy_service_inactive
+  exit 3
 fi
+/usr/local/lib/wdtt/local-proxy-firewall up || { echo WDTT_ERROR=local_proxy_firewall_failed; systemctl stop wdtt-3proxy 2>/dev/null || true; exit 3; }
+TEST_IP="$(curl --proxy-user "$PROXY_LOGIN:$PROXY_PASSWORD" --socks5-hostname "127.0.0.1:$PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+[ -n "$TEST_IP" ] || { systemctl stop wdtt-3proxy 2>/dev/null || true; echo WDTT_ERROR=local_proxy_check_failed; exit 3; }
 SERVER_IP="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 cat >/etc/wdtt/local-proxy.json <<EOF
 {
@@ -1017,11 +1116,11 @@ cat >/etc/wdtt/local-proxy.json <<EOF
 EOF
 chmod 600 /etc/wdtt/local-proxy.json
 echo "Прокси на этом сервере включён и проверен."
-echo "SOCKS5: socks5://$PROXY_LOGIN:$PROXY_PASSWORD@$SERVER_IP:$PROXY_PORT"
-echo "HTTP: http://$PROXY_LOGIN:$PROXY_PASSWORD@$SERVER_IP:$HTTP_PORT"
+echo "SOCKS5: socks5://$PROXY_LOGIN:********@$SERVER_IP:$PROXY_PORT"
+echo "HTTP: http://$PROXY_LOGIN:********@$SERVER_IP:$HTTP_PORT"
 echo "Веб-страница 3proxy: http://$SERVER_IP:$ADMIN_PORT/"
-echo "Логин и пароль одинаковые для SOCKS5, HTTP и веб-страницы 3proxy."
-`, outboundBotPrelude(), port, httpPort, adminPort, botShellQuote(login), botShellQuote(password))
+echo "Логин и пароль одинаковые для SOCKS5, HTTP и веб-страницы 3proxy. Чтобы загрузить сохранённый пароль, используйте в Android-приложении «Деплой → Выходной IP и прокси → Загрузить настройки»."
+`, outboundBotPrelude(), port, httpPort, adminPort, botShellQuote(login), botShellQuote(password), botShellQuote(botThreeProxyVersion), botShellQuote(botThreeProxySourceURL), botShellQuote(botThreeProxySourceSHA256))
 }
 
 func localProxyCheckScript() string {
@@ -1035,7 +1134,7 @@ command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; exit 2;
 if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files wdtt-3proxy.service >/dev/null 2>&1; then
   systemctl is-active --quiet wdtt-3proxy || { echo WDTT_ERROR=local_proxy_service_inactive; exit 3; }
 fi
-IP="$(curl --socks5-hostname "$PROXY_LOGIN:$PROXY_PASSWORD@127.0.0.1:$PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+IP="$(curl --proxy-user "$PROXY_LOGIN:$PROXY_PASSWORD" --socks5-hostname "127.0.0.1:$PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null || true)"
 [ -n "$IP" ] || { echo WDTT_ERROR=local_proxy_check_failed; exit 3; }
 echo "Проверка успешна: SOCKS5 на 127.0.0.1:$PROXY_PORT отвечает с сохранёнными логином и паролем. Выходной IP: $IP"
 `
@@ -1054,7 +1153,7 @@ echo "Прокси на этом сервере остановлен. Настр
 	}
 	return `
 systemctl disable --now wdtt-3proxy 2>/dev/null || true
-rm -f /etc/systemd/system/wdtt-3proxy.service /etc/wdtt/3proxy.cfg /etc/wdtt/local-proxy.json
+rm -f /etc/systemd/system/wdtt-3proxy.service /etc/wdtt/3proxy.cfg /etc/wdtt/local-proxy.json /usr/local/lib/wdtt/local-proxy-firewall
 systemctl daemon-reload 2>/dev/null || true
 if command -v iptables >/dev/null 2>&1; then
   iptables -S INPUT 2>/dev/null | grep WDTT_LOCAL_PROXY | sed 's/^-A /iptables -D /' | while read -r cmd; do $cmd 2>/dev/null || true; done
@@ -1106,7 +1205,27 @@ func parseExternalProxyInput(input string) (kind, host string, port int, login, 
 		err = errors.New("если прокси с авторизацией, укажите и логин, и пароль; если без авторизации — используйте `- -`")
 		return
 	}
+	if len(login) > 80 || len(password) > 120 {
+		err = errors.New("логин должен быть не длиннее 80 символов, пароль — не длиннее 120")
+		return
+	}
+	if strings.Contains(login, ":") {
+		err = errors.New("логин внешнего прокси не должен содержать двоеточие")
+		return
+	}
+	if strings.ContainsAny(login+password, `\"`) {
+		err = errors.New("в логине и пароле через бот нельзя использовать кавычку или обратную косую черту; задайте такие данные из приложения")
+		return
+	}
+	if strings.IndexFunc(login+password, func(r rune) bool { return r < 32 || r == 127 }) >= 0 {
+		err = errors.New("логин или пароль содержит недопустимые управляющие символы")
+		return
+	}
 	return
+}
+
+func escapeRedsocksValue(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value)
 }
 
 func proxyKindLabel(kind string) string {
@@ -1125,18 +1244,20 @@ func externalProxyCheckScript(kind, host string, port int, login, password strin
 	if kind == "socks5" {
 		scheme = "socks5h"
 	}
-	auth := ""
-	if login != "" {
-		auth = login + ":" + password + "@"
-	}
-	proxyURI := fmt.Sprintf("%s://%s%s:%d", scheme, auth, host, port)
+	proxyURI := fmt.Sprintf("%s://%s:%d", scheme, host, port)
 	return fmt.Sprintf(`
 command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; exit 2; }
 PROXY_URI=%s
-IP="$(curl --proxy "$PROXY_URI" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
+PROXY_LOGIN=%s
+PROXY_PASSWORD=%s
+if [ -n "$PROXY_LOGIN" ]; then
+  IP="$(curl --proxy "$PROXY_URI" --proxy-user "$PROXY_LOGIN:$PROXY_PASSWORD" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
+else
+  IP="$(curl --proxy "$PROXY_URI" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
+fi
 [ -n "$IP" ] || { echo WDTT_ERROR=external_proxy_check_failed; exit 3; }
 echo "Проверка успешна: %s отвечает, сервер смог открыть проверочный сайт через него. IP через прокси: $IP"
-`, botShellQuote(proxyURI), proxyKindLabel(kind))
+`, botShellQuote(proxyURI), botShellQuote(login), botShellQuote(password), proxyKindLabel(kind))
 }
 
 func externalProxyEnableScript(kind, host string, port int, login, password string) string {
@@ -1151,6 +1272,8 @@ PROXY_HOST=%s
 PROXY_PORT=%d
 PROXY_LOGIN=%s
 PROXY_PASSWORD=%s
+PROXY_LOGIN_CONFIG=%s
+PROXY_PASSWORD_CONFIG=%s
 wdtt_install_redsocks_tools || true
 REDSOCKS_BIN="$(command -v redsocks || true)"
 [ -n "$REDSOCKS_BIN" ] || { echo WDTT_ERROR=redsocks_not_installed; exit 2; }
@@ -1175,22 +1298,48 @@ redsocks {
   type = $REDSOCKS_TYPE;
 EOF
 if [ -n "$PROXY_LOGIN" ]; then
-  printf '  login = "%%s";\n' "$PROXY_LOGIN" >>/etc/wdtt/redsocks.conf
-  printf '  password = "%%s";\n' "$PROXY_PASSWORD" >>/etc/wdtt/redsocks.conf
+  printf '  login = "%%s";\n' "$PROXY_LOGIN_CONFIG" >>/etc/wdtt/redsocks.conf
+  printf '  password = "%%s";\n' "$PROXY_PASSWORD_CONFIG" >>/etc/wdtt/redsocks.conf
 fi
 cat >>/etc/wdtt/redsocks.conf <<EOF
 }
 EOF
 chmod 600 /etc/wdtt/redsocks.conf
+mkdir -p /usr/local/lib/wdtt
+cat >/usr/local/lib/wdtt/redsocks-routes <<EOF
+#!/bin/sh
+set -eu
+action="\${1:-}"
+WDTT_IFACE=wdtt0
+PROXY_IP=$PROXY_IP
+cleanup() {
+  while iptables -t nat -D PREROUTING -i "\$WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; do :; done
+  iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
+  iptables -t nat -X WDTT_PROXY_OUT 2>/dev/null || true
+}
+if [ "\$action" = down ]; then cleanup; exit 0; fi
+[ "\$action" = up ] || exit 2
+cleanup
+iptables -t nat -N WDTT_PROXY_OUT
+for net in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+  iptables -t nat -A WDTT_PROXY_OUT -d "\$net" -j RETURN
+done
+[ -n "\$PROXY_IP" ] && iptables -t nat -A WDTT_PROXY_OUT -d "\$PROXY_IP" -j RETURN
+iptables -t nat -A WDTT_PROXY_OUT -p tcp -j REDIRECT --to-ports 12345
+iptables -t nat -A PREROUTING -i "\$WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT
+EOF
+chmod 700 /usr/local/lib/wdtt/redsocks-routes
 cat >/etc/systemd/system/wdtt-redsocks.service <<EOF
 [Unit]
 Description=WDTT Plus external proxy redirector
-After=network-online.target
+After=network-online.target wdtt.service
 Wants=network-online.target
 
 [Service]
 Type=forking
 ExecStart=$REDSOCKS_BIN -c /etc/wdtt/redsocks.conf -p /run/wdtt-redsocks.pid
+ExecStartPost=/usr/local/lib/wdtt/redsocks-routes up
+ExecStopPost=/usr/local/lib/wdtt/redsocks-routes down
 PIDFile=/run/wdtt-redsocks.pid
 Restart=on-failure
 
@@ -1198,13 +1347,16 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now wdtt-redsocks >/dev/null
-systemctl is-active --quiet wdtt-redsocks || { echo WDTT_ERROR=external_proxy_service_inactive; journalctl -u wdtt-redsocks -n 30 --no-pager 2>/dev/null || true; exit 3; }
-iptables -t nat -N WDTT_PROXY_OUT 2>/dev/null || true
-iptables -t nat -F WDTT_PROXY_OUT
-wdtt_proxy_reserved_returns WDTT_PROXY_OUT "$PROXY_IP"
-iptables -t nat -A WDTT_PROXY_OUT -p tcp -j REDIRECT --to-ports 12345
-iptables -t nat -C PREROUTING -i "$WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null || iptables -t nat -A PREROUTING -i "$WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT
+if ! systemctl enable wdtt-redsocks >/dev/null ||
+   ! systemctl restart wdtt-redsocks >/dev/null ||
+   ! systemctl is-active --quiet wdtt-redsocks; then
+  journalctl -u wdtt-redsocks -n 30 --no-pager 2>/dev/null || true
+  wdtt_clear_external_out
+  wdtt_write_mode "direct" "rollback after external proxy service error"
+  echo WDTT_ERROR=external_proxy_service_inactive
+  exit 3
+fi
+/usr/local/lib/wdtt/redsocks-routes up || { echo WDTT_ERROR=external_proxy_route_install_failed; wdtt_clear_external_out; exit 3; }
 if ! wdtt_test_redsocks_path "$PROXY_IP"; then
   wdtt_clear_external_out
   wdtt_write_mode "direct" "rollback after external proxy error"
@@ -1213,7 +1365,7 @@ fi
 wdtt_write_mode "external_proxy" "$PROXY_KIND://$PROXY_HOST:$PROXY_PORT"
 echo "Внешний прокси включён для обычных TCP-подключений WDTT-пользователей. Голосовой UDP-трафик через него не перенаправляется."
 echo "Прокси: $PROXY_KIND://$PROXY_HOST:$PROXY_PORT"
-`, outboundBotPrelude(), botShellQuote(kind), botShellQuote(redsocksType), botShellQuote(host), port, botShellQuote(login), botShellQuote(password))
+`, outboundBotPrelude(), botShellQuote(kind), botShellQuote(redsocksType), botShellQuote(host), port, botShellQuote(login), botShellQuote(password), botShellQuote(escapeRedsocksValue(login)), botShellQuote(escapeRedsocksValue(password)))
 }
 
 func sendFreeWarpMenu(token string, adminID int64, messageID int) int {
@@ -2108,7 +2260,7 @@ func showEditExpiryMenu(token string, adminID int64, messageID int, pass string)
 	)
 }
 
-func startNewPasswordFlow(token string, adminID int64, wgDev *device.Device, waitingForDays *bool, messageID int) int {
+func startNewPasswordFlow(token string, adminID int64, wgDev wgDevice, waitingForDays *bool, messageID int) int {
 	dbMutex.Lock()
 	if cleanupExpiredPasswordsLocked(wgDev) > 0 {
 		saveDB()
@@ -2125,7 +2277,7 @@ func startNewPasswordFlow(token string, adminID int64, wgDev *device.Device, wai
 	return showNewPasswordDaysMenu(token, adminID, messageID)
 }
 
-func botLoop(token string, adminIDstr string, wgDev *device.Device) {
+func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 	if token == "" || adminIDstr == "" {
 		return
 	}
@@ -2578,9 +2730,9 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					entry, exists := db.Passwords[pass]
 					if exists && entry != nil {
 						if days == 0 {
-							entry.ExpiresAt = 0
+							setPasswordExpiryPreservingRetention(entry, 0)
 						} else {
-							entry.ExpiresAt = time.Now().Add(time.Duration(days) * 24 * time.Hour).Unix()
+							setPasswordExpiryPreservingRetention(entry, time.Now().Add(time.Duration(days)*24*time.Hour).Unix())
 						}
 						saveDB()
 					}
@@ -2787,7 +2939,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 				} else if data == "out_local_install" {
 					login := "wdtt" + strings.ToLower(generatePassword()[:8])
 					password := generatePassword()
-					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "🧦 Создаю или обновляю SOCKS5/HTTP-прокси на этом сервере. Если пакета 3proxy нет, попробую собрать его из исходников...", nil)
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "🧦 Создаю или обновляю SOCKS5/HTTP-прокси на этом сервере из проверенного выпуска 3proxy...", nil)
 					out, err := runBotScript(localProxyInstallScript(login, password, 1080), 5*time.Minute)
 					promptMessageID = sendBotScriptResult(token, adminID, promptMessageID, "Прокси на сервере готов", out, err, "out_local")
 				} else if data == "out_local_check" {
@@ -3449,9 +3601,9 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 						continue
 					}
 					if days == 0 {
-						entry.ExpiresAt = 0
+						setPasswordExpiryPreservingRetention(entry, 0)
 					} else {
-						entry.ExpiresAt = time.Now().Add(time.Duration(days) * 24 * time.Hour).Unix()
+						setPasswordExpiryPreservingRetention(entry, time.Now().Add(time.Duration(days)*24*time.Hour).Unix())
 					}
 					saveDB()
 					dbMutex.Unlock()
@@ -3581,7 +3733,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 	}
 }
 
-func sendPasswordList(token string, adminID int64, wgDev *device.Device, messageID int) int {
+func sendPasswordList(token string, adminID int64, wgDev wgDevice, messageID int) int {
 	dbMutex.Lock()
 	defer dbMutex.Unlock()
 

@@ -123,4 +123,68 @@ class TrustedWifiTest {
             )
         )
     }
+
+    @Test
+    fun `trusted wifi resume retries keep cpu awake only during fast recovery window`() {
+        assertEquals(
+            TrustedWifiResumeRetryPlan(delayMs = 5_000L, keepCpuAwake = true),
+            trustedWifiResumeRetryPlan(0)
+        )
+        assertEquals(
+            TrustedWifiResumeRetryPlan(delayMs = 5_000L, keepCpuAwake = true),
+            trustedWifiResumeRetryPlan(11)
+        )
+        assertEquals(
+            TrustedWifiResumeRetryPlan(delayMs = 30_000L, keepCpuAwake = false),
+            trustedWifiResumeRetryPlan(12)
+        )
+    }
+
+    @Test
+    fun `lost trusted wifi is not reused as validated resume network`() {
+        val networks = TrustedWifiValidatedNetworkTracker<String>()
+        networks.update(network = "home", validated = true, wifi = true)
+        assertTrue(networks.hasUsableNetwork())
+
+        networks.forgetWifi()
+        assertFalse(networks.hasUsableNetwork())
+
+        networks.update(network = "cellular", validated = true, wifi = false)
+        assertTrue(networks.hasUsableNetwork())
+
+        networks.lost("cellular")
+        assertFalse(networks.hasUsableNetwork())
+    }
+
+    @Test
+    fun `trusted wifi loss preserves an already validated cellular network`() {
+        val networks = TrustedWifiValidatedNetworkTracker<String>()
+        networks.update(network = "home", validated = true, wifi = true)
+        networks.update(network = "cellular", validated = true, wifi = false)
+
+        networks.forgetWifi()
+
+        assertTrue(networks.hasUsableNetwork())
+    }
+
+    @Test
+    fun `internet capability without validation is not enough to resume`() {
+        val networks = TrustedWifiValidatedNetworkTracker<String>()
+        networks.update(network = "cellular", validated = false, wifi = false)
+        assertFalse(networks.hasUsableNetwork())
+
+        networks.update(network = "cellular", validated = true, wifi = false)
+        assertTrue(networks.hasUsableNetwork())
+    }
+
+    @Test
+    fun `losing trusted wifi does not discard a newly validated untrusted wifi`() {
+        val networks = TrustedWifiValidatedNetworkTracker<String>()
+        networks.update(network = "home", validated = true, wifi = true)
+        networks.update(network = "office", validated = true, wifi = true)
+
+        networks.lost("home")
+
+        assertTrue(networks.hasUsableNetwork())
+    }
 }

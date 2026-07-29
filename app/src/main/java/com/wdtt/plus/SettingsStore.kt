@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -17,8 +18,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -26,11 +30,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 import android.os.Build
+import java.util.UUID
 
 data class VkHashInsertResult(
     val slot: Int,
     val hash: String,
-    val previousHash: String
+    val previousHash: String,
+    val profile: Int = 0,
+    val hashes: List<String> = emptyList(),
 )
 
 data class WdttLinkParts(
@@ -40,20 +47,34 @@ data class WdttLinkParts(
     val localPort: Int,
     val password: String,
     val hashes: String,
-    val profileName: String = ""
+    val profileName: String = "",
+    val maxWorkers: Int = 0
 )
+
+internal fun WdttLinkParts.hasNonStandardPorts(): Boolean =
+    dtlsPort != 56000 || wgPort != 56001 || localPort != 9000
+
+private val supportedWdttLinkFormats = """
+    Поддерживаются форматы:
+    • Новый: wdtt://connect?v=1&host=адрес&dtls=DTLS-порт&wg=WG-порт&local=локальный-порт&password=пароль&hashes=VK-хеши
+    • Старый: wdtt://адрес:DTLS-порт:WG-порт:локальный-порт:пароль:VK-хеши
+""".trimIndent()
 
 data class WdttDeepLinkValidation(
     val parts: WdttLinkParts?,
     val errors: List<String>,
     val warnings: List<String> = emptyList()
 ) {
-    val canStartVpn: Boolean = parts != null && errors.isEmpty()
+    val canStartVpn: Boolean = parts != null && errors.isEmpty() && parts.hashes.isNotBlank()
 
     fun userMessage(): String {
-        return if (canStartVpn) {
+        return if (parts != null && errors.isEmpty()) {
             buildString {
-                append("Ссылка wdtt:// корректна. VPN сможет использовать эти данные для подключения.")
+                if (parts.hashes.isBlank()) {
+                    append("Ссылка wdtt:// распознана. Добавьте свой VK-хеш перед запуском VPN.")
+                } else {
+                    append("Ссылка wdtt:// корректна. VPN сможет использовать эти данные для подключения.")
+                }
                 parts?.profileName?.takeIf { it.isNotBlank() }?.let {
                     append("\nНазвание профиля: «")
                     append(it)
@@ -68,7 +89,8 @@ data class WdttDeepLinkValidation(
             buildString {
                 append("VPN не запустится по этой ссылке, потому что в ней есть ошибки:\n")
                 append(errors.joinToString("\n") { "• $it" })
-                append("\n\nПравильный вид: wdtt://адрес:DTLS-порт:WG-порт:локальный-порт:пароль:VK-хеши")
+                append("\n\n")
+                append(supportedWdttLinkFormats)
             }
         }
     }
@@ -84,17 +106,108 @@ data class WdttDeepLinkApplyPlan(
 data class WdttDeepLinkApplyResult(
     val targetProfile: Int,
     val overwritten: Boolean,
-    val storedAsLink: Boolean
+    val storedAsLink: Boolean,
+    val alreadyApplied: Boolean = false,
+)
+
+internal data class InterfaceRoleProfileState(
+    val role: String,
+    val rememberedRole: String?,
+)
+
+internal fun reconcileInterfaceRoleForProfile(
+    storedRole: String,
+    rememberedRole: String?,
+    remoteManagedProfile: Boolean,
+): InterfaceRoleProfileState {
+    val validStoredRole = storedRole.takeIf { it == "user" || it == "admin" }.orEmpty()
+    val validRememberedRole = rememberedRole?.takeIf { it == "user" || it == "admin" }
+    return if (remoteManagedProfile) {
+        InterfaceRoleProfileState(
+            role = "user",
+            rememberedRole = validRememberedRole ?: validStoredRole.takeIf { it.isNotBlank() },
+        )
+    } else {
+        InterfaceRoleProfileState(
+            role = validRememberedRole ?: validStoredRole,
+            rememberedRole = null,
+        )
+    }
+}
+
+data class TunnelProfileSnapshot(
+    val profileIndex: Int,
+    val remoteManaged: Boolean,
+    val linkMode: Boolean,
+    val link: String,
+    val peer: String,
+    val vkHashes: String,
+    val secondaryVkHash: String,
+    val connectionPassword: String,
+    val workersPerHash: Int,
+    val profileMaxWorkers: Int,
+    val manualPortsEnabled: Boolean,
+    val serverDtlsPort: Int,
+    val listenPort: Int,
+    val sni: String,
+    val protocol: String,
+    val vkCallsPreflight: Boolean,
+    val captchaMode: String,
+    val captchaSolveMethod: String,
+    val fingerprint: String,
+    val clientIds: String,
+    val customVkCredentialsEnabled: Boolean,
+    val customVkClientId: String,
+    val customVkClientSecret: String,
+)
+
+/**
+ * One atomic DataStore projection for the visible Tunnel tab.
+ *
+ * Keeping these values in one snapshot prevents a profile switch from briefly combining the
+ * new profile index with connection fields (or interface role) emitted for the previous one.
+ */
+data class ActiveTunnelProfileUiSnapshot(
+    val profileIndex: Int,
+    val profileNames: List<String>,
+    val interfaceRole: String,
+    val permissionOnboardingComplete: Boolean,
+    val connectionInputMethod: String,
+    val linkMode: Boolean,
+    val link: String,
+    val peer: String,
+    val vkHashes: String,
+    val connectionPassword: String,
+    val workersPerHash: Int,
+    val manualPortsEnabled: Boolean,
+    val serverDtlsPort: Int,
+    val serverWgPort: Int,
+    val listenPort: Int,
+    val sni: String,
+    val captchaMode: String,
+    val captchaSolveMethod: String,
+    val fingerprint: String,
+    val clientIds: String,
+    val customVkCredentialsEnabled: Boolean,
+    val customVkClientId: String,
+    val customVkClientSecret: String,
+    val vkCallsPreflight: Boolean,
+    val remoteActionKey: String,
+    val remoteActionUrl: String,
+    val remoteManaged: Boolean,
+    val cachedRemoteAction: CachedRemoteAction,
+    val remoteCardDismissed: Boolean,
+    val accessLifecycle: AccessLifecycleUiState,
+    val accessLifecycleDismissedSignature: String,
+    val profileMaxWorkers: Int,
 )
 
 object WdttDeepLink {
-    private val expectedFormat = "wdtt://адрес:DTLS-порт:WG-порт:локальный-порт:пароль:VK-хеши"
-
-    fun parse(value: String): WdttLinkParts? {
-        return validate(value).parts
+    fun parse(value: String, allowMissingHashes: Boolean = false): WdttLinkParts? {
+        return validate(value, allowMissingHashes).parts
     }
 
-    fun validate(value: String): WdttDeepLinkValidation {
+    fun validate(value: String, allowMissingHashes: Boolean = false): WdttDeepLinkValidation {
         val clean = WdttTransferCodec.extractWdttLink(value) ?: value.trim()
         val errors = mutableListOf<String>()
         val warnings = mutableListOf<String>()
@@ -102,7 +215,7 @@ object WdttDeepLink {
         if (clean.isBlank()) {
             return WdttDeepLinkValidation(
                 parts = null,
-                errors = listOf("Ссылка пустая. Нужен вид: $expectedFormat.")
+                errors = listOf("Ссылка пустая. Вставьте ссылку WDTT нового или старого формата.")
             )
         }
 
@@ -132,7 +245,7 @@ object WdttDeepLink {
             }
             return WdttDeepLinkValidation(
                 parts = null,
-                errors = listOf("В ссылке должно быть 6 полей после wdtt://, сейчас $found: $detail.")
+                errors = listOf("В старой ссылке должно быть 6 полей после wdtt://, сейчас $found: $detail.")
             )
         }
 
@@ -152,20 +265,26 @@ object WdttDeepLink {
 
         val rawHashes = (modernParts?.hashes ?: parts[5]).split(",")
         val hashes = rawHashes
-            .map { VkJoinLink.extractHash(it) }
-            .filter { it.isNotBlank() && it.length >= 16 }
+            .mapNotNull { VkJoinLink.normalizeHashes(it)?.takeIf(String::isNotBlank) }
             .distinct()
             .joinToString(",")
 
         if (hashes.isBlank()) {
-            errors += "Нет рабочего VK-хеша. Нужен хотя бы один хеш длиной от 16 символов или ссылка VK-звонка."
+            val invalidHashesProvided = rawHashes.any { it.isNotBlank() }
+            if (invalidHashesProvided) {
+                errors += "VK-хеш содержит недопустимые символы. Используйте латинские буквы, цифры, _ и - либо ссылку VK-звонка."
+            } else if (allowMissingHashes) {
+                warnings += "VK-хеши ещё не заполнены. Добавьте их в WDTT Plus перед запуском VPN."
+            } else {
+                errors += "Нет рабочего VK-хеша. Нужен хеш из латинских букв, цифр, _ или - либо ссылка VK-звонка."
+            }
         } else {
             val invalidHashes = rawHashes
                 .map { it.trim() }
                 .filter { it.isNotBlank() }
-                .count { VkJoinLink.extractHash(it).length < 16 }
+                .count { !VkJoinLink.isValidInput(it) }
             if (invalidHashes > 0) {
-                warnings += "$invalidHashes ${hashWord(invalidHashes)} короче 16 символов и будет пропущено."
+                warnings += "$invalidHashes ${hashWord(invalidHashes)} содержит недопустимые символы и будет пропущено."
             }
         }
 
@@ -177,7 +296,8 @@ object WdttDeepLink {
                 localPort = localPort,
                 password = password,
                 hashes = hashes,
-                profileName = normalizeVpnProfileName(modernParts?.profileName.orEmpty())
+                profileName = normalizeVpnProfileName(modernParts?.profileName.orEmpty()),
+                maxWorkers = modernParts?.maxWorkers ?: 0
             )
         } else null
 
@@ -235,39 +355,117 @@ object WdttDeepLink {
 
 class SettingsStore(context: Context) {
     private val appContext = context.applicationContext
-    private val storeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val preferencesState: StateFlow<Preferences?> = appContext.dataStore.data.stateIn(
-        storeScope,
-        SharingStarted.Eagerly,
-        null
-    )
+    private val sharedPreferences = obtainSharedPreferences(appContext)
+    private val storeScope = sharedPreferences.scope
+    private val preferencesState: StateFlow<Preferences?> = sharedPreferences.state
     private val preferencesFlow: Flow<Preferences> = preferencesState.filterNotNull()
     private val _settingsReady = MutableStateFlow(false)
     val settingsReady: StateFlow<Boolean> = _settingsReady.asStateFlow()
 
-    init {
-        storeScope.launch {
-            preferencesFlow.first()
-            _settingsReady.value = true
-        }
-    }
-
     companion object {
         private val Context.dataStore by preferencesDataStore("settings")
+        private data class SharedPreferences(
+            val scope: CoroutineScope,
+            val state: StateFlow<Preferences?>,
+        )
+
+        @Volatile
+        private var sharedPreferences: SharedPreferences? = null
+
+        private fun obtainSharedPreferences(context: Context): SharedPreferences =
+            sharedPreferences ?: synchronized(this) {
+                sharedPreferences ?: run {
+                    val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+                    SharedPreferences(
+                        scope = scope,
+                        state = context.dataStore.data.stateIn(
+                            scope,
+                            SharingStarted.Eagerly,
+                            null,
+                        ),
+                    ).also { sharedPreferences = it }
+                }
+            }
         private val ACTIVE_PROFILE = intPreferencesKey("active_profile")
+        private val ACTIVE_TUNNEL_PROFILE = intPreferencesKey("active_tunnel_profile")
         private val PROFILE_NAME = stringPreferencesKey("profile_name")
         private val SHOW_SYSTEM_APPS = booleanPreferencesKey("show_system_apps")
         private val LOGGING_ENABLED = booleanPreferencesKey("logging_enabled")
+        private val FLOATING_TOOLBAR_Y_FRACTION = floatPreferencesKey("floating_toolbar_y_fraction")
         private val TRUSTED_WIFI_ENABLED = booleanPreferencesKey("trusted_wifi_enabled")
         private val TRUSTED_WIFI_SSIDS = stringPreferencesKey("trusted_wifi_ssids")
         private val TRUSTED_WIFI_WAITING = booleanPreferencesKey("trusted_wifi_waiting")
         private val TRUSTED_WIFI_WAITING_SSID = stringPreferencesKey("trusted_wifi_waiting_ssid")
         private val WDTT_LINK = stringPreferencesKey("wdtt_link")
         private val WDTT_LINK_MODE = booleanPreferencesKey("wdtt_link_mode")
+        private val CONNECTION_INPUT_METHOD = stringPreferencesKey("connection_input_method")
+        private val CONNECT_DEVICE_ID = stringPreferencesKey("connect_device_id")
+        private val TUNNEL_DEVICE_ID = stringPreferencesKey("tunnel_device_id")
 
         private val PEER = stringPreferencesKey("peer")
         private val VK_HASHES = stringPreferencesKey("vk_hashes")
         private val SECONDARY_VK_HASH = stringPreferencesKey("secondary_vk_hash")
+        private val PROFILE_VALUES_SYNC_PENDING =
+            booleanPreferencesKey("profile_values_sync_pending")
+        private val REMOTE_ACTION_KEY = stringPreferencesKey("remote_action_key")
+        private val REMOTE_ACTION_KEY_ENCRYPTED =
+            stringPreferencesKey("remote_action_key_encrypted")
+        private val REMOTE_ACTION_URL = stringPreferencesKey("remote_action_url")
+        private val REMOTE_DOCUMENT_BINDING = stringPreferencesKey("remote_document_binding")
+        private val REMOTE_MANAGED_PROFILE = booleanPreferencesKey("remote_managed_profile")
+        private val REMOTE_CARD_DISMISSED = booleanPreferencesKey("remote_card_dismissed")
+        private val ACCESS_LIFECYCLE_DISMISSED_SIGNATURE =
+            stringPreferencesKey("access_lifecycle_dismissed_signature")
+        private val ACCESS_LIFECYCLE_KEY_ENCRYPTED =
+            stringPreferencesKey("access_lifecycle_key_encrypted")
+        private val ACCESS_LIFECYCLE_URL = stringPreferencesKey("access_lifecycle_url")
+        private val ACCESS_LIFECYCLE_BINDING = stringPreferencesKey("access_lifecycle_binding")
+        private val PROFILE_EXCHANGE_SUBMIT_TOKEN_ENCRYPTED =
+            stringPreferencesKey("profile_exchange_submit_token_encrypted")
+        private val PROFILE_EXCHANGE_ACTION_TOKEN_ENCRYPTED =
+            stringPreferencesKey("profile_exchange_action_token_encrypted")
+        private val PROFILE_EXCHANGE_ACTION_LABEL =
+            stringPreferencesKey("profile_exchange_action_label")
+        private val PROFILE_EXCHANGE_ACTION_MESSAGE =
+            stringPreferencesKey("profile_exchange_action_message")
+        private val PROFILE_EXCHANGE_ACTION_AVAILABLE =
+            booleanPreferencesKey("profile_exchange_action_available")
+        private val CACHED_ACTION_PAYLOAD_ENCRYPTED =
+            stringPreferencesKey("cached_action_payload_encrypted")
+        private val CACHED_ACTION_URL = stringPreferencesKey("cached_action_url")
+        private val CACHED_ACTION_FALLBACK = stringPreferencesKey("cached_action_fallback")
+        private val CACHED_ACTION_HANDLER = stringPreferencesKey("cached_action_handler")
+        private val CACHED_ACTION_TITLE = stringPreferencesKey("cached_action_title")
+        private val CACHED_ACTION_MESSAGE = stringPreferencesKey("cached_action_message")
+        private val CACHED_ACTION_LABEL = stringPreferencesKey("cached_action_label")
+        private val CACHED_ACTION_CLIPBOARD_LABEL =
+            stringPreferencesKey("cached_action_clipboard_label")
+        private val CACHED_ACTION_COPIED_MESSAGE =
+            stringPreferencesKey("cached_action_copied_message")
+        private val CACHED_ACTION_FAILED_MESSAGE =
+            stringPreferencesKey("cached_action_failed_message")
+        private val CACHED_ACTION_HELP_TITLE =
+            stringPreferencesKey("cached_action_help_title")
+        private val CACHED_ACTION_HELP_INTRO =
+            stringPreferencesKey("cached_action_help_intro")
+        private val CACHED_ACTION_HELP_STEPS =
+            stringPreferencesKey("cached_action_help_steps")
+        private val ACCESS_ACTION_LABEL = stringPreferencesKey("access_action_label")
+        private val ACCESS_ACTION_MESSAGE = stringPreferencesKey("access_action_message")
+        private val ACCESS_TITLE = stringPreferencesKey("access_title")
+        private val ACCESS_MESSAGE = stringPreferencesKey("access_message")
+        private val ACCESS_DETAIL_LABEL = stringPreferencesKey("access_detail_label")
+        private val ACCESS_DETAIL_VALUE = stringPreferencesKey("access_detail_value")
+        private val ACCESS_ACTION_ICON = stringPreferencesKey("access_action_icon")
+        private val ACCESS_SEVERITY = stringPreferencesKey("access_severity")
+        private val ACCESS_ALLOW_CONNECT = booleanPreferencesKey("access_allow_connect")
+        private val ACCESS_ACTION_AVAILABLE = booleanPreferencesKey("access_action_available")
+        private val ACCESS_CHECKED_AT = longPreferencesKey("access_checked_at")
+        private val ACCESS_LAST_ATTEMPT_AT = longPreferencesKey("access_last_attempt_at")
+        private val ACCESS_PROFILE_REVISION = longPreferencesKey("access_profile_revision")
+        private val ACCESS_ACTION_LAUNCHED_AT =
+            longPreferencesKey("access_action_launched_at")
+        private val PROFILE_MAX_WORKERS = intPreferencesKey("profile_max_workers")
         private val VK_HASH_NEXT_SLOT = intPreferencesKey("vk_hash_next_slot")
         private val WORKERS_PER_HASH = intPreferencesKey("workers_per_hash")
         private val PROTOCOL = stringPreferencesKey("protocol")
@@ -336,6 +534,11 @@ class SettingsStore(context: Context) {
         // ═══ Fingerprint & Client IDs ═══
         private val SELECTED_FINGERPRINT = stringPreferencesKey("selected_fingerprint")
         private val ACTIVE_CLIENT_IDS = stringPreferencesKey("active_client_ids")
+        private val CUSTOM_VK_CREDENTIALS_ENABLED = booleanPreferencesKey("custom_vk_credentials_enabled")
+        private val CUSTOM_VK_CLIENT_ID = stringPreferencesKey("custom_vk_client_id")
+        private val CUSTOM_VK_CLIENT_SECRET = stringPreferencesKey("custom_vk_client_secret")
+        private val CUSTOM_VK_CLIENT_SECRET_ENCRYPTED =
+            stringPreferencesKey("custom_vk_client_secret_encrypted")
 
         private val UPDATE_LAST_CHECK_AT = longPreferencesKey("update_last_check_at")
         private val UPDATE_LATEST_VERSION = stringPreferencesKey("update_latest_version")
@@ -363,17 +566,138 @@ class SettingsStore(context: Context) {
 
         private val CLIENT_ID_CHECK_RESULTS = stringPreferencesKey("client_id_check_results")
         private val INTERFACE_ROLE = stringPreferencesKey("interface_role")
+        private val INTERFACE_ROLE_BEFORE_REMOTE_PROFILE =
+            stringPreferencesKey("interface_role_before_remote_profile")
         private val PERMISSION_ONBOARDING_COMPLETE = booleanPreferencesKey("permission_onboarding_complete")
         private const val VPN_PROFILE_COUNT = 3
+
+        private val PROFILE_STRING_KEYS = listOf(
+            PROFILE_NAME,
+            PEER,
+            VK_HASHES,
+            SECONDARY_VK_HASH,
+            REMOTE_ACTION_KEY,
+            REMOTE_ACTION_KEY_ENCRYPTED,
+            REMOTE_ACTION_URL,
+            REMOTE_DOCUMENT_BINDING,
+            ACCESS_LIFECYCLE_KEY_ENCRYPTED,
+            ACCESS_LIFECYCLE_URL,
+            ACCESS_LIFECYCLE_BINDING,
+            PROFILE_EXCHANGE_SUBMIT_TOKEN_ENCRYPTED,
+            PROFILE_EXCHANGE_ACTION_TOKEN_ENCRYPTED,
+            PROFILE_EXCHANGE_ACTION_LABEL,
+            PROFILE_EXCHANGE_ACTION_MESSAGE,
+            CACHED_ACTION_PAYLOAD_ENCRYPTED,
+            CACHED_ACTION_URL,
+            CACHED_ACTION_FALLBACK,
+            CACHED_ACTION_HANDLER,
+            CACHED_ACTION_TITLE,
+            CACHED_ACTION_MESSAGE,
+            CACHED_ACTION_LABEL,
+            CACHED_ACTION_CLIPBOARD_LABEL,
+            CACHED_ACTION_COPIED_MESSAGE,
+            CACHED_ACTION_FAILED_MESSAGE,
+            CACHED_ACTION_HELP_TITLE,
+            CACHED_ACTION_HELP_INTRO,
+            CACHED_ACTION_HELP_STEPS,
+            ACCESS_ACTION_LABEL,
+            ACCESS_ACTION_MESSAGE,
+            ACCESS_TITLE,
+            ACCESS_MESSAGE,
+            ACCESS_DETAIL_LABEL,
+            ACCESS_DETAIL_VALUE,
+            ACCESS_ACTION_ICON,
+            ACCESS_SEVERITY,
+            ACCESS_LIFECYCLE_DISMISSED_SIGNATURE,
+            PROTOCOL,
+            SNI,
+            USER_AGENT,
+            DEPLOY_IP,
+            DEPLOY_LOGIN,
+            DEPLOY_PASSWORD,
+            DEPLOY_PASSWORD_ENCRYPTED,
+            DEPLOY_SSH_PRIVATE_KEY,
+            DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED,
+            DEPLOY_SSH_KEY_PASSPHRASE,
+            DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED,
+            DEPLOY_SSH_AUTH_MODE,
+            WG_EXIT_SSH_PRIVATE_KEY,
+            WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED,
+            WG_EXIT_SSH_KEY_PASSPHRASE,
+            WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED,
+            WG_EXIT_SSH_AUTH_MODE,
+            DEPLOY_SSH_PORT,
+            DEPLOY_DNS1,
+            DEPLOY_DNS2,
+            EXCLUDED_APPS,
+            BLACKLIST_APPS,
+            WHITELIST_APPS,
+            CONNECTION_PASSWORD,
+            CONNECTION_PASSWORD_ENCRYPTED,
+            DEPLOY_MAIN_PASSWORD,
+            DEPLOY_MAIN_PASSWORD_ENCRYPTED,
+            DEPLOY_ADMIN_ID,
+            DEPLOY_ADMIN_ID_ENCRYPTED,
+            DEPLOY_BOT_TOKEN,
+            DEPLOY_BOT_TOKEN_ENCRYPTED,
+            PROXY_MODE,
+            PROXY_HOST,
+            CAPTCHA_MODE,
+            CAPTCHA_SOLVE_METHOD,
+            CAPTCHA_WBV_SOLVE_METHOD,
+            WDTT_LINK,
+            CONNECTION_INPUT_METHOD,
+            SELECTED_FINGERPRINT,
+            ACTIVE_CLIENT_IDS,
+            CUSTOM_VK_CLIENT_ID,
+            CUSTOM_VK_CLIENT_SECRET,
+            CUSTOM_VK_CLIENT_SECRET_ENCRYPTED
+        )
+        private val PROFILE_INT_KEYS = listOf(
+            WORKERS_PER_HASH,
+            PROFILE_MAX_WORKERS,
+            VK_HASH_NEXT_SLOT,
+            LISTEN_PORT,
+            SERVER_DTLS_PORT,
+            SERVER_WG_PORT,
+            PROXY_PORT
+        )
+        private val PROFILE_LONG_KEYS = listOf(
+            ACCESS_CHECKED_AT,
+            ACCESS_LAST_ATTEMPT_AT,
+            ACCESS_PROFILE_REVISION,
+            ACCESS_ACTION_LAUNCHED_AT,
+        )
+        private val PROFILE_BOOLEAN_KEYS = listOf(
+            MANUAL_PORTS_ENABLED,
+            NO_DTLS,
+            NO_DNS,
+            IS_WHITELIST,
+            WDTT_LINK_MODE,
+            REMOTE_MANAGED_PROFILE,
+            REMOTE_CARD_DISMISSED,
+            VKCALLS_PREFLIGHT,
+            DETAILED_LOGS,
+            CUSTOM_VK_CREDENTIALS_ENABLED,
+            ACCESS_ALLOW_CONNECT,
+            ACCESS_ACTION_AVAILABLE,
+            PROFILE_VALUES_SYNC_PENDING,
+            PROFILE_EXCHANGE_ACTION_AVAILABLE,
+        )
+
+        internal fun resettableProfilePreferenceNames(): Set<String> =
+            (PROFILE_STRING_KEYS + PROFILE_INT_KEYS + PROFILE_LONG_KEYS + PROFILE_BOOLEAN_KEYS)
+                .mapTo(linkedSetOf()) { it.name }
 
         private fun <T> getProfileKey(baseKey: Preferences.Key<T>, profile: Int): Preferences.Key<T> {
             if (profile == 0) return baseKey
             val newName = "${baseKey.name}_$profile"
             @Suppress("UNCHECKED_CAST")
-            return when (baseKey) {
-                PROFILE_NAME, PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE, DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_AUTH_MODE, WG_EXIT_SSH_PRIVATE_KEY, WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED, WG_EXIT_SSH_KEY_PASSPHRASE, WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED, WG_EXIT_SSH_AUTH_MODE, DEPLOY_SSH_PORT, DEPLOY_DNS1, DEPLOY_DNS2, EXCLUDED_APPS, BLACKLIST_APPS, WHITELIST_APPS, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_ADMIN_ID, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_BOT_TOKEN, DEPLOY_BOT_TOKEN_ENCRYPTED, PROXY_MODE, PROXY_HOST, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, WDTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS -> stringPreferencesKey(newName) as Preferences.Key<T>
-                WORKERS_PER_HASH, VK_HASH_NEXT_SLOT, LISTEN_PORT, SERVER_DTLS_PORT, SERVER_WG_PORT, PROXY_PORT -> intPreferencesKey(newName) as Preferences.Key<T>
-                MANUAL_PORTS_ENABLED, NO_DTLS, NO_DNS, IS_WHITELIST, WDTT_LINK_MODE, VKCALLS_PREFLIGHT, DETAILED_LOGS -> booleanPreferencesKey(newName) as Preferences.Key<T>
+            return when {
+                PROFILE_STRING_KEYS.any { it.name == baseKey.name } -> stringPreferencesKey(newName) as Preferences.Key<T>
+                PROFILE_INT_KEYS.any { it.name == baseKey.name } -> intPreferencesKey(newName) as Preferences.Key<T>
+                PROFILE_LONG_KEYS.any { it.name == baseKey.name } -> longPreferencesKey(newName) as Preferences.Key<T>
+                PROFILE_BOOLEAN_KEYS.any { it.name == baseKey.name } -> booleanPreferencesKey(newName) as Preferences.Key<T>
                 else -> throw IllegalArgumentException("Unsupported key type: ${baseKey.name}")
             }
         }
@@ -381,16 +705,124 @@ class SettingsStore(context: Context) {
 
     private val dataStore = appContext.dataStore
     private val secureStore = SecureStringStore(appContext)
+    // Keep the selected profile responsive while the DataStore write is being flushed. The
+    // snapshot still falls back to the persisted value for every other caller.
+    private val activeProfileOverride = MutableStateFlow<Int?>(null)
+
+    val activeProfile: Flow<Int> = preferencesFlow.map { it[ACTIVE_PROFILE] ?: 0 }
+    val activeTunnelProfileUiSnapshot: StateFlow<ActiveTunnelProfileUiSnapshot?> =
+        combine(preferencesState, activeProfileOverride) { prefs, requestedProfile ->
+            prefs?.let {
+                val persistedProfile = (it[ACTIVE_PROFILE] ?: 0)
+                    .coerceIn(0, VPN_PROFILE_COUNT - 1)
+                if (requestedProfile != null && requestedProfile == persistedProfile) {
+                    // The DataStore emission has caught up. Clearing the override here keeps
+                    // the same snapshot (distinctUntilChanged prevents a visual bounce).
+                    activeProfileOverride.compareAndSet(requestedProfile, null)
+                }
+                val profile =
+                    (requestedProfile ?: persistedProfile)
+                        .coerceIn(0, VPN_PROFILE_COUNT - 1)
+                ActiveTunnelProfileUiSnapshot(
+                    profileIndex = profile,
+                    profileNames = (0 until VPN_PROFILE_COUNT).map { index ->
+                        it[getProfileKey(PROFILE_NAME, index)].orEmpty()
+                    },
+                    interfaceRole = it[INTERFACE_ROLE].orEmpty(),
+                    permissionOnboardingComplete =
+                        it[PERMISSION_ONBOARDING_COMPLETE] ?: !it[INTERFACE_ROLE].isNullOrBlank(),
+                    connectionInputMethod = it[getProfileKey(CONNECTION_INPUT_METHOD, profile)]
+                        ?.takeIf { method -> method == "link" || method == "manual" }
+                        .orEmpty(),
+                    linkMode = it[getProfileKey(WDTT_LINK_MODE, profile)] ?: false,
+                    link = it[getProfileKey(WDTT_LINK, profile)].orEmpty(),
+                    peer = it[getProfileKey(PEER, profile)].orEmpty(),
+                    vkHashes = it[getProfileKey(VK_HASHES, profile)].orEmpty(),
+                    connectionPassword = readSecret(
+                        it,
+                        CONNECTION_PASSWORD_ENCRYPTED,
+                        CONNECTION_PASSWORD,
+                        profile
+                    ),
+                    workersPerHash = it[getProfileKey(WORKERS_PER_HASH, profile)] ?: 18,
+                    manualPortsEnabled = it[getProfileKey(MANUAL_PORTS_ENABLED, profile)] ?: false,
+                    serverDtlsPort = it[getProfileKey(SERVER_DTLS_PORT, profile)] ?: 56000,
+                    serverWgPort = it[getProfileKey(SERVER_WG_PORT, profile)] ?: 56001,
+                    listenPort = it[getProfileKey(LISTEN_PORT, profile)] ?: 9000,
+                    sni = it[getProfileKey(SNI, profile)].orEmpty(),
+                    captchaMode = it[getProfileKey(CAPTCHA_MODE, profile)] ?: "auto",
+                    captchaSolveMethod = it[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] ?: "auto",
+                    fingerprint = it[getProfileKey(SELECTED_FINGERPRINT, profile)] ?: "firefox",
+                    clientIds = it[getProfileKey(ACTIVE_CLIENT_IDS, profile)] ?: DEFAULT_VK_CLIENT_IDS,
+                    customVkCredentialsEnabled =
+                        it[getProfileKey(CUSTOM_VK_CREDENTIALS_ENABLED, profile)] ?: false,
+                    customVkClientId = normalizeVkClientId(
+                        it[getProfileKey(CUSTOM_VK_CLIENT_ID, profile)].orEmpty()
+                    ),
+                    customVkClientSecret = readSecret(
+                        it,
+                        CUSTOM_VK_CLIENT_SECRET_ENCRYPTED,
+                        CUSTOM_VK_CLIENT_SECRET,
+                        profile
+                    ),
+                    vkCallsPreflight = it[getProfileKey(VKCALLS_PREFLIGHT, profile)] ?: true,
+                    remoteActionKey = readSecret(
+                        it,
+                        REMOTE_ACTION_KEY_ENCRYPTED,
+                        REMOTE_ACTION_KEY,
+                        profile
+                    ),
+                    remoteActionUrl = it[getProfileKey(REMOTE_ACTION_URL, profile)].orEmpty(),
+                    remoteManaged =
+                        it[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true ||
+                            it[getProfileKey(REMOTE_DOCUMENT_BINDING, profile)].orEmpty().isNotBlank() ||
+                            it[getProfileKey(REMOTE_ACTION_URL, profile)].orEmpty().isNotBlank() ||
+                            it[getProfileKey(ACCESS_LIFECYCLE_URL, profile)].orEmpty().isNotBlank(),
+                    cachedRemoteAction = readCachedRemoteAction(it, profile),
+                    remoteCardDismissed =
+                        it[getProfileKey(REMOTE_CARD_DISMISSED, profile)] ?: false,
+                    accessLifecycle = readAccessLifecycleUiState(it, profile),
+                    accessLifecycleDismissedSignature =
+                        it[getProfileKey(ACCESS_LIFECYCLE_DISMISSED_SIGNATURE, profile)].orEmpty(),
+                    profileMaxWorkers =
+                        (it[getProfileKey(PROFILE_MAX_WORKERS, profile)] ?: 0)
+                            .coerceIn(0, APP_MAX_WORKERS),
+                )
+            }
+        }.distinctUntilChanged()
+            .flowOn(Dispatchers.IO)
+            .stateIn(storeScope, SharingStarted.Eagerly, null)
 
     init {
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+        storeScope.launch {
+            preferencesFlow.first()
             migrateSecretsToKeystore()
+            prewarmTunnelProfileSecrets(preferencesFlow.first())
             migrateWireGuardExitSshAuthMode()
             migrateVpnAppLists()
+            repairInvalidLinkModes()
+            _settingsReady.value = true
         }
     }
 
-    val activeProfile: Flow<Int> = preferencesFlow.map { it[ACTIVE_PROFILE] ?: 0 }
+    private fun prewarmTunnelProfileSecrets(prefs: Preferences) {
+        for (profile in 0 until VPN_PROFILE_COUNT) {
+            readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile)
+            readSecret(
+                prefs,
+                CUSTOM_VK_CLIENT_SECRET_ENCRYPTED,
+                CUSTOM_VK_CLIENT_SECRET,
+                profile,
+            )
+            readSecret(prefs, REMOTE_ACTION_KEY_ENCRYPTED, REMOTE_ACTION_KEY, profile)
+            readProtectedSecret(prefs, ACCESS_LIFECYCLE_KEY_ENCRYPTED, profile)
+            readProtectedSecret(prefs, CACHED_ACTION_PAYLOAD_ENCRYPTED, profile)
+        }
+    }
+
+    val activeTunnelProfile: Flow<Int?> = preferencesFlow.map { prefs ->
+        prefs[ACTIVE_TUNNEL_PROFILE]?.takeIf { it in 0 until VPN_PROFILE_COUNT }
+    }
     val profileNames: Flow<List<String>> = preferencesFlow.map { prefs ->
         (0 until VPN_PROFILE_COUNT).map { profile ->
             prefs[getProfileKey(PROFILE_NAME, profile)].orEmpty()
@@ -398,6 +830,9 @@ class SettingsStore(context: Context) {
     }
     val showSystemApps: Flow<Boolean> = preferencesFlow.map { it[SHOW_SYSTEM_APPS] ?: false }
     val loggingEnabled: Flow<Boolean> = preferencesFlow.map { it[LOGGING_ENABLED] ?: true }
+    val floatingToolbarYFraction: Flow<Float> = preferencesFlow.map { prefs ->
+        prefs[FLOATING_TOOLBAR_Y_FRACTION]?.coerceIn(0f, 1f) ?: -1f
+    }
     val trustedWifiEnabled: Flow<Boolean> = preferencesFlow.map { it[TRUSTED_WIFI_ENABLED] ?: false }
     val trustedWifiSsids: Flow<List<String>> = preferencesFlow.map { prefs ->
         parseTrustedWifiSsids(prefs[TRUSTED_WIFI_SSIDS].orEmpty())
@@ -414,6 +849,12 @@ class SettingsStore(context: Context) {
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(WDTT_LINK_MODE, profile)] ?: false
     }
+    val connectionInputMethod: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        prefs[getProfileKey(CONNECTION_INPUT_METHOD, profile)]
+            ?.takeIf { it == "link" || it == "manual" }
+            .orEmpty()
+    }
 
     val peer: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -427,9 +868,32 @@ class SettingsStore(context: Context) {
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(SECONDARY_VK_HASH, profile)] ?: ""
     }
+    val remoteActionKey: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        readSecret(prefs, REMOTE_ACTION_KEY_ENCRYPTED, REMOTE_ACTION_KEY, profile)
+    }
+    val remoteActionUrl: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        prefs[getProfileKey(REMOTE_ACTION_URL, profile)].orEmpty()
+    }
+    val remoteManagedProfile: Flow<Boolean> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        prefs[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true ||
+            prefs[getProfileKey(REMOTE_DOCUMENT_BINDING, profile)].orEmpty().isNotBlank() ||
+            prefs[getProfileKey(REMOTE_ACTION_URL, profile)].orEmpty().isNotBlank() ||
+            prefs[getProfileKey(ACCESS_LIFECYCLE_URL, profile)].orEmpty().isNotBlank()
+    }
+    val activeAccessLifecycle: Flow<AccessLifecycleUiState> = preferencesFlow.map { prefs ->
+        val profile = (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
+        readAccessLifecycleUiState(prefs, profile)
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
+    val profileMaxWorkers: Flow<Int> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        (prefs[getProfileKey(PROFILE_MAX_WORKERS, profile)] ?: 0).coerceIn(0, APP_MAX_WORKERS)
+    }
     val workersPerHash: Flow<Int> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(WORKERS_PER_HASH, profile)] ?: 16
+        prefs[getProfileKey(WORKERS_PER_HASH, profile)] ?: 18
     }
     val protocol: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -475,35 +939,35 @@ class SettingsStore(context: Context) {
     val deployPassword: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, profile)
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val deploySshPrivateKey: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, profile)
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val deploySshKeyPassphrase: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE, profile)
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val deploySshAuthMode: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)]
             ?.takeIf { it == "password" || it == "key" }
             ?: if (readSecret(prefs, DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, profile).isNotBlank()) "key" else "password"
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val wireGuardExitSshPrivateKey: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED, WG_EXIT_SSH_PRIVATE_KEY, profile)
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val wireGuardExitSshKeyPassphrase: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED, WG_EXIT_SSH_KEY_PASSPHRASE, profile)
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val wireGuardExitSshAuthMode: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(WG_EXIT_SSH_AUTH_MODE, profile)]
             ?.takeIf { it == "password" || it == "key" }
             ?: if (readSecret(prefs, WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED, WG_EXIT_SSH_PRIVATE_KEY, profile).isNotBlank()) "key" else "password"
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val deploySshPort: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] ?: ""
@@ -535,19 +999,19 @@ class SettingsStore(context: Context) {
     val connectionPassword: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile)
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val deployMainPassword: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile)
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val deployAdminId: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, profile)
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
     val deployBotToken: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, profile)
-    }
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
 
     // ═══ Proxy Mode ═══
     val proxyMode: Flow<String> = preferencesFlow.map { prefs ->
@@ -599,7 +1063,35 @@ class SettingsStore(context: Context) {
     }
     val activeClientIds: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] ?: "6287487,8202606"
+        prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] ?: DEFAULT_VK_CLIENT_IDS
+    }
+    val customVkCredentialsEnabled: Flow<Boolean> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        prefs[getProfileKey(CUSTOM_VK_CREDENTIALS_ENABLED, profile)] ?: false
+    }
+    val customVkClientId: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        normalizeVkClientId(prefs[getProfileKey(CUSTOM_VK_CLIENT_ID, profile)].orEmpty())
+    }
+    val customVkClientSecret: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        readSecret(
+            prefs,
+            CUSTOM_VK_CLIENT_SECRET_ENCRYPTED,
+            CUSTOM_VK_CLIENT_SECRET,
+            profile
+        )
+    }
+    val customVkCredentialsComplete: Flow<Boolean> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        val clientId = prefs[getProfileKey(CUSTOM_VK_CLIENT_ID, profile)].orEmpty()
+        val clientSecret = readSecret(
+            prefs,
+            CUSTOM_VK_CLIENT_SECRET_ENCRYPTED,
+            CUSTOM_VK_CLIENT_SECRET,
+            profile
+        )
+        isValidVkClientId(clientId) && clientSecret.isNotBlank()
     }
     val clientIdCheckResults: Flow<String> = preferencesFlow.map { prefs ->
         prefs[CLIENT_ID_CHECK_RESULTS] ?: "{}"
@@ -642,13 +1134,46 @@ class SettingsStore(context: Context) {
     }
 
     suspend fun saveInterfaceRole(role: String) {
+        require(role == "user" || role == "admin") { "Неизвестный режим интерфейса" }
         dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
             val hadRole = !prefs[INTERFACE_ROLE].isNullOrBlank()
             prefs[INTERFACE_ROLE] = role
-            prefs[getProfileKey(WDTT_LINK_MODE, profile)] = role == "user"
+            prefs.remove(INTERFACE_ROLE_BEFORE_REMOTE_PROFILE)
             if (!hadRole && !prefs.contains(PERMISSION_ONBOARDING_COMPLETE)) {
                 prefs[PERMISSION_ONBOARDING_COMPLETE] = false
+            }
+        }
+    }
+
+    suspend fun synchronizeInterfaceRoleForProfile(remoteManagedProfile: Boolean) {
+        dataStore.edit { prefs ->
+            val hadRole = !prefs[INTERFACE_ROLE].isNullOrBlank()
+            val state = reconcileInterfaceRoleForProfile(
+                storedRole = prefs[INTERFACE_ROLE].orEmpty(),
+                rememberedRole = prefs[INTERFACE_ROLE_BEFORE_REMOTE_PROFILE],
+                remoteManagedProfile = remoteManagedProfile,
+            )
+            if (state.role.isBlank()) {
+                prefs.remove(INTERFACE_ROLE)
+            } else {
+                prefs[INTERFACE_ROLE] = state.role
+            }
+            state.rememberedRole?.let { rememberedRole ->
+                prefs[INTERFACE_ROLE_BEFORE_REMOTE_PROFILE] = rememberedRole
+            } ?: prefs.remove(INTERFACE_ROLE_BEFORE_REMOTE_PROFILE)
+            if (!hadRole && state.role.isNotBlank() && !prefs.contains(PERMISSION_ONBOARDING_COMPLETE)) {
+                prefs[PERMISSION_ONBOARDING_COMPLETE] = false
+            }
+        }
+    }
+
+    suspend fun useUserInterfaceForRemoteActivationIfUnset() {
+        dataStore.edit { prefs ->
+            if (prefs[INTERFACE_ROLE].isNullOrBlank()) {
+                prefs[INTERFACE_ROLE] = "user"
+                if (!prefs.contains(PERMISSION_ONBOARDING_COMPLETE)) {
+                    prefs[PERMISSION_ONBOARDING_COMPLETE] = false
+                }
             }
         }
     }
@@ -688,6 +1213,30 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
             prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] = clientIds
+        }
+    }
+
+    suspend fun saveCustomVkCredentialsEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            prefs[getProfileKey(CUSTOM_VK_CREDENTIALS_ENABLED, profile)] = enabled
+        }
+    }
+
+    suspend fun saveCustomVkCredentials(clientId: String, clientSecret: String) {
+        val normalizedId = normalizeVkClientId(clientId)
+        val normalizedSecret = normalizeVkClientSecret(clientSecret)
+        require(isValidVkClientId(normalizedId)) { "Client ID должен состоять из цифр" }
+        require(normalizedSecret.isNotBlank()) { "Client secret не может быть пустым" }
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            prefs[getProfileKey(CUSTOM_VK_CLIENT_ID, profile)] = normalizedId
+            prefs.putSecret(
+                CUSTOM_VK_CLIENT_SECRET_ENCRYPTED,
+                CUSTOM_VK_CLIENT_SECRET,
+                normalizedSecret,
+                profile
+            )
         }
     }
 
@@ -803,8 +1352,26 @@ class SettingsStore(context: Context) {
     }
 
     suspend fun saveActiveProfile(profile: Int) {
+        val normalized = profile.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        activeProfileOverride.value = normalized
         dataStore.edit { prefs ->
-            prefs[ACTIVE_PROFILE] = profile
+            prefs[ACTIVE_PROFILE] = normalized
+        }
+    }
+
+    suspend fun saveFloatingToolbarYFraction(fraction: Float) {
+        dataStore.edit { prefs ->
+            prefs[FLOATING_TOOLBAR_Y_FRACTION] = fraction.coerceIn(0f, 1f)
+        }
+    }
+
+    suspend fun saveActiveTunnelProfile(profile: Int?) {
+        dataStore.edit { prefs ->
+            if (profile == null) {
+                prefs.remove(ACTIVE_TUNNEL_PROFILE)
+            } else {
+                prefs[ACTIVE_TUNNEL_PROFILE] = profile.coerceIn(0, VPN_PROFILE_COUNT - 1)
+            }
         }
     }
 
@@ -818,6 +1385,53 @@ class SettingsStore(context: Context) {
             } else {
                 prefs[key] = clean
             }
+        }
+    }
+
+    suspend fun saveRemoteCardDismissed(profile: Int, dismissed: Boolean) {
+        dataStore.edit { prefs ->
+            val key = getProfileKey(
+                REMOTE_CARD_DISMISSED,
+                profile.coerceIn(0, VPN_PROFILE_COUNT - 1)
+            )
+            if (dismissed) {
+                prefs[key] = true
+            } else {
+                prefs.remove(key)
+            }
+        }
+    }
+
+    suspend fun saveAccessLifecycleDismissedSignature(profile: Int, signature: String) {
+        dataStore.edit { prefs ->
+            val key = getProfileKey(
+                ACCESS_LIFECYCLE_DISMISSED_SIGNATURE,
+                profile.coerceIn(0, VPN_PROFILE_COUNT - 1)
+            )
+            if (signature.isBlank()) {
+                prefs.remove(key)
+            } else {
+                prefs[key] = signature
+            }
+        }
+    }
+
+    suspend fun resetProfile(profile: Int) {
+        val index = profile.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            PROFILE_STRING_KEYS.forEach { key ->
+                prefs.remove(getProfileKey(key, index))
+            }
+            PROFILE_INT_KEYS.forEach { key ->
+                prefs.remove(getProfileKey(key, index))
+            }
+            PROFILE_LONG_KEYS.forEach { key ->
+                prefs.remove(getProfileKey(key, index))
+            }
+            PROFILE_BOOLEAN_KEYS.forEach { key ->
+                prefs.remove(getProfileKey(key, index))
+            }
+            prefs.remove(serverMigrationCompletedKey(index))
         }
     }
 
@@ -893,7 +1507,7 @@ class SettingsStore(context: Context) {
     }
 
     suspend fun createWdttDeepLinkApplyPlan(link: String): WdttDeepLinkApplyPlan? {
-        WdttDeepLink.parse(link) ?: return null
+        WdttDeepLink.parse(link, allowMissingHashes = true) ?: return null
         val cleanLink = link.trim()
         return appContext.dataStore.data.map { prefs ->
             val activeProfile = (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
@@ -909,6 +1523,51 @@ class SettingsStore(context: Context) {
         }.first()
     }
 
+    suspend fun tunnelProfileSnapshot(profileIndex: Int? = null): TunnelProfileSnapshot =
+        preferencesFlow.map { prefs ->
+            val profile = (profileIndex ?: prefs[ACTIVE_PROFILE] ?: 0)
+                .coerceIn(0, VPN_PROFILE_COUNT - 1)
+            TunnelProfileSnapshot(
+                profileIndex = profile,
+                remoteManaged = prefs[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true,
+                linkMode = prefs[getProfileKey(WDTT_LINK_MODE, profile)] ?: false,
+                link = prefs[getProfileKey(WDTT_LINK, profile)].orEmpty(),
+                peer = prefs[getProfileKey(PEER, profile)].orEmpty(),
+                vkHashes = prefs[getProfileKey(VK_HASHES, profile)].orEmpty(),
+                secondaryVkHash = prefs[getProfileKey(SECONDARY_VK_HASH, profile)].orEmpty(),
+                connectionPassword = readSecret(
+                    prefs,
+                    CONNECTION_PASSWORD_ENCRYPTED,
+                    CONNECTION_PASSWORD,
+                    profile
+                ),
+                workersPerHash = prefs[getProfileKey(WORKERS_PER_HASH, profile)] ?: 18,
+                profileMaxWorkers = (prefs[getProfileKey(PROFILE_MAX_WORKERS, profile)] ?: 0)
+                    .coerceIn(0, APP_MAX_WORKERS),
+                manualPortsEnabled = prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] ?: false,
+                serverDtlsPort = prefs[getProfileKey(SERVER_DTLS_PORT, profile)] ?: 56000,
+                listenPort = prefs[getProfileKey(LISTEN_PORT, profile)] ?: 9000,
+                sni = prefs[getProfileKey(SNI, profile)].orEmpty(),
+                protocol = prefs[getProfileKey(PROTOCOL, profile)] ?: "udp",
+                vkCallsPreflight = prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] ?: true,
+                captchaMode = prefs[getProfileKey(CAPTCHA_MODE, profile)] ?: "auto",
+                captchaSolveMethod = prefs[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] ?: "auto",
+                fingerprint = prefs[getProfileKey(SELECTED_FINGERPRINT, profile)] ?: "firefox",
+                clientIds = prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] ?: DEFAULT_VK_CLIENT_IDS,
+                customVkCredentialsEnabled =
+                    prefs[getProfileKey(CUSTOM_VK_CREDENTIALS_ENABLED, profile)] ?: false,
+                customVkClientId = normalizeVkClientId(
+                    prefs[getProfileKey(CUSTOM_VK_CLIENT_ID, profile)].orEmpty()
+                ),
+                customVkClientSecret = readSecret(
+                    prefs,
+                    CUSTOM_VK_CLIENT_SECRET_ENCRYPTED,
+                    CUSTOM_VK_CLIENT_SECRET,
+                    profile
+                ),
+            )
+        }.first()
+
     suspend fun connectionLinkForProfile(profileIndex: Int): String {
         val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
         return appContext.dataStore.data.map { prefs ->
@@ -920,14 +1579,18 @@ class SettingsStore(context: Context) {
                 wgPort = prefs[getProfileKey(SERVER_WG_PORT, profile)] ?: 56001,
                 localPort = prefs[getProfileKey(LISTEN_PORT, profile)] ?: 9000,
                 password = readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile),
-                hashes = prefs[getProfileKey(VK_HASHES, profile)].orEmpty()
+                hashes = prefs[getProfileKey(VK_HASHES, profile)].orEmpty(),
+                maxWorkers = prefs[getProfileKey(PROFILE_MAX_WORKERS, profile)] ?: 0
             )
             val names = (0 until VPN_PROFILE_COUNT).map { index ->
                 prefs[getProfileKey(PROFILE_NAME, index)].orEmpty()
             }
             val profileLabel = vpnProfileDisplayName(profile, names)
             val link = WdttTransferCodec.buildConnectionLink(
-                parts.copy(profileName = vpnProfileTransferName(profile, names))
+                parts.copy(
+                    profileName = vpnProfileTransferName(profile, names),
+                    maxWorkers = prefs[getProfileKey(PROFILE_MAX_WORKERS, profile)] ?: 0
+                )
             )
             val validation = WdttDeepLink.validate(link)
             require(validation.canStartVpn) {
@@ -943,10 +1606,17 @@ class SettingsStore(context: Context) {
             profiles.put(JSONObject().apply {
                 put("wdttLink", prefs[getProfileKey(WDTT_LINK, profile)].orEmpty())
                 put("wdttLinkMode", prefs[getProfileKey(WDTT_LINK_MODE, profile)] ?: false)
+                put(
+                    "connectionInputMethod",
+                    prefs[getProfileKey(CONNECTION_INPUT_METHOD, profile)]
+                        ?.takeIf { it == "link" || it == "manual" }
+                        .orEmpty()
+                )
                 put("peer", prefs[getProfileKey(PEER, profile)].orEmpty())
                 put("vkHashes", prefs[getProfileKey(VK_HASHES, profile)].orEmpty())
                 put("secondaryVkHash", prefs[getProfileKey(SECONDARY_VK_HASH, profile)].orEmpty())
-                put("workersPerHash", prefs[getProfileKey(WORKERS_PER_HASH, profile)] ?: 16)
+                put("workersPerHash", prefs[getProfileKey(WORKERS_PER_HASH, profile)] ?: 18)
+                put("profileMaxWorkers", prefs[getProfileKey(PROFILE_MAX_WORKERS, profile)] ?: 0)
                 put("protocol", prefs[getProfileKey(PROTOCOL, profile)] ?: "udp")
                 put("listenPort", prefs[getProfileKey(LISTEN_PORT, profile)] ?: 9000)
                 put("manualPortsEnabled", prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] ?: false)
@@ -1003,6 +1673,7 @@ class SettingsStore(context: Context) {
     }.first()
 
     suspend fun importAdminSettings(settingsJson: String) {
+        activeProfileOverride.value = null
         val root = runCatching { JSONObject(settingsJson) }
             .getOrElse { throw IllegalArgumentException("Расшифрованные настройки повреждены.") }
         require(root.optString("format") == "wdtt-plus-admin-settings" && root.optInt("version") == 1) {
@@ -1015,14 +1686,51 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             repeat(VPN_PROFILE_COUNT) { profile ->
                 val item = profiles.getJSONObject(profile)
-                prefs[getProfileKey(WDTT_LINK, profile)] = item.optString("wdttLink")
-                prefs[getProfileKey(WDTT_LINK_MODE, profile)] = item.optBoolean("wdttLinkMode")
-                prefs[getProfileKey(PEER, profile)] = item.optString("peer")
+                prefs.putSecret(
+                    REMOTE_ACTION_KEY_ENCRYPTED,
+                    REMOTE_ACTION_KEY,
+                    "",
+                    profile,
+                )
+                prefs.remove(getProfileKey(REMOTE_ACTION_URL, profile))
+                prefs.remove(getProfileKey(REMOTE_DOCUMENT_BINDING, profile))
+                prefs.remove(getProfileKey(REMOTE_MANAGED_PROFILE, profile))
+                prefs.clearAccessLifecycle(profile)
+                val importedLink = item.optString("wdttLink")
+                val importedLinkMode = item.optBoolean("wdttLinkMode")
+                val importedPeer = item.optString("peer")
+                val importedConnectionPassword = item.optString("connectionPassword")
+                val importedMethod = item.optString("connectionInputMethod")
+                    .takeIf { it == "link" || it == "manual" }
+                    ?: when {
+                        importedLinkMode &&
+                            WdttDeepLink.parse(importedLink, allowMissingHashes = true) != null -> "link"
+                        importedPeer.isNotBlank() && importedConnectionPassword.isNotBlank() -> "manual"
+                        else -> ""
+                    }
+                prefs[getProfileKey(WDTT_LINK, profile)] = importedLink
+                prefs[getProfileKey(WDTT_LINK_MODE, profile)] = importedLinkMode
+                val connectionInputMethodKey = getProfileKey(CONNECTION_INPUT_METHOD, profile)
+                if (importedMethod.isBlank()) {
+                    prefs.remove(connectionInputMethodKey)
+                } else {
+                    prefs[connectionInputMethodKey] = importedMethod
+                }
+                prefs[getProfileKey(PEER, profile)] = importedPeer
                 prefs[getProfileKey(VK_HASHES, profile)] = item.optString("vkHashes")
                 prefs[getProfileKey(SECONDARY_VK_HASH, profile)] = item.optString("secondaryVkHash")
                 prefs[getProfileKey(VK_HASH_NEXT_SLOT, profile)] = 0
                 prefs.remove(getProfileKey(EXCLUDED_APPS, profile))
-                prefs[getProfileKey(WORKERS_PER_HASH, profile)] = item.optInt("workersPerHash", 16).coerceIn(1, 128)
+                prefs[getProfileKey(WORKERS_PER_HASH, profile)] = item.optInt("workersPerHash", 18).coerceIn(1, 128)
+                val importedProfileMaxWorkers = item.optInt("profileMaxWorkers", 0)
+                if (
+                    importedProfileMaxWorkers in TUNNEL_WORKERS_PER_GROUP..APP_MAX_WORKERS &&
+                    importedProfileMaxWorkers % TUNNEL_WORKERS_PER_GROUP == 0
+                ) {
+                    prefs[getProfileKey(PROFILE_MAX_WORKERS, profile)] = importedProfileMaxWorkers
+                } else {
+                    prefs.remove(getProfileKey(PROFILE_MAX_WORKERS, profile))
+                }
                 prefs[getProfileKey(PROTOCOL, profile)] = item.optString("protocol", "udp").takeIf { it in setOf("udp", "tcp") } ?: "udp"
                 prefs[getProfileKey(LISTEN_PORT, profile)] = item.safePort("listenPort", 9000)
                 prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] = item.optBoolean("manualPortsEnabled")
@@ -1032,7 +1740,12 @@ class SettingsStore(context: Context) {
                 prefs[getProfileKey(NO_DTLS, profile)] = item.optBoolean("noDtls")
                 prefs[getProfileKey(NO_DNS, profile)] = item.optBoolean("noDns")
                 prefs[getProfileKey(USER_AGENT, profile)] = item.optString("userAgent")
-                prefs.putSecret(CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, item.optString("connectionPassword"), profile)
+                prefs.putSecret(
+                    CONNECTION_PASSWORD_ENCRYPTED,
+                    CONNECTION_PASSWORD,
+                    importedConnectionPassword,
+                    profile
+                )
                 prefs[getProfileKey(DEPLOY_IP, profile)] = item.optString("deployIp")
                 prefs[getProfileKey(DEPLOY_LOGIN, profile)] = item.optString("deployLogin")
                 prefs.putSecret(DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, item.optString("deployPassword"), profile)
@@ -1085,34 +1798,29 @@ class SettingsStore(context: Context) {
             prefs[UPDATE_CHECK_INTERVAL_MINUTES] = updateIntervalMinutes
             prefs[INTERFACE_ROLE] = "admin"
         }
+        activeProfileOverride.value = null
         importSharedPreferences("wdtt_outbound_forms", root.optJSONObject("outbound") ?: JSONObject())
     }
 
-    suspend fun applyWdttDeepLink(plan: WdttDeepLinkApplyPlan): WdttDeepLinkApplyResult? {
-        val parts = WdttDeepLink.parse(plan.link) ?: return null
+    suspend fun applyWdttDeepLink(
+        plan: WdttDeepLinkApplyPlan,
+        resetRemoteContinuation: Boolean = false,
+        profileMaxWorkers: Int? = null,
+        remoteManaged: Boolean? = null,
+        preserveVkHashes: Boolean = false,
+    ): WdttDeepLinkApplyResult? {
+        val parts = WdttDeepLink.parse(plan.link, allowMissingHashes = true) ?: return null
         val profile = plan.targetProfile.coerceIn(0, VPN_PROFILE_COUNT - 1)
         dataStore.edit { prefs ->
-            prefs[ACTIVE_PROFILE] = profile
-            val importedProfileName = vpnProfileRestorableName(parts.profileName)
-            if (importedProfileName.isNotBlank()) {
-                val profileNameKey = getProfileKey(PROFILE_NAME, profile)
-                prefs[profileNameKey] = importedProfileName
-            }
-            prefs[getProfileKey(WDTT_LINK_MODE, profile)] = plan.storeAsLink
-            if (plan.storeAsLink) {
-                prefs[getProfileKey(WDTT_LINK, profile)] = plan.link
-                prefs.clearManualTunnelFields(profile)
-            } else {
-                prefs.remove(getProfileKey(WDTT_LINK, profile))
-                prefs[getProfileKey(PEER, profile)] = parts.host
-                prefs[getProfileKey(SERVER_DTLS_PORT, profile)] = parts.dtlsPort
-                prefs[getProfileKey(SERVER_WG_PORT, profile)] = parts.wgPort
-                prefs[getProfileKey(LISTEN_PORT, profile)] = parts.localPort
-                prefs.putSecret(CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, parts.password, profile)
-                prefs[getProfileKey(VK_HASHES, profile)] = parts.hashes
-                prefs[getProfileKey(SECONDARY_VK_HASH, profile)] = ""
-                prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] = true
-            }
+            prefs.applyWdttDeepLinkParts(
+                plan = plan,
+                parts = parts,
+                profile = profile,
+                resetRemoteContinuation = resetRemoteContinuation,
+                profileMaxWorkers = profileMaxWorkers,
+                remoteManaged = remoteManaged,
+                preserveVkHashes = preserveVkHashes,
+            )
         }
         return WdttDeepLinkApplyResult(
             targetProfile = profile,
@@ -1121,11 +1829,187 @@ class SettingsStore(context: Context) {
         )
     }
 
+    /**
+     * Applies a remote profile document as one DataStore transaction.
+     *
+     * A remote import changes the tunnel, protected capabilities, lifecycle status and UI role
+     * together. Publishing each part separately makes Compose rebuild the whole Tunnel tab
+     * several times and briefly exposes incomplete combinations of those values.
+     */
+    suspend fun applyRemoteDocumentDelivery(
+        plan: WdttDeepLinkApplyPlan,
+        delivery: RemoteDocumentDelivery,
+        isBoundUpdate: Boolean,
+        existingProfileRedelivery: Boolean = false,
+    ): WdttDeepLinkApplyResult? {
+        val parts = WdttDeepLink.parse(plan.link, allowMissingHashes = true) ?: return null
+        val profile = plan.targetProfile.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        var alreadyApplied = false
+        dataStore.edit { prefs ->
+            if (
+                isBoundUpdate &&
+                delivery.profileRevision > 0 &&
+                (prefs[getProfileKey(ACCESS_PROFILE_REVISION, profile)] ?: 0L) >=
+                    delivery.profileRevision
+            ) {
+                alreadyApplied = true
+                return@edit
+            }
+            prefs.applyWdttDeepLinkParts(
+                plan = plan,
+                parts = parts,
+                profile = profile,
+                resetRemoteContinuation = !isBoundUpdate,
+                profileMaxWorkers = delivery.profileMaxWorkers,
+                remoteManaged = if (isBoundUpdate) null else true,
+                preserveVkHashes = delivery.shouldPreserveLocalVkHashes(
+                    existingProfileRedelivery = existingProfileRedelivery,
+                ),
+            )
+            if (prefs[INTERFACE_ROLE].isNullOrBlank()) {
+                prefs[INTERFACE_ROLE] = "user"
+                if (!prefs.contains(PERMISSION_ONBOARDING_COMPLETE)) {
+                    prefs[PERMISSION_ONBOARDING_COMPLETE] = false
+                }
+            }
+            if (delivery.access.available) {
+                prefs.putRemoteAccessCapability(delivery.access, profile)
+                delivery.access.initialStatus?.let { status ->
+                    prefs.putAccessLifecycleStatus(profile, status)
+                }
+            }
+            if (
+                !isBoundUpdate &&
+                (delivery.binding.isNotBlank() ||
+                    delivery.continuation.available ||
+                    delivery.access.available)
+            ) {
+                prefs.putRemoteContinuation(
+                    continuation = delivery.continuation,
+                    binding = delivery.binding,
+                    profile = profile,
+                )
+            }
+            if (
+                isBoundUpdate &&
+                delivery.profileRevision > 0
+            ) {
+                prefs[getProfileKey(ACCESS_PROFILE_REVISION, profile)] =
+                    delivery.profileRevision
+            }
+        }
+        return WdttDeepLinkApplyResult(
+            targetProfile = profile,
+            overwritten = plan.requiresConfirmation,
+            storedAsLink = plan.storeAsLink,
+            alreadyApplied = alreadyApplied,
+        )
+    }
+
+    private fun MutablePreferences.applyWdttDeepLinkParts(
+        plan: WdttDeepLinkApplyPlan,
+        parts: WdttLinkParts,
+        profile: Int,
+        resetRemoteContinuation: Boolean,
+        profileMaxWorkers: Int?,
+        remoteManaged: Boolean?,
+        preserveVkHashes: Boolean,
+    ) {
+        this[ACTIVE_PROFILE] = profile
+        if (resetRemoteContinuation) {
+            putSecret(
+                REMOTE_ACTION_KEY_ENCRYPTED,
+                REMOTE_ACTION_KEY,
+                "",
+                profile,
+            )
+            remove(getProfileKey(REMOTE_ACTION_URL, profile))
+            remove(getProfileKey(REMOTE_DOCUMENT_BINDING, profile))
+            remove(getProfileKey(REMOTE_MANAGED_PROFILE, profile))
+            clearAccessLifecycle(profile)
+        }
+        remoteManaged?.let { managed ->
+            val key = getProfileKey(REMOTE_MANAGED_PROFILE, profile)
+            if (managed) this[key] = true else remove(key)
+        }
+        val requestedLimit = profileMaxWorkers
+            ?.takeIf { it >= TUNNEL_WORKERS_PER_GROUP }
+            ?: parts.maxWorkers
+        val normalizedLimit = (requestedLimit / TUNNEL_WORKERS_PER_GROUP) *
+            TUNNEL_WORKERS_PER_GROUP
+        if (normalizedLimit >= TUNNEL_WORKERS_PER_GROUP) {
+            this[getProfileKey(PROFILE_MAX_WORKERS, profile)] =
+                normalizedLimit.coerceAtMost(APP_MAX_WORKERS)
+        } else {
+            remove(getProfileKey(PROFILE_MAX_WORKERS, profile))
+        }
+        val importedProfileName = vpnProfileRestorableName(parts.profileName)
+        if (importedProfileName.isNotBlank()) {
+            this[getProfileKey(PROFILE_NAME, profile)] = importedProfileName
+        }
+        this[getProfileKey(WDTT_LINK_MODE, profile)] = plan.storeAsLink
+        this[getProfileKey(CONNECTION_INPUT_METHOD, profile)] = "link"
+        if (plan.storeAsLink) {
+            this[getProfileKey(WDTT_LINK, profile)] = plan.link
+            clearManualTunnelFields(profile)
+        } else {
+            remove(getProfileKey(WDTT_LINK, profile))
+            this[getProfileKey(PEER, profile)] = parts.host
+            this[getProfileKey(SERVER_DTLS_PORT, profile)] = parts.dtlsPort
+            this[getProfileKey(SERVER_WG_PORT, profile)] = parts.wgPort
+            this[getProfileKey(LISTEN_PORT, profile)] = parts.localPort
+            putSecret(CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, parts.password, profile)
+            if (!preserveVkHashes) {
+                this[getProfileKey(VK_HASHES, profile)] = parts.hashes
+                this[getProfileKey(SECONDARY_VK_HASH, profile)] = ""
+            }
+            this[getProfileKey(MANUAL_PORTS_ENABLED, profile)] = parts.hasNonStandardPorts()
+        }
+    }
+
     suspend fun saveWdttLinkMode(enabled: Boolean) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
             prefs[getProfileKey(WDTT_LINK_MODE, profile)] = enabled
         }
+    }
+
+    suspend fun materializeActiveLinkProfile(): WdttLinkParts? {
+        val snapshot = dataStore.data.first()
+        val profile = (snapshot[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
+        if (snapshot[getProfileKey(WDTT_LINK_MODE, profile)] != true) return null
+        val storedLink = snapshot[getProfileKey(WDTT_LINK, profile)].orEmpty()
+        val parts = WdttDeepLink.parse(storedLink, allowMissingHashes = true) ?: return null
+        var applied = false
+        dataStore.edit { prefs ->
+            if (
+                (prefs[ACTIVE_PROFILE] ?: 0) != profile ||
+                prefs[getProfileKey(WDTT_LINK, profile)].orEmpty() != storedLink
+            ) {
+                return@edit
+            }
+            prefs[getProfileKey(WDTT_LINK_MODE, profile)] = false
+            prefs[getProfileKey(CONNECTION_INPUT_METHOD, profile)] = "link"
+            prefs.remove(getProfileKey(WDTT_LINK, profile))
+            prefs[getProfileKey(PEER, profile)] = parts.host
+            prefs[getProfileKey(SERVER_DTLS_PORT, profile)] = parts.dtlsPort
+            prefs[getProfileKey(SERVER_WG_PORT, profile)] = parts.wgPort
+            prefs[getProfileKey(LISTEN_PORT, profile)] = parts.localPort
+            prefs.putSecret(CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, parts.password, profile)
+            prefs[getProfileKey(VK_HASHES, profile)] = parts.hashes
+            prefs[getProfileKey(SECONDARY_VK_HASH, profile)] = ""
+            prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] = parts.hasNonStandardPorts()
+            if (parts.maxWorkers >= TUNNEL_WORKERS_PER_GROUP) {
+                prefs[getProfileKey(PROFILE_MAX_WORKERS, profile)] =
+                    parts.maxWorkers.coerceAtMost(APP_MAX_WORKERS)
+            }
+            val importedProfileName = vpnProfileRestorableName(parts.profileName)
+            if (importedProfileName.isNotBlank()) {
+                prefs[getProfileKey(PROFILE_NAME, profile)] = importedProfileName
+            }
+            applied = true
+        }
+        return parts.takeIf { applied }
     }
 
     suspend fun save(
@@ -1158,9 +2042,307 @@ class SettingsStore(context: Context) {
         }
     }
 
+    suspend fun saveRemoteContinuation(
+        continuation: RemoteContinuation,
+        binding: String,
+        profileIndex: Int? = null
+    ) {
+        dataStore.edit { prefs ->
+            val profile = (profileIndex ?: prefs[ACTIVE_PROFILE] ?: 0)
+                .coerceIn(0, VPN_PROFILE_COUNT - 1)
+            prefs.putRemoteContinuation(continuation, binding, profile)
+        }
+    }
+
+    suspend fun saveRemoteAccessCapability(
+        capability: RemoteAccessCapability,
+        profileIndex: Int,
+    ) {
+        if (!capability.available) return
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            prefs.putRemoteAccessCapability(capability, profile)
+        }
+    }
+
+    suspend fun accessLifecycleForProfile(profileIndex: Int): StoredAccessLifecycle {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        return preferencesFlow.map { prefs ->
+            readStoredAccessLifecycle(prefs, profile)
+        }.first()
+    }
+
+    suspend fun accessLifecycleProfiles(): List<Int> = preferencesFlow.map { prefs ->
+        (0 until VPN_PROFILE_COUNT).filter { profile ->
+            readStoredAccessLifecycle(prefs, profile).capability.available
+        }
+    }.first()
+
+    suspend fun saveAccessLifecycleAttempt(profileIndex: Int, attemptedAtMillis: Long) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(ACCESS_LAST_ATTEMPT_AT, profile)] =
+                attemptedAtMillis.coerceAtLeast(0)
+        }
+    }
+
+    suspend fun saveAccessLifecycleStatus(
+        profileIndex: Int,
+        status: AccessLifecycleStatus,
+        expectedCapability: RemoteAccessCapability? = null,
+    ): Boolean {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        var saved = false
+        dataStore.edit { prefs ->
+            if (
+                expectedCapability != null &&
+                readStoredAccessLifecycle(prefs, profile).capability != expectedCapability
+            ) {
+                return@edit
+            }
+            prefs.putAccessLifecycleStatus(profile, status)
+            saved = true
+        }
+        return saved
+    }
+
+    suspend fun markAccessLifecycleDenied(profileIndex: Int) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            if (prefs[getProfileKey(ACCESS_LIFECYCLE_URL, profile)].isNullOrBlank()) return@edit
+            prefs[getProfileKey(ACCESS_ALLOW_CONNECT, profile)] = false
+            prefs[getProfileKey(ACCESS_TITLE, profile)] = "Профиль недоступен"
+            prefs[getProfileKey(ACCESS_MESSAGE, profile)] =
+                "Откройте профиль, чтобы обновить его состояние."
+            prefs[getProfileKey(ACCESS_SEVERITY, profile)] = "error"
+            prefs[getProfileKey(ACCESS_CHECKED_AT, profile)] = System.currentTimeMillis()
+        }
+    }
+
+    suspend fun saveAppliedAccessProfileRevision(profileIndex: Int, revision: Long) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(ACCESS_PROFILE_REVISION, profile)] = revision.coerceAtLeast(0)
+        }
+    }
+
+    suspend fun markAccessLifecycleActionLaunched(
+        profileIndex: Int,
+        launchedAtMillis: Long = System.currentTimeMillis(),
+    ) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(ACCESS_ACTION_LAUNCHED_AT, profile)] =
+                launchedAtMillis.coerceAtLeast(0)
+        }
+    }
+
+    suspend fun takeAccessLifecycleActionProfiles(): Set<Int> {
+        val profiles = mutableSetOf<Int>()
+        dataStore.edit { prefs ->
+            repeat(VPN_PROFILE_COUNT) { profile ->
+                val key = getProfileKey(ACCESS_ACTION_LAUNCHED_AT, profile)
+                if ((prefs[key] ?: 0) > 0) profiles += profile
+                prefs.remove(key)
+            }
+        }
+        return profiles
+    }
+
+    suspend fun remoteBindingForProfile(profileIndex: Int): String {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        return preferencesFlow.map { prefs ->
+            prefs[getProfileKey(REMOTE_DOCUMENT_BINDING, profile)].orEmpty()
+        }.first()
+    }
+
+    suspend fun remoteAccessBindingForProfile(profileIndex: Int): String {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        return preferencesFlow.map { prefs ->
+            prefs[getProfileKey(ACCESS_LIFECYCLE_BINDING, profile)].orEmpty()
+        }.first()
+    }
+
+    suspend fun remoteDocumentBindings(): List<String> =
+        appContext.dataStore.data.map { prefs ->
+            buildList {
+                repeat(VPN_PROFILE_COUNT) { profile ->
+                    add(prefs[getProfileKey(REMOTE_DOCUMENT_BINDING, profile)].orEmpty())
+                    add(prefs[getProfileKey(ACCESS_LIFECYCLE_BINDING, profile)].orEmpty())
+                }
+            }
+                .map(String::trim)
+                .filter(String::isNotBlank)
+                .distinct()
+        }.first()
+
+    suspend fun remoteContinuationForProfile(profileIndex: Int): RemoteContinuation {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        return appContext.dataStore.data.map { prefs ->
+            val key = readSecret(
+                prefs,
+                REMOTE_ACTION_KEY_ENCRYPTED,
+                REMOTE_ACTION_KEY,
+                profile
+            )
+            val url = prefs[getProfileKey(REMOTE_ACTION_URL, profile)].orEmpty()
+            RemoteContinuation(
+                available = key.isNotBlank() && url.isNotBlank(),
+                key = key,
+                url = url
+            )
+        }.first()
+    }
+
+    suspend fun profileForRemoteBinding(binding: String): Int? {
+        val expected = binding.trim()
+        if (expected.isBlank()) return null
+        return appContext.dataStore.data.map { prefs ->
+            (0 until VPN_PROFILE_COUNT).firstOrNull { profile ->
+                prefs[getProfileKey(REMOTE_DOCUMENT_BINDING, profile)] == expected ||
+                    prefs[getProfileKey(ACCESS_LIFECYCLE_BINDING, profile)] == expected
+            }
+        }.first()
+    }
+
+    /**
+     * Finds an already imported copy of the same connection when an optional setup-device
+     * binding was rotated. The access password is unique to the connection; matching it together
+     * with the remote endpoint avoids treating another profile on the same server as the same
+     * connection.
+     */
+    suspend fun profileForConnectionDocument(document: String): Int? {
+        val expected = WdttDeepLink.parse(document, allowMissingHashes = true) ?: return null
+        if (expected.host.isBlank() || expected.password.isBlank()) return null
+        return appContext.dataStore.data.map { prefs ->
+            (0 until VPN_PROFILE_COUNT).firstOrNull { profile ->
+                val stored = if (prefs[getProfileKey(WDTT_LINK_MODE, profile)] == true) {
+                    WdttDeepLink.parse(
+                        prefs[getProfileKey(WDTT_LINK, profile)].orEmpty(),
+                        allowMissingHashes = true,
+                    )
+                } else {
+                    null
+                }
+                val host = stored?.host
+                    ?: prefs[getProfileKey(PEER, profile)].orEmpty().trim()
+                val dtlsPort = stored?.dtlsPort
+                    ?: prefs[getProfileKey(SERVER_DTLS_PORT, profile)] ?: 56000
+                val wgPort = stored?.wgPort
+                    ?: prefs[getProfileKey(SERVER_WG_PORT, profile)] ?: 56001
+                val password = stored?.password
+                    ?: readSecret(
+                        prefs,
+                        CONNECTION_PASSWORD_ENCRYPTED,
+                        CONNECTION_PASSWORD,
+                        profile,
+                    )
+                host.equals(expected.host, ignoreCase = true) &&
+                    dtlsPort == expected.dtlsPort &&
+                    wgPort == expected.wgPort &&
+                    password == expected.password
+            }
+        }.first()
+    }
+
+    suspend fun saveVkHashesForProfile(profile: Int, hashes: List<String>) {
+        val cleaned = hashes
+            .map(VkJoinLink::extractHash)
+            .filter(VkJoinLink::isValidHash)
+            .distinct()
+        require(cleaned.size in 1..4) { "Добавьте от 1 до 4 корректных VK-хешей." }
+        dataStore.edit { prefs ->
+            val safeProfile = profile.coerceIn(0, VPN_PROFILE_COUNT - 1)
+            prefs[getProfileKey(VK_HASHES, safeProfile)] = cleaned.joinToString(",")
+            prefs[getProfileKey(SECONDARY_VK_HASH, safeProfile)] = ""
+            prefs[getProfileKey(PROFILE_VALUES_SYNC_PENDING, safeProfile)] = true
+        }
+    }
+
+    suspend fun markProfileValuesSyncPending(profileIndex: Int) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(PROFILE_VALUES_SYNC_PENDING, profile)] = true
+        }
+    }
+
+    suspend fun clearProfileValuesSyncPending(profileIndex: Int) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            prefs.remove(getProfileKey(PROFILE_VALUES_SYNC_PENDING, profile))
+        }
+    }
+
+    suspend fun profileValuesSyncPending(profileIndex: Int): Boolean {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        return preferencesFlow.map { prefs ->
+            prefs[getProfileKey(PROFILE_VALUES_SYNC_PENDING, profile)] == true
+        }.first()
+    }
+
+    suspend fun mergeVkHashesForProfile(profile: Int, hashes: List<String>): Int {
+        val cleaned = hashes
+            .map(VkJoinLink::extractHash)
+            .filter(VkJoinLink::isValidHash)
+            .distinct()
+            .take(4)
+        if (cleaned.isEmpty()) return 0
+        var added = 0
+        dataStore.edit { prefs ->
+            val safeProfile = profile.coerceIn(0, VPN_PROFILE_COUNT - 1)
+            val key = getProfileKey(VK_HASHES, safeProfile)
+            val slots = parseVkHashSlots(prefs[key].orEmpty())
+            cleaned.forEach { hash ->
+                if (hash !in slots) {
+                    val empty = slots.indexOfFirst { it.isBlank() }
+                    if (empty >= 0) {
+                        slots[empty] = hash
+                        added += 1
+                    }
+                }
+            }
+            if (added > 0) {
+                prefs[key] = slots.joinToString(",")
+                prefs[getProfileKey(SECONDARY_VK_HASH, safeProfile)] = ""
+            }
+        }
+        return added
+    }
+
+    suspend fun getOrCreateConnectDeviceId(): String {
+        val tunnelDeviceId = getOrCreateTunnelDeviceId()
+        var resolved = ""
+        dataStore.edit { prefs ->
+            resolved = DeviceIdentity.resolve(
+                existing = prefs[CONNECT_DEVICE_ID],
+                platformId = tunnelDeviceId,
+                generatedId = "android-${UUID.randomUUID()}",
+            )
+            prefs[CONNECT_DEVICE_ID] = resolved
+        }
+        return resolved
+    }
+
+    suspend fun getOrCreateTunnelDeviceId(): String {
+        val platformId = android.provider.Settings.Secure.getString(
+            appContext.contentResolver,
+            android.provider.Settings.Secure.ANDROID_ID,
+        )
+        var resolved = ""
+        dataStore.edit { prefs ->
+            resolved = DeviceIdentity.resolve(
+                existing = prefs[TUNNEL_DEVICE_ID],
+                platformId = platformId,
+                generatedId = "android-${UUID.randomUUID()}",
+            )
+            prefs[TUNNEL_DEVICE_ID] = resolved
+        }
+        return resolved
+    }
+
     suspend fun insertVkHashFromShare(hash: String): VkHashInsertResult {
         val cleanedHash = VkJoinLink.extractHash(hash)
-        require(cleanedHash.length >= 16) { "VK-хеш слишком короткий" }
+        require(VkJoinLink.isValidHash(cleanedHash)) { "VK-хеш имеет неверный формат" }
         var result = VkHashInsertResult(slot = 1, hash = cleanedHash, previousHash = "")
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -1179,7 +2361,14 @@ class SettingsStore(context: Context) {
 
             prefs[hashesKey] = slots.joinToString(",")
             prefs[nextSlotKey] = (slotIndex + 1) % 4
-            result = VkHashInsertResult(slot = slotIndex + 1, hash = cleanedHash, previousHash = previous)
+            prefs[getProfileKey(PROFILE_VALUES_SYNC_PENDING, profile)] = true
+            result = VkHashInsertResult(
+                slot = slotIndex + 1,
+                hash = cleanedHash,
+                previousHash = previous,
+                profile = profile,
+                hashes = slots.filter { it.isNotBlank() },
+            )
         }
         return result
     }
@@ -1191,7 +2380,7 @@ class SettingsStore(context: Context) {
             raw.split(Regex("[\\s\\n]+"))
         }
         val slots = tokens
-            .map { VkJoinLink.extractHash(it) }
+            .map { VkJoinLink.extractValidHash(it) }
             .take(4)
             .toMutableList()
         while (slots.size < 4) {
@@ -1332,6 +2521,33 @@ class SettingsStore(context: Context) {
             prefs.putSecret(CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, password, profile)
         }
     }
+
+    suspend fun saveManualTunnelConnection(
+        peer: String,
+        password: String,
+        manualPortsEnabled: Boolean,
+        serverDtlsPort: Int,
+        serverWgPort: Int,
+        listenPort: Int,
+    ) {
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            prefs[getProfileKey(WDTT_LINK_MODE, profile)] = false
+            prefs[getProfileKey(CONNECTION_INPUT_METHOD, profile)] = "manual"
+            prefs.remove(getProfileKey(WDTT_LINK, profile))
+            prefs[getProfileKey(PEER, profile)] = peer.trim()
+            prefs.putSecret(
+                CONNECTION_PASSWORD_ENCRYPTED,
+                CONNECTION_PASSWORD,
+                password,
+                profile
+            )
+            prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] = manualPortsEnabled
+            prefs[getProfileKey(SERVER_DTLS_PORT, profile)] = serverDtlsPort
+            prefs[getProfileKey(SERVER_WG_PORT, profile)] = serverWgPort
+            prefs[getProfileKey(LISTEN_PORT, profile)] = listenPort
+        }
+    }
     
     // ═══ Сохранение секретов деплоя ═══
     suspend fun saveDeploySecrets(mainPass: String, adminId: String, botToken: String, sshPort: String) {
@@ -1366,6 +2582,20 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
             prefs[getProfileKey(CAPTCHA_MODE, profile)] = mode
+        }
+    }
+
+    suspend fun saveCaptchaPreference(autoEnabled: Boolean) {
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            if (autoEnabled) {
+                prefs[getProfileKey(CAPTCHA_MODE, profile)] = "auto"
+                prefs[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] = "auto"
+            } else {
+                prefs[getProfileKey(CAPTCHA_MODE, profile)] = "wv"
+                prefs[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] = "manual"
+                prefs[getProfileKey(CAPTCHA_WBV_SOLVE_METHOD, profile)] = "manual"
+            }
         }
     }
 
@@ -1406,6 +2636,14 @@ class SettingsStore(context: Context) {
                 prefs.migrateSecret(getProfileKey(DEPLOY_MAIN_PASSWORD_ENCRYPTED, profile), getProfileKey(DEPLOY_MAIN_PASSWORD, profile))
                 prefs.migrateSecret(getProfileKey(DEPLOY_ADMIN_ID_ENCRYPTED, profile), getProfileKey(DEPLOY_ADMIN_ID, profile))
                 prefs.migrateSecret(getProfileKey(DEPLOY_BOT_TOKEN_ENCRYPTED, profile), getProfileKey(DEPLOY_BOT_TOKEN, profile))
+                prefs.migrateSecret(
+                    getProfileKey(REMOTE_ACTION_KEY_ENCRYPTED, profile),
+                    getProfileKey(REMOTE_ACTION_KEY, profile)
+                )
+                prefs.migrateSecret(
+                    getProfileKey(CUSTOM_VK_CLIENT_SECRET_ENCRYPTED, profile),
+                    getProfileKey(CUSTOM_VK_CLIENT_SECRET, profile)
+                )
             }
         }
     }
@@ -1443,6 +2681,326 @@ class SettingsStore(context: Context) {
                 prefs.remove(legacyKey)
             }
         }
+    }
+
+    private suspend fun repairInvalidLinkModes() {
+        dataStore.edit { prefs ->
+            for (profile in 0 until VPN_PROFILE_COUNT) {
+                val modeKey = getProfileKey(WDTT_LINK_MODE, profile)
+                val storedLink = prefs[getProfileKey(WDTT_LINK, profile)].orEmpty()
+                val hasStoredLink =
+                    WdttDeepLink.parse(storedLink, allowMissingHashes = true) != null
+                val hasManualConnection = prefs[getProfileKey(PEER, profile)].orEmpty().isNotBlank() &&
+                    readSecret(
+                        prefs,
+                        CONNECTION_PASSWORD_ENCRYPTED,
+                        CONNECTION_PASSWORD,
+                        profile
+                    ).isNotBlank()
+                var linkMode = prefs[modeKey] == true
+                if (linkMode && !hasStoredLink && hasManualConnection) {
+                    prefs[modeKey] = false
+                    linkMode = false
+                }
+
+                val methodKey = getProfileKey(CONNECTION_INPUT_METHOD, profile)
+                if (prefs[methodKey] != "link" && prefs[methodKey] != "manual") {
+                    when {
+                        linkMode && hasStoredLink -> prefs[methodKey] = "link"
+                        hasManualConnection -> prefs[methodKey] = "manual"
+                        else -> prefs.remove(methodKey)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun readAccessLifecycleUiState(
+        prefs: Preferences,
+        profile: Int,
+    ): AccessLifecycleUiState = readStoredAccessLifecycle(prefs, profile).toUiState()
+
+    private fun MutablePreferences.putRemoteContinuation(
+        continuation: RemoteContinuation,
+        binding: String,
+        profile: Int,
+    ) {
+        putSecret(
+            REMOTE_ACTION_KEY_ENCRYPTED,
+            REMOTE_ACTION_KEY,
+            continuation.key.trim(),
+            profile,
+        )
+        this[getProfileKey(REMOTE_ACTION_URL, profile)] = continuation.url.trim()
+        if (binding.isBlank()) {
+            remove(getProfileKey(REMOTE_DOCUMENT_BINDING, profile))
+        } else {
+            this[getProfileKey(REMOTE_DOCUMENT_BINDING, profile)] = binding.trim()
+        }
+        if (binding.isNotBlank() || continuation.available) {
+            this[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] = true
+        }
+    }
+
+    private fun MutablePreferences.putRemoteAccessCapability(
+        capability: RemoteAccessCapability,
+        profile: Int,
+    ) {
+        val previousKey = readProtectedSecret(
+            this,
+            ACCESS_LIFECYCLE_KEY_ENCRYPTED,
+            profile,
+        )
+        val previousUrl = this[getProfileKey(ACCESS_LIFECYCLE_URL, profile)].orEmpty()
+        val previousBinding =
+            this[getProfileKey(ACCESS_LIFECYCLE_BINDING, profile)].orEmpty()
+        if (
+            previousKey != capability.key ||
+            previousUrl != capability.url ||
+            previousBinding != capability.binding
+        ) {
+            clearAccessLifecycleStatus(profile)
+        }
+        putProtectedSecret(
+            ACCESS_LIFECYCLE_KEY_ENCRYPTED,
+            capability.key.trim(),
+            profile,
+        )
+        this[getProfileKey(ACCESS_LIFECYCLE_URL, profile)] = capability.url.trim()
+        this[getProfileKey(ACCESS_LIFECYCLE_BINDING, profile)] = capability.binding.trim()
+        putCachedRemoteAction(capability.cachedAction, profile)
+        putProfileExchange(capability.exchange, profile)
+        this[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] = true
+    }
+
+    private fun MutablePreferences.putCachedRemoteAction(
+        action: CachedRemoteAction,
+        profile: Int,
+    ) {
+        putProtectedSecret(
+            CACHED_ACTION_PAYLOAD_ENCRYPTED,
+            action.payload.takeIf { action.available }.orEmpty(),
+            profile,
+        )
+        val values = listOf(
+            kotlin.Pair(CACHED_ACTION_URL, action.target.primaryUrl),
+            kotlin.Pair(CACHED_ACTION_FALLBACK, action.target.fallbackUrl),
+            kotlin.Pair(CACHED_ACTION_HANDLER, action.target.preferredHandler),
+            kotlin.Pair(CACHED_ACTION_TITLE, action.title),
+            kotlin.Pair(CACHED_ACTION_MESSAGE, action.message),
+            kotlin.Pair(CACHED_ACTION_LABEL, action.label),
+            kotlin.Pair(CACHED_ACTION_CLIPBOARD_LABEL, action.clipboardLabel),
+            kotlin.Pair(CACHED_ACTION_COPIED_MESSAGE, action.copiedMessage),
+            kotlin.Pair(CACHED_ACTION_FAILED_MESSAGE, action.failedMessage),
+            kotlin.Pair(CACHED_ACTION_HELP_TITLE, action.helpTitle),
+            kotlin.Pair(CACHED_ACTION_HELP_INTRO, action.helpIntro),
+            kotlin.Pair(CACHED_ACTION_HELP_STEPS, action.helpSteps),
+        )
+        values.forEach { (key, value) ->
+            val profileKey = getProfileKey(key, profile)
+            if (action.available && value.isNotBlank()) {
+                this[profileKey] = value
+            } else {
+                remove(profileKey)
+            }
+        }
+    }
+
+    private fun MutablePreferences.putProfileExchange(
+        exchange: RemoteProfileExchange,
+        profile: Int,
+    ) {
+        putProtectedSecret(
+            PROFILE_EXCHANGE_SUBMIT_TOKEN_ENCRYPTED,
+            exchange.submitToken.takeIf { exchange.submitAvailable }.orEmpty(),
+            profile,
+        )
+        putProtectedSecret(
+            PROFILE_EXCHANGE_ACTION_TOKEN_ENCRYPTED,
+            exchange.actionToken,
+            profile,
+        )
+        this[getProfileKey(PROFILE_EXCHANGE_ACTION_AVAILABLE, profile)] =
+            exchange.actionAvailable
+        this[getProfileKey(PROFILE_EXCHANGE_ACTION_LABEL, profile)] = exchange.label
+        this[getProfileKey(PROFILE_EXCHANGE_ACTION_MESSAGE, profile)] = exchange.message
+    }
+
+    private fun MutablePreferences.putAccessLifecycleStatus(
+        profile: Int,
+        status: AccessLifecycleStatus,
+    ) {
+        if (status.cachedAction.available) {
+            putCachedRemoteAction(status.cachedAction, profile)
+        }
+        status.exchange?.let { putProfileExchange(it, profile) }
+        this[getProfileKey(ACCESS_ALLOW_CONNECT, profile)] = status.allowConnect
+        this[getProfileKey(ACCESS_CHECKED_AT, profile)] = status.checkedAtMillis.coerceAtLeast(0)
+        this[getProfileKey(ACCESS_ACTION_AVAILABLE, profile)] = status.actionAvailable
+        this[getProfileKey(ACCESS_ACTION_LABEL, profile)] = status.actionLabel
+        this[getProfileKey(ACCESS_ACTION_MESSAGE, profile)] = status.actionMessage
+        this[getProfileKey(ACCESS_TITLE, profile)] = status.title
+        this[getProfileKey(ACCESS_MESSAGE, profile)] = status.message
+        this[getProfileKey(ACCESS_DETAIL_LABEL, profile)] = status.detailLabel
+        this[getProfileKey(ACCESS_DETAIL_VALUE, profile)] = status.detailValue
+        this[getProfileKey(ACCESS_ACTION_ICON, profile)] = status.actionIcon
+        this[getProfileKey(ACCESS_SEVERITY, profile)] = status.severity.name.lowercase()
+    }
+
+    private fun readStoredAccessLifecycle(
+        prefs: Preferences,
+        profile: Int,
+    ): StoredAccessLifecycle {
+        val key = readProtectedSecret(prefs, ACCESS_LIFECYCLE_KEY_ENCRYPTED, profile)
+        val url = prefs[getProfileKey(ACCESS_LIFECYCLE_URL, profile)].orEmpty()
+        val binding = prefs[getProfileKey(ACCESS_LIFECYCLE_BINDING, profile)].orEmpty()
+        val capability = RemoteAccessCapability(
+            available = key.isNotBlank() && url.isNotBlank() && binding.isNotBlank(),
+            key = key,
+            url = url,
+            binding = binding,
+            cachedAction = readCachedRemoteAction(prefs, profile),
+            exchange = readProfileExchange(prefs, profile),
+        )
+        val hasStatus = (prefs[getProfileKey(ACCESS_CHECKED_AT, profile)] ?: 0) > 0
+        val status = if (hasStatus) {
+            val allowConnect = prefs[getProfileKey(ACCESS_ALLOW_CONNECT, profile)] ?: false
+            AccessLifecycleStatus(
+                allowConnect = allowConnect,
+                actionAvailable =
+                    prefs[getProfileKey(ACCESS_ACTION_AVAILABLE, profile)] ?: false,
+                actionLabel = prefs[getProfileKey(ACCESS_ACTION_LABEL, profile)].orEmpty(),
+                actionMessage = prefs[getProfileKey(ACCESS_ACTION_MESSAGE, profile)].orEmpty(),
+                title = prefs[getProfileKey(ACCESS_TITLE, profile)].orEmpty(),
+                message = prefs[getProfileKey(ACCESS_MESSAGE, profile)].orEmpty(),
+                detailLabel =
+                    prefs[getProfileKey(ACCESS_DETAIL_LABEL, profile)].orEmpty(),
+                detailValue =
+                    prefs[getProfileKey(ACCESS_DETAIL_VALUE, profile)].orEmpty(),
+                actionIcon =
+                    prefs[getProfileKey(ACCESS_ACTION_ICON, profile)].orEmpty(),
+                severity = AccessLifecycleSeverity.parse(
+                    prefs[getProfileKey(ACCESS_SEVERITY, profile)].orEmpty(),
+                    allowConnect,
+                ),
+                checkedAtMillis = prefs[getProfileKey(ACCESS_CHECKED_AT, profile)] ?: 0,
+                profileRevision =
+                    prefs[getProfileKey(ACCESS_PROFILE_REVISION, profile)] ?: 0,
+            )
+        } else {
+            null
+        }
+        return StoredAccessLifecycle(
+            managed = capability.available,
+            capability = capability,
+            status = status,
+            appliedProfileRevision =
+                prefs[getProfileKey(ACCESS_PROFILE_REVISION, profile)] ?: 0,
+            lastAttemptAtMillis =
+                prefs[getProfileKey(ACCESS_LAST_ATTEMPT_AT, profile)] ?: 0,
+        )
+    }
+
+    private fun readCachedRemoteAction(
+        prefs: Preferences,
+        profile: Int,
+    ): CachedRemoteAction {
+        val payload = readProtectedSecret(prefs, CACHED_ACTION_PAYLOAD_ENCRYPTED, profile)
+        val primary = prefs[getProfileKey(CACHED_ACTION_URL, profile)].orEmpty()
+        if (payload.isBlank() || primary.isBlank()) return CachedRemoteAction.Unavailable
+        return CachedRemoteAction(
+            available = true,
+            payload = payload,
+            target = RemoteLaunchTarget(
+                primaryUrl = primary,
+                fallbackUrl = prefs[getProfileKey(CACHED_ACTION_FALLBACK, profile)].orEmpty(),
+                preferredHandler = prefs[getProfileKey(CACHED_ACTION_HANDLER, profile)].orEmpty(),
+            ),
+            title = prefs[getProfileKey(CACHED_ACTION_TITLE, profile)].orEmpty(),
+            message = prefs[getProfileKey(CACHED_ACTION_MESSAGE, profile)].orEmpty(),
+            label = prefs[getProfileKey(CACHED_ACTION_LABEL, profile)].orEmpty(),
+            clipboardLabel =
+                prefs[getProfileKey(CACHED_ACTION_CLIPBOARD_LABEL, profile)].orEmpty(),
+            copiedMessage =
+                prefs[getProfileKey(CACHED_ACTION_COPIED_MESSAGE, profile)].orEmpty(),
+            failedMessage =
+                prefs[getProfileKey(CACHED_ACTION_FAILED_MESSAGE, profile)].orEmpty(),
+            helpTitle = prefs[getProfileKey(CACHED_ACTION_HELP_TITLE, profile)].orEmpty(),
+            helpIntro = prefs[getProfileKey(CACHED_ACTION_HELP_INTRO, profile)].orEmpty(),
+            helpSteps = prefs[getProfileKey(CACHED_ACTION_HELP_STEPS, profile)].orEmpty(),
+        )
+    }
+
+    private fun readProfileExchange(
+        prefs: Preferences,
+        profile: Int,
+    ): RemoteProfileExchange {
+        val submitToken = readProtectedSecret(
+            prefs,
+            PROFILE_EXCHANGE_SUBMIT_TOKEN_ENCRYPTED,
+            profile,
+        )
+        val actionToken = readProtectedSecret(
+            prefs,
+            PROFILE_EXCHANGE_ACTION_TOKEN_ENCRYPTED,
+            profile,
+        )
+        return if (submitToken.isNotBlank() || actionToken.isNotBlank()) {
+            RemoteProfileExchange(
+                submitAvailable = submitToken.isNotBlank(),
+                submitToken = submitToken,
+                actionAvailable =
+                    prefs[getProfileKey(PROFILE_EXCHANGE_ACTION_AVAILABLE, profile)] == true &&
+                        actionToken.isNotBlank(),
+                actionToken = actionToken,
+                label =
+                    prefs[getProfileKey(PROFILE_EXCHANGE_ACTION_LABEL, profile)].orEmpty(),
+                message =
+                    prefs[getProfileKey(PROFILE_EXCHANGE_ACTION_MESSAGE, profile)].orEmpty(),
+            )
+        } else {
+            RemoteProfileExchange.Unavailable
+        }
+    }
+
+    private fun readProtectedSecret(
+        prefs: Preferences,
+        encryptedKey: Preferences.Key<String>,
+        profile: Int,
+    ): String = secureStore.decrypt(prefs[getProfileKey(encryptedKey, profile)]).orEmpty()
+
+    private fun MutablePreferences.putProtectedSecret(
+        encryptedKey: Preferences.Key<String>,
+        value: String,
+        profile: Int,
+    ) {
+        val key = getProfileKey(encryptedKey, profile)
+        if (value.isBlank()) remove(key) else this[key] = secureStore.encrypt(value)
+    }
+
+    private fun MutablePreferences.clearAccessLifecycleStatus(profile: Int) {
+        remove(getProfileKey(ACCESS_ALLOW_CONNECT, profile))
+        remove(getProfileKey(ACCESS_ACTION_AVAILABLE, profile))
+        remove(getProfileKey(ACCESS_ACTION_LABEL, profile))
+        remove(getProfileKey(ACCESS_ACTION_MESSAGE, profile))
+        remove(getProfileKey(ACCESS_TITLE, profile))
+        remove(getProfileKey(ACCESS_MESSAGE, profile))
+        remove(getProfileKey(ACCESS_DETAIL_LABEL, profile))
+        remove(getProfileKey(ACCESS_DETAIL_VALUE, profile))
+        remove(getProfileKey(ACCESS_ACTION_ICON, profile))
+        remove(getProfileKey(ACCESS_SEVERITY, profile))
+        remove(getProfileKey(ACCESS_CHECKED_AT, profile))
+        remove(getProfileKey(ACCESS_LAST_ATTEMPT_AT, profile))
+        remove(getProfileKey(ACCESS_ACTION_LAUNCHED_AT, profile))
+    }
+
+    private fun MutablePreferences.clearAccessLifecycle(profile: Int) {
+        remove(getProfileKey(ACCESS_LIFECYCLE_KEY_ENCRYPTED, profile))
+        remove(getProfileKey(ACCESS_LIFECYCLE_URL, profile))
+        remove(getProfileKey(ACCESS_LIFECYCLE_BINDING, profile))
+        remove(getProfileKey(ACCESS_PROFILE_REVISION, profile))
+        putCachedRemoteAction(CachedRemoteAction.Unavailable, profile)
+        clearAccessLifecycleStatus(profile)
     }
 
     private fun readSecret(
@@ -1515,6 +3073,12 @@ class SettingsStore(context: Context) {
     private fun exportSharedPreferences(name: String): JSONObject {
         val result = JSONObject()
         appContext.getSharedPreferences(name, Context.MODE_PRIVATE).all.forEach { (key, value) ->
+            if (name == "wdtt_outbound_forms" && key.endsWith("_encrypted") && value is String) {
+                secureStore.decrypt(value)?.let { decrypted ->
+                    result.put(key.removeSuffix("_encrypted"), decrypted)
+                }
+                return@forEach
+            }
             when (value) {
                 is String, is Boolean, is Int, is Long, is Float -> result.put(key, value)
                 is Set<*> -> result.put(key, JSONArray(value.filterIsInstance<String>()))
@@ -1529,7 +3093,15 @@ class SettingsStore(context: Context) {
         while (keys.hasNext()) {
             val key = keys.next()
             when (val value = json.get(key)) {
-                is String -> editor.putString(key, value)
+                is String -> {
+                    if (name == "wdtt_outbound_forms" && isOutboundPreferenceSecretKey(key)) {
+                        if (value.isNotBlank()) {
+                            editor.putString("${key}_encrypted", secureStore.encrypt(value))
+                        }
+                    } else {
+                        editor.putString(key, value)
+                    }
+                }
                 is Boolean -> editor.putBoolean(key, value)
                 is Int -> editor.putInt(key, value)
                 is Long -> editor.putLong(key, value)
@@ -1542,6 +3114,14 @@ class SettingsStore(context: Context) {
         }
         editor.apply()
     }
+
+    private fun isOutboundPreferenceSecretKey(key: String): Boolean =
+        listOf(
+            "local_proxy_password",
+            "external_proxy_password",
+            "wg_exit_password",
+            "imported_wg_config",
+        ).any { secretName -> key == secretName || key.endsWith("_$secretName") }
 
     private fun JSONObject.safePort(name: String, fallback: Int): Int =
         optInt(name, fallback).takeIf { it in 1..65535 } ?: fallback

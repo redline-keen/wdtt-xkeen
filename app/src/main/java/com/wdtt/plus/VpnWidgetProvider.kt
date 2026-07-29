@@ -45,8 +45,18 @@ class VpnWidgetProvider : AppWidgetProvider() {
         val trustedWifi = TrustedWifiManager.state.value
         scope.launch {
             val settingsStore = SettingsStore(context)
-            val activeProfile = settingsStore.activeProfile.first().coerceIn(0, 2)
+            val selectedProfile = settingsStore.activeProfile.first().coerceIn(0, 2)
+            val activeTunnelProfile = TunnelManager.activeTunnelProfile.value
+                ?: settingsStore.activeTunnelProfile.first()
+            val displayedProfile = displayedTunnelProfile(
+                selectedProfile = selectedProfile,
+                activeTunnelProfile = activeTunnelProfile,
+                running = running,
+                trustedWifiWaiting = trustedWifi.waiting,
+            )
             val profileNames = settingsStore.profileNames.first()
+            val accessLifecycle =
+                settingsStore.accessLifecycleForProfile(displayedProfile).toUiState()
             for (appWidgetId in appWidgetIds) {
                 updateWidgetState(
                     context = context,
@@ -54,8 +64,9 @@ class VpnWidgetProvider : AppWidgetProvider() {
                     appWidgetId = appWidgetId,
                     running = running,
                     trustedWifi = trustedWifi,
-                    activeProfile = activeProfile,
-                    profileNames = profileNames
+                    activeProfile = displayedProfile,
+                    profileNames = profileNames,
+                    accessLifecycle = accessLifecycle,
                 )
             }
         }
@@ -65,38 +76,53 @@ class VpnWidgetProvider : AppWidgetProvider() {
         super.onReceive(context, intent)
         if (intent.action == ACTION_WIDGET_TOGGLE) {
             runCatching {
-                if (TunnelManager.running.value || TrustedWifiManager.state.value.waiting) {
-                    // Останавливаем туннель
-                    val stopIntent = Intent(context, TunnelService::class.java).apply { action = "STOP" }
-                    context.startService(stopIntent)
-                    updateAllWidgets(context)
-                    return
-                }
+                when (
+                    tunnelToggleAction(
+                        running = TunnelManager.running.value,
+                        trustedWifiWaiting = TrustedWifiManager.state.value.waiting,
+                        vpnPermissionRequired = VpnService.prepare(context) != null,
+                    )
+                ) {
+                    TunnelToggleAction.STOP -> {
+                        context.startService(
+                            Intent(context, TunnelService::class.java).apply { action = "STOP" }
+                        )
+                        updateAllWidgets(context)
+                    }
+                    TunnelToggleAction.REQUEST_VPN_PERMISSION -> {
+                        Toast.makeText(
+                            context,
+                            "Откройте WDTT Plus и выдайте VPN-разрешение",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        openMainActivity(context)
+                    }
+                    TunnelToggleAction.START -> scope.launch {
+                        try {
+                            val startIntent = buildTunnelStartIntentFromSettings(context)
+                            if (startIntent == null) {
+                                Toast.makeText(
+                                    context,
+                                    "Заполните настройки подключения в WDTT Plus",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                openMainActivity(context)
+                                return@launch
+                            }
 
-                if (VpnService.prepare(context) != null) {
-                    Toast.makeText(context, "Откройте WDTT Plus и выдайте VPN-разрешение", Toast.LENGTH_LONG).show()
-                    openMainActivity(context)
-                    return
-                }
-
-                // Запуск туннеля в фоне
-                scope.launch {
-                    try {
-                        val startIntent = buildTunnelStartIntentFromSettings(context)
-                        if (startIntent == null) {
-                            Toast.makeText(context, "Заполните настройки подключения в WDTT Plus", Toast.LENGTH_LONG).show()
-                            openMainActivity(context)
-                            return@launch
+                            if (Build.VERSION.SDK_INT >= 26) {
+                                context.startForegroundService(startIntent)
+                            } else {
+                                context.startService(startIntent)
+                            }
+                        } catch (e: Exception) {
+                            Log.e("VpnWidget", "Failed to start tunnel from widget", e)
+                            Toast.makeText(
+                                context,
+                                "Ошибка запуска: ${e.localizedMessage}",
+                                Toast.LENGTH_SHORT
+                            ).show()
                         }
-
-                        if (Build.VERSION.SDK_INT >= 26) {
-                            context.startForegroundService(startIntent)
-                        } else {
-                            context.startService(startIntent)
-                        }
-                    } catch (e: Exception) {
-                        Log.e("VpnWidget", "Failed to start tunnel from widget", e)
-                        Toast.makeText(context, "Ошибка запуска: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
                     }
                 }
             }.onFailure { e ->
@@ -112,7 +138,8 @@ class VpnWidgetProvider : AppWidgetProvider() {
         running: Boolean,
         trustedWifi: TrustedWifiRuntimeState,
         activeProfile: Int,
-        profileNames: List<String>
+        profileNames: List<String>,
+        accessLifecycle: AccessLifecycleUiState,
     ) {
         val views = RemoteViews(context.packageName, R.layout.vpn_widget)
 
@@ -129,8 +156,24 @@ class VpnWidgetProvider : AppWidgetProvider() {
             views.setTextColor(R.id.widget_status, 0xFF00E5FF.toInt()) // Неоновый голубой
             views.setInt(R.id.widget_toggle_btn, "setBackgroundResource", R.drawable.bg_widget_button_active)
         } else {
-            views.setTextViewText(R.id.widget_status, "Отключено")
-            views.setTextColor(R.id.widget_status, 0xFF888888.toInt()) // Матовый серый
+            val accessBlocked = accessLifecycle.managed && !accessLifecycle.allowConnect
+            views.setTextViewText(
+                R.id.widget_status,
+                accessLifecycle.title.takeIf { accessBlocked && it.isNotBlank() }
+                    ?: accessLifecycle.fallbackTitle().takeIf { accessBlocked }
+                    ?: "Отключено"
+            )
+            views.setTextColor(
+                R.id.widget_status,
+                if (
+                    accessLifecycle.severity == AccessLifecycleSeverity.ERROR &&
+                    accessBlocked
+                ) {
+                    0xFFFF6B6B.toInt()
+                } else {
+                    0xFF888888.toInt()
+                }
+            )
             views.setInt(R.id.widget_toggle_btn, "setBackgroundResource", R.drawable.bg_widget_button_inactive)
         }
 

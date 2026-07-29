@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,23 +16,64 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
-
-	"golang.zx2c4.com/wireguard/device"
 )
 
 type adminResponse struct {
 	OK              bool                `json:"ok"`
+	Code            string              `json:"code,omitempty"`
 	Message         string              `json:"message,omitempty"`
 	RestartRequired bool                `json:"restart_required,omitempty"`
 	Server          *adminServerInfo    `json:"server,omitempty"`
 	Password        *adminPasswordInfo  `json:"password,omitempty"`
 	Passwords       []adminPasswordInfo `json:"passwords,omitempty"`
+	ClientState     *adminClientState   `json:"client_state,omitempty"`
+}
+
+type adminClientState struct {
+	Version        int                      `json:"version"`
+	Password       string                   `json:"password"`
+	DownBytes      int64                    `json:"down_bytes"`
+	UpBytes        int64                    `json:"up_bytes"`
+	Traffic        []TrafficBucket          `json:"traffic,omitempty"`
+	TrafficImports map[string]TrafficImport `json:"traffic_imports,omitempty"`
+	BindHistory    []BindHistoryEntry       `json:"bind_history,omitempty"`
 }
 
 type adminRequest struct {
 	MainPassword string   `json:"main_password"`
 	Args         []string `json:"args"`
+}
+
+type adminCommandError struct {
+	code    string
+	message string
+}
+
+func (e *adminCommandError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func newAdminCommandError(code, message string) error {
+	return &adminCommandError{code: code, message: message}
+}
+
+func adminErrorResponse(err error) adminResponse {
+	response := adminResponse{OK: false}
+	if err == nil {
+		return response
+	}
+	response.Message = err.Error()
+	var coded *adminCommandError
+	if errors.As(err, &coded) {
+		response.Code = coded.code
+	}
+	return response
 }
 
 type adminLiveSnapshot struct {
@@ -39,20 +82,64 @@ type adminLiveSnapshot struct {
 }
 
 type adminServerInfo struct {
-	ConfigDir         string             `json:"config_dir"`
-	PublicIP          string             `json:"public_ip,omitempty"`
-	EffectivePublic   string             `json:"effective_public_ip,omitempty"`
-	DNS               string             `json:"dns,omitempty"`
-	DefaultPorts      string             `json:"default_ports"`
-	MaxPasswords      int                `json:"max_passwords"`
-	PasswordCount     int                `json:"password_count"`
-	DeviceCount       int                `json:"device_count"`
-	ExpiredCount      int                `json:"expired_count"`
-	OrphanDeviceCount int                `json:"orphan_device_count"`
-	OrphanDevices     []adminDeviceInfo  `json:"orphan_devices,omitempty"`
-	Traffic           adminTrafficPeriod `json:"traffic"`
-	AdminTraffic      adminTrafficPeriod `json:"admin_traffic"`
-	AdminProfile      AdminProfileEntry  `json:"admin_profile,omitempty"`
+	WDTTPlusVersion        string             `json:"wdtt_plus_version"`
+	BinarySHA256           string             `json:"binary_sha256,omitempty"`
+	WGBackend              string             `json:"wg_backend,omitempty"`
+	ConfigDir              string             `json:"config_dir"`
+	PublicIP               string             `json:"public_ip,omitempty"`
+	EffectivePublic        string             `json:"effective_public_ip,omitempty"`
+	DNS                    string             `json:"dns,omitempty"`
+	DefaultPorts           string             `json:"default_ports"`
+	MaxPasswords           int                `json:"max_passwords"`
+	MaxWorkersPerAccess    int                `json:"max_workers_per_access"`
+	MaxClientMbps          float64            `json:"max_client_mbps"`
+	PasswordCount          int                `json:"password_count"`
+	ActivePasswordCount    int                `json:"active_password_count"`
+	RetainedExpiredCount   int                `json:"retained_expired_count"`
+	AvailablePasswordCount int                `json:"available_password_count"`
+	DeviceCount            int                `json:"device_count"`
+	OwnerDeviceCount       int                `json:"owner_device_count"`
+	ExpiredCount           int                `json:"expired_count"`
+	OrphanDeviceCount      int                `json:"orphan_device_count"`
+	ActiveConnections      int32              `json:"active_connections"`
+	CPUPercent             float64            `json:"cpu_percent"`
+	MemoryPercent          float64            `json:"memory_percent"`
+	NetworkRxMbps          float64            `json:"network_rx_mbps"`
+	NetworkTxMbps          float64            `json:"network_tx_mbps"`
+	PacketDrops            int64              `json:"packet_drops"`
+	Reconnects             int64              `json:"reconnects"`
+	HandshakeFailures      int64              `json:"handshake_failures"`
+	HandshakeThrottles     int64              `json:"handshake_throttles"`
+	WorkerLimitRejects     int64              `json:"worker_limit_rejections"`
+	OrphanDevices          []adminDeviceInfo  `json:"orphan_devices,omitempty"`
+	Traffic                adminTrafficPeriod `json:"traffic"`
+	AdminTraffic           adminTrafficPeriod `json:"admin_traffic"`
+	AdminProfile           AdminProfileEntry  `json:"admin_profile,omitempty"`
+}
+
+var (
+	runningBinarySHA256Once sync.Once
+	runningBinarySHA256Sum  string
+)
+
+func runningBinarySHA256() string {
+	runningBinarySHA256Once.Do(func() {
+		executable, err := os.Executable()
+		if err != nil {
+			return
+		}
+		source, err := os.Open(executable)
+		if err != nil {
+			return
+		}
+		defer source.Close()
+		digest := sha256.New()
+		if _, err := io.Copy(digest, source); err != nil {
+			return
+		}
+		runningBinarySHA256Sum = fmt.Sprintf("%x", digest.Sum(nil))
+	})
+	return runningBinarySHA256Sum
 }
 
 type adminTrafficValue struct {
@@ -92,6 +179,7 @@ type adminPasswordInfo struct {
 	Ports           string             `json:"ports"`
 	Status          string             `json:"status"`
 	ExpiresAt       int64              `json:"expires_at,omitempty"`
+	PurgeAfter      int64              `json:"purge_after,omitempty"`
 	DownBytes       int64              `json:"down_bytes,omitempty"`
 	UpBytes         int64              `json:"up_bytes,omitempty"`
 	DeviceID        string             `json:"device_id,omitempty"`
@@ -154,7 +242,7 @@ func runAdminCLI(args []string) int {
 	return 0
 }
 
-func executeAdminCommand(configDir string, loaded *Database, rest []string, wgDev *device.Device, live bool) (adminResponse, error) {
+func executeAdminCommand(configDir string, loaded *Database, rest []string, wgDev wgDevice, live bool) (adminResponse, error) {
 	var response adminResponse
 	var err error
 	snapshot := captureAdminLiveSnapshot(loaded, rest)
@@ -170,8 +258,12 @@ func executeAdminCommand(configDir string, loaded *Database, rest []string, wgDe
 		}
 	case "details":
 		response, err = adminPasswordDetails(configDir, loaded, rest[1:])
+	case "export-client-state":
+		response, err = adminExportClientState(configDir, loaded, rest[1:])
 	case "create":
 		response, err = adminCreatePassword(configDir, loaded, rest[1:])
+	case "import-client-state":
+		response, err = adminImportClientState(configDir, loaded, rest[1:])
 	case "delete":
 		response, err = adminDeletePassword(configDir, loaded, rest[1:])
 	case "unbind":
@@ -186,6 +278,8 @@ func executeAdminCommand(configDir string, loaded *Database, rest []string, wgDe
 		response, err = adminSetPasswordHash(configDir, loaded, rest[1:])
 	case "set-expiry":
 		response, err = adminSetPasswordExpiry(configDir, loaded, rest[1:])
+	case "set-retention":
+		response, err = adminSetPasswordRetention(configDir, loaded, rest[1:])
 	case "set-ports":
 		response, err = adminSetPasswordPorts(configDir, loaded, rest[1:])
 	case "set-password":
@@ -212,6 +306,8 @@ func executeAdminCommand(configDir string, loaded *Database, rest []string, wgDe
 		response, err = adminCleanupOrphans(configDir, loaded, wgDev, live)
 	case "reset-traffic":
 		response, err = adminResetTraffic(configDir, loaded)
+	case "merge-client-traffic":
+		response, err = adminMergeClientTraffic(configDir, loaded, rest[1:])
 	case "restart":
 		response = adminResponse{OK: true, Message: "Перезапуск сервиса", RestartRequired: true}
 	default:
@@ -268,7 +364,7 @@ func captureAdminLiveSnapshot(loaded *Database, args []string) adminLiveSnapshot
 	}
 }
 
-func applyLiveAdminEffects(configDir string, loaded *Database, args []string, response adminResponse, snapshot adminLiveSnapshot, wgDev *device.Device) error {
+func applyLiveAdminEffects(configDir string, loaded *Database, args []string, response adminResponse, snapshot adminLiveSnapshot, wgDev wgDevice) error {
 	if len(args) == 0 {
 		return nil
 	}
@@ -287,16 +383,16 @@ func applyLiveAdminEffects(configDir string, loaded *Database, args []string, re
 			return fmt.Errorf("не удалось добавить WRAP-ключ: %w", err)
 		}
 	case "delete":
-		if !isAdminSnapshotDevice(loaded, snapshot) {
+		if shouldRemoveAdminSnapshotPeer(loaded, snapshot) {
 			removePeerFromWG(wgDev, snapshot.device)
 		}
 		serverWrapKeys.RemovePassword(snapshot.password)
 	case "unbind":
-		if !isAdminSnapshotDevice(loaded, snapshot) {
+		if shouldRemoveAdminSnapshotPeer(loaded, snapshot) {
 			removePeerFromWG(wgDev, snapshot.device)
 		}
 	case "deactivate":
-		if !isAdminSnapshotDevice(loaded, snapshot) {
+		if shouldRemoveAdminSnapshotPeer(loaded, snapshot) {
 			removePeerFromWG(wgDev, snapshot.device)
 		}
 		serverWrapKeys.RemovePassword(snapshot.password)
@@ -314,9 +410,10 @@ func applyLiveAdminEffects(configDir string, loaded *Database, args []string, re
 			return errors.New("сервер изменил пароль клиента без нового значения")
 		}
 		newPassword := response.Password.Password
-		if response.Password.Status == "active" {
+		entry := loaded.Passwords[newPassword]
+		if entry != nil && !entry.IsDeactivated && !isPasswordPurgeable(entry) {
 			if err := serverWrapKeys.AddPassword(newPassword); err != nil {
-				if entry := loaded.Passwords[newPassword]; entry != nil {
+				if entry != nil {
 					delete(loaded.Passwords, newPassword)
 					loaded.Passwords[snapshot.password] = entry
 					_ = saveAdminDB(configDir, loaded)
@@ -325,8 +422,20 @@ func applyLiveAdminEffects(configDir string, loaded *Database, args []string, re
 			}
 		}
 		serverWrapKeys.RemovePassword(snapshot.password)
-		if !isAdminSnapshotDevice(loaded, snapshot) {
+		if shouldRemoveAdminSnapshotPeer(loaded, snapshot) {
 			removePeerFromWG(wgDev, snapshot.device)
+		}
+	case "set-expiry":
+		if response.Password == nil {
+			return errors.New("сервер обновил срок клиента без состояния доступа")
+		}
+		password := response.Password.Password
+		if response.Password.Status == "active" {
+			if err := serverWrapKeys.AddPassword(password); err != nil {
+				return fmt.Errorf("не удалось вернуть WRAP-ключ после продления: %w", err)
+			}
+		} else if response.Password.Status == "deactivated" {
+			serverWrapKeys.RemovePassword(password)
 		}
 	case "set-dns", "update-settings":
 		setServerDNS(loaded.DNS)
@@ -357,6 +466,13 @@ func isAdminSnapshotDevice(loaded *Database, snapshot adminLiveSnapshot) bool {
 	return ok
 }
 
+func shouldRemoveAdminSnapshotPeer(loaded *Database, snapshot adminLiveSnapshot) bool {
+	if snapshot.device == nil || isAdminSnapshotDevice(loaded, snapshot) {
+		return false
+	}
+	return !databaseUsesDeviceIDExcept(loaded, snapshot.device.DeviceID, snapshot.password)
+}
+
 func adminSocketPath(configDir string) string {
 	if filepath.Clean(configDir) == "/etc/wdtt" {
 		return "/run/wdtt/admin.sock"
@@ -381,7 +497,7 @@ func callAdminSocket(configDir string, request adminRequest) (adminResponse, err
 	return response, nil
 }
 
-func startAdminSocket(ctx context.Context, configDir string, wgDev *device.Device) error {
+func startAdminSocket(ctx context.Context, configDir string, wgDev wgDevice) error {
 	path := adminSocketPath(configDir)
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
@@ -419,7 +535,7 @@ func startAdminSocket(ctx context.Context, configDir string, wgDev *device.Devic
 	return nil
 }
 
-func handleAdminSocketConn(conn net.Conn, configDir string, wgDev *device.Device) {
+func handleAdminSocketConn(conn net.Conn, configDir string, wgDev wgDevice) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	var request adminRequest
@@ -439,7 +555,7 @@ func handleAdminSocketConn(conn net.Conn, configDir string, wgDev *device.Device
 	}
 	response, err := executeAdminCommand(configDir, db, request.Args, wgDev, true)
 	if err != nil {
-		response = adminResponse{OK: false, Message: err.Error()}
+		response = adminErrorResponse(err)
 	}
 	_ = json.NewEncoder(conn).Encode(response)
 }
@@ -620,19 +736,43 @@ func saveAdminDB(configDir string, loaded *Database) error {
 
 func buildAdminServerInfo(configDir string, loaded *Database) *adminServerInfo {
 	expired := 0
+	active := 0
+	retainedExpired := 0
+	occupied := 0
+	nowUnix := time.Now().Unix()
 	usedDevices := make(map[string]struct{})
+	clientDevices := make(map[string]struct{})
 	for _, entry := range loaded.Passwords {
 		if entry == nil {
 			continue
 		}
-		if isPasswordExpired(entry) {
+		if !isPasswordPurgeableAt(entry, nowUnix) {
+			occupied++
+		}
+		if isPasswordExpiredAt(entry, nowUnix) {
 			expired++
+			if isPasswordRetainedExpiredAt(entry, nowUnix) {
+				retainedExpired++
+			}
+		} else if !entry.IsDeactivated {
+			active++
 		}
 		if entry.DeviceID != "" {
 			usedDevices[entry.DeviceID] = struct{}{}
+			clientDevices[entry.DeviceID] = struct{}{}
+		}
+		for _, event := range entry.BindHistory {
+			deviceID := strings.TrimSpace(event.DeviceID)
+			if deviceID == "" || event.Status == "denied_mismatch" {
+				continue
+			}
+			if event.BoundAt > 0 || event.Status == "active" || event.Status == "unbound" {
+				clientDevices[deviceID] = struct{}{}
+			}
 		}
 	}
-	for deviceID := range adminDeviceIDSet(loaded) {
+	ownerDevices := adminDeviceIDSet(loaded)
+	for deviceID := range ownerDevices {
 		usedDevices[deviceID] = struct{}{}
 	}
 	orphans := 0
@@ -652,21 +792,45 @@ func buildAdminServerInfo(configDir string, loaded *Database) *adminServerInfo {
 	if effectivePublic == "" {
 		effectivePublic = publicIP
 	}
+	available := loaded.MaxPasswords - occupied
+	if available < 0 {
+		available = 0
+	}
+	maxWorkersPerAccess, maxClientMbps := configuredAccessRuntimeLimits()
 	return &adminServerInfo{
-		ConfigDir:         configDir,
-		PublicIP:          loaded.PublicIP,
-		EffectivePublic:   effectivePublic,
-		DNS:               loaded.DNS,
-		DefaultPorts:      loaded.DefaultPorts,
-		MaxPasswords:      loaded.MaxPasswords,
-		PasswordCount:     len(loaded.Passwords),
-		DeviceCount:       len(loaded.Devices),
-		ExpiredCount:      expired,
-		OrphanDeviceCount: orphans,
-		OrphanDevices:     orphanDevices,
-		Traffic:           buildAdminDatabaseTraffic(loaded),
-		AdminTraffic:      buildAdminTrafficPeriod(loaded.AdminTraffic, loaded.AdminDownBytes, loaded.AdminUpBytes),
-		AdminProfile:      buildAdminProfileInfo(loaded),
+		WDTTPlusVersion:        wdttServerVersion,
+		BinarySHA256:           runningBinarySHA256(),
+		WGBackend:              activeWGBackend.Load(),
+		ConfigDir:              configDir,
+		PublicIP:               loaded.PublicIP,
+		EffectivePublic:        effectivePublic,
+		DNS:                    loaded.DNS,
+		DefaultPorts:           loaded.DefaultPorts,
+		MaxPasswords:           loaded.MaxPasswords,
+		MaxWorkersPerAccess:    maxWorkersPerAccess,
+		MaxClientMbps:          maxClientMbps,
+		PasswordCount:          len(loaded.Passwords),
+		ActivePasswordCount:    active,
+		RetainedExpiredCount:   retainedExpired,
+		AvailablePasswordCount: available,
+		DeviceCount:            len(clientDevices),
+		OwnerDeviceCount:       len(ownerDevices),
+		ExpiredCount:           expired,
+		OrphanDeviceCount:      orphans,
+		ActiveConnections:      atomic.LoadInt32(&activeConns),
+		CPUPercent:             runtimeCPUPercent(),
+		MemoryPercent:          runtimeMemoryPercent(),
+		NetworkRxMbps:          runtimeNetworkRxMbps(),
+		NetworkTxMbps:          runtimeNetworkTxMbps(),
+		PacketDrops:            atomic.LoadInt64(&runtimePacketDrops),
+		Reconnects:             atomic.LoadInt64(&reconnectCount),
+		HandshakeFailures:      atomic.LoadInt64(&handshakeFailures),
+		HandshakeThrottles:     atomic.LoadInt64(&handshakeThrottles),
+		WorkerLimitRejects:     atomic.LoadInt64(&workerLimitRejections),
+		OrphanDevices:          orphanDevices,
+		Traffic:                buildAdminDatabaseTraffic(loaded),
+		AdminTraffic:           buildAdminTrafficPeriod(loaded.AdminTraffic, loaded.AdminDownBytes, loaded.AdminUpBytes),
+		AdminProfile:           buildAdminProfileInfo(loaded),
 	}
 }
 
@@ -711,6 +875,148 @@ func adminPasswordDetails(configDir string, loaded *Database, args []string) (ad
 	}, nil
 }
 
+func adminExportClientState(configDir string, loaded *Database, args []string) (adminResponse, error) {
+	password, err := adminPasswordArg("export-client-state", args)
+	if err != nil {
+		return adminResponse{}, err
+	}
+	entry, err := requireAdminPassword(loaded, password)
+	if err != nil {
+		return adminResponse{}, err
+	}
+	state := &adminClientState{
+		Version:        1,
+		Password:       password,
+		DownBytes:      entry.DownBytes,
+		UpBytes:        entry.UpBytes,
+		Traffic:        append([]TrafficBucket(nil), entry.Traffic...),
+		TrafficImports: cloneTrafficImports(entry.TrafficImports),
+		BindHistory:    append([]BindHistoryEntry(nil), entry.BindHistory...),
+	}
+	return adminResponse{
+		OK:          true,
+		Message:     "Состояние клиента подготовлено",
+		Server:      buildAdminServerInfo(configDir, loaded),
+		Password:    ptrAdminPasswordInfo(buildAdminPasswordInfo(loaded, password, entry)),
+		ClientState: state,
+	}, nil
+}
+
+func adminImportClientState(configDir string, loaded *Database, args []string) (adminResponse, error) {
+	fs := flag.NewFlagSet("import-client-state", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	password := fs.String("password", "", "пароль клиента")
+	operationID := fs.String("operation-id", "", "уникальный идентификатор переноса")
+	encoded := fs.String("state", "", "base64url-состояние клиента")
+	if err := fs.Parse(args); err != nil {
+		return adminResponse{}, err
+	}
+	key := strings.TrimSpace(*operationID)
+	if key == "" || len(key) > 160 {
+		return adminResponse{}, errors.New("operation-id должен содержать 1..160 символов")
+	}
+	entry, err := requireAdminPassword(loaded, strings.TrimSpace(*password))
+	if err != nil {
+		return adminResponse{}, err
+	}
+	if entry.TrafficImports != nil {
+		if _, applied := entry.TrafficImports[key]; applied {
+			return adminResponse{
+				OK:       true,
+				Message:  "Состояние клиента уже было перенесено",
+				Server:   buildAdminServerInfo(configDir, loaded),
+				Password: ptrAdminPasswordInfo(buildAdminPasswordInfo(loaded, strings.TrimSpace(*password), entry)),
+			}, nil
+		}
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(*encoded))
+	if err != nil || len(raw) == 0 || len(raw) > 128<<10 {
+		return adminResponse{}, errors.New("состояние клиента повреждено или слишком велико")
+	}
+	var state adminClientState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return adminResponse{}, errors.New("состояние клиента имеет неверный формат")
+	}
+	if err := validateAdminClientState(&state, strings.TrimSpace(*password)); err != nil {
+		return adminResponse{}, err
+	}
+	if entry.DeviceID != "" || entry.DownBytes != 0 || entry.UpBytes != 0 ||
+		len(entry.Traffic) != 0 || len(entry.BindHistory) != 0 {
+		return adminResponse{}, newAdminCommandError(
+			"target_not_empty",
+			"целевой клиент уже содержит устройство или статистику",
+		)
+	}
+	previousDown := entry.DownBytes
+	previousUp := entry.UpBytes
+	previousTraffic := append([]TrafficBucket(nil), entry.Traffic...)
+	previousImports := cloneTrafficImports(entry.TrafficImports)
+	previousHistory := append([]BindHistoryEntry(nil), entry.BindHistory...)
+
+	entry.DownBytes = state.DownBytes
+	entry.UpBytes = state.UpBytes
+	entry.Traffic = append([]TrafficBucket(nil), state.Traffic...)
+	entry.TrafficImports = cloneTrafficImports(state.TrafficImports)
+	if entry.TrafficImports == nil {
+		entry.TrafficImports = make(map[string]TrafficImport)
+	}
+	entry.TrafficImports[key] = TrafficImport{AppliedAt: time.Now().Unix()}
+	entry.BindHistory = append([]BindHistoryEntry(nil), state.BindHistory...)
+	if err := saveAdminDB(configDir, loaded); err != nil {
+		entry.DownBytes = previousDown
+		entry.UpBytes = previousUp
+		entry.Traffic = previousTraffic
+		entry.TrafficImports = previousImports
+		entry.BindHistory = previousHistory
+		return adminResponse{}, err
+	}
+	return adminResponse{
+		OK:       true,
+		Message:  "Статистика и история клиента перенесены",
+		Server:   buildAdminServerInfo(configDir, loaded),
+		Password: ptrAdminPasswordInfo(buildAdminPasswordInfo(loaded, strings.TrimSpace(*password), entry)),
+	}, nil
+}
+
+func validateAdminClientState(state *adminClientState, password string) error {
+	if state == nil || state.Version != 1 || state.Password != password {
+		return errors.New("состояние клиента относится к другому паролю или версии")
+	}
+	if state.DownBytes < 0 || state.UpBytes < 0 {
+		return errors.New("счётчики состояния клиента не могут быть отрицательными")
+	}
+	if len(state.Traffic) > trafficHistoryDays || len(state.BindHistory) > 50 ||
+		len(state.TrafficImports) > 1024 {
+		return errors.New("история состояния клиента превышает допустимый размер")
+	}
+	for _, bucket := range state.Traffic {
+		if len(bucket.Date) != 10 || bucket.DownBytes < 0 || bucket.UpBytes < 0 {
+			return errors.New("история трафика клиента повреждена")
+		}
+		if _, err := time.Parse("2006-01-02", bucket.Date); err != nil {
+			return errors.New("история трафика клиента содержит неверную дату")
+		}
+	}
+	for key, imported := range state.TrafficImports {
+		if strings.TrimSpace(key) == "" || len(key) > 160 ||
+			imported.DownBytes < 0 || imported.UpBytes < 0 || imported.AppliedAt < 0 {
+			return errors.New("история учёта перенесённого трафика повреждена")
+		}
+	}
+	return nil
+}
+
+func cloneTrafficImports(source map[string]TrafficImport) map[string]TrafficImport {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[string]TrafficImport, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
 func buildAdminPasswordInfo(loaded *Database, password string, entry *PasswordEntry) adminPasswordInfo {
 	info := adminPasswordInfo{
 		Password: password,
@@ -727,16 +1033,20 @@ func buildAdminPasswordInfo(loaded *Database, password string, entry *PasswordEn
 	info.Label = entry.Label
 	info.VkHash = entry.VkHash
 	info.ExpiresAt = entry.ExpiresAt
+	info.PurgeAfter = entry.PurgeAfter
 	info.DownBytes = entry.DownBytes
 	info.UpBytes = entry.UpBytes
 	info.DeviceID = entry.DeviceID
 	info.BindEventsCount = len(entry.BindHistory)
 	info.Traffic = buildAdminTrafficPeriod(entry.Traffic, entry.DownBytes, entry.UpBytes)
 	info.BindHistory = append([]BindHistoryEntry(nil), entry.BindHistory...)
-	if entry.IsDeactivated {
-		info.Status = "deactivated"
-	} else if isPasswordExpired(entry) {
+	nowUnix := time.Now().Unix()
+	if isPasswordRetainedExpiredAt(entry, nowUnix) {
+		info.Status = "expired_retained"
+	} else if isPasswordExpiredAt(entry, nowUnix) {
 		info.Status = "expired"
+	} else if entry.IsDeactivated {
+		info.Status = "deactivated"
 	}
 	if entry.DeviceID != "" {
 		if dev := loaded.Devices[entry.DeviceID]; dev != nil {
@@ -810,6 +1120,11 @@ func adminCreatePassword(configDir string, loaded *Database, args []string) (adm
 	ports := fs.String("ports", "", "DTLS,WG,TUN")
 	clientPassword := fs.String("client-password", "", "заданный пароль клиента")
 	expiresAt := fs.Int64("expires-at", -1, "точная дата окончания unix, 0 = бессрочно")
+	purgeAfter := fs.Int64(
+		"purge-after",
+		0,
+		"не удалять истёкшую запись до unix timestamp",
+	)
 	deactivated := fs.Bool("deactivated", false, "создать клиента отключённым")
 	if err := fs.Parse(args); err != nil {
 		return adminResponse{}, err
@@ -819,7 +1134,7 @@ func adminCreatePassword(configDir string, loaded *Database, args []string) (adm
 	}
 	cleanupExpiredPasswordsAdmin(loaded)
 	if len(loaded.Passwords) >= loaded.MaxPasswords {
-		return adminResponse{}, fmt.Errorf("лимит клиентов: максимум %d", loaded.MaxPasswords)
+		return adminResponse{}, newAdminCommandError("capacity_full", fmt.Sprintf("лимит клиентов: максимум %d", loaded.MaxPasswords))
 	}
 	normalizedPorts := loaded.DefaultPorts
 	if strings.TrimSpace(*ports) != "" {
@@ -879,6 +1194,10 @@ func adminCreatePassword(configDir string, loaded *Database, args []string) (adm
 	} else if *days > 0 {
 		entry.ExpiresAt = time.Now().Add(time.Duration(*days) * 24 * time.Hour).Unix()
 	}
+	if err := validatePasswordRetention(entry.ExpiresAt, *purgeAfter); err != nil {
+		return adminResponse{}, err
+	}
+	entry.PurgeAfter = *purgeAfter
 	loaded.Passwords[password] = entry
 	if err := saveAdminDB(configDir, loaded); err != nil {
 		return adminResponse{}, err
@@ -1071,21 +1390,67 @@ func adminSetPasswordExpiry(configDir string, loaded *Database, args []string) (
 	fs.SetOutput(io.Discard)
 	password := fs.String("password", "", "пароль клиента")
 	days := fs.Int("days", 30, "новый срок от текущего момента, 0 = бессрочно")
+	expiresAt := fs.Int64("expires-at", -1, "точная дата окончания unix, 0 = бессрочно")
+	purgeAfter := fs.Int64(
+		"purge-after",
+		-1,
+		"не удалять истёкшую запись до unix timestamp; по умолчанию сохраняется прежний интервал",
+	)
 	if err := fs.Parse(args); err != nil {
 		return adminResponse{}, err
 	}
-	if *days < 0 || *days > 365 {
+	provided := make(map[string]bool)
+	fs.Visit(func(value *flag.Flag) {
+		provided[value.Name] = true
+	})
+	if provided["days"] && provided["expires-at"] {
+		return adminResponse{}, errors.New("укажите только один из параметров: days или expires-at")
+	}
+	if !provided["expires-at"] && (*days < 0 || *days > 365) {
 		return adminResponse{}, errors.New("days должен быть 0..365")
 	}
 	entry, err := requireAdminPassword(loaded, *password)
 	if err != nil {
 		return adminResponse{}, err
 	}
-	if *days == 0 {
-		entry.ExpiresAt = 0
-	} else {
-		entry.ExpiresAt = time.Now().Add(time.Duration(*days) * 24 * time.Hour).Unix()
+	nowUnix := time.Now().Unix()
+	if isPasswordPurgeableAt(entry, nowUnix) {
+		return adminResponse{}, newAdminCommandError(
+			"retention_expired",
+			"запись уже подлежит удалению; создайте доступ заново",
+		)
 	}
+
+	newExpiresAt := int64(0)
+	if provided["expires-at"] {
+		if *expiresAt < 0 {
+			return adminResponse{}, errors.New("expires-at должен быть 0 или будущим unix timestamp")
+		}
+		newExpiresAt = *expiresAt
+		if newExpiresAt > 0 && newExpiresAt <= nowUnix {
+			return adminResponse{}, errors.New("новый срок действия уже истёк")
+		}
+	} else if *days > 0 {
+		newExpiresAt = time.Now().Add(time.Duration(*days) * 24 * time.Hour).Unix()
+	}
+
+	newPurgeAfter := int64(0)
+	if provided["purge-after"] {
+		newPurgeAfter = *purgeAfter
+	} else {
+		oldRetentionDuration := entry.PurgeAfter - entry.ExpiresAt
+		if newExpiresAt > 0 && entry.ExpiresAt > 0 && oldRetentionDuration > 0 {
+			newPurgeAfter = newExpiresAt + oldRetentionDuration
+			if newPurgeAfter < newExpiresAt {
+				return adminResponse{}, errors.New("срок хранения выходит за допустимый диапазон")
+			}
+		}
+	}
+	if err := validatePasswordRetention(newExpiresAt, newPurgeAfter); err != nil {
+		return adminResponse{}, err
+	}
+	entry.ExpiresAt = newExpiresAt
+	entry.PurgeAfter = newPurgeAfter
 	if err := saveAdminDB(configDir, loaded); err != nil {
 		return adminResponse{}, err
 	}
@@ -1094,6 +1459,80 @@ func adminSetPasswordExpiry(configDir string, loaded *Database, args []string) (
 		Message:  "Срок обновлён",
 		Server:   buildAdminServerInfo(configDir, loaded),
 		Password: ptrAdminPasswordInfo(buildAdminPasswordInfo(loaded, *password, entry)),
+	}, nil
+}
+
+func validatePasswordRetention(expiresAt, purgeAfter int64) error {
+	if purgeAfter < 0 {
+		return errors.New("purge-after должен быть неотрицательным unix timestamp")
+	}
+	if expiresAt == 0 {
+		if purgeAfter != 0 {
+			return errors.New("для бессрочного доступа purge-after должен быть 0")
+		}
+		return nil
+	}
+	if purgeAfter > 0 && purgeAfter < expiresAt {
+		return errors.New("purge-after не может быть раньше expires-at")
+	}
+	return nil
+}
+
+func adminSetPasswordRetention(configDir string, loaded *Database, args []string) (adminResponse, error) {
+	fs := flag.NewFlagSet("set-retention", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	password := fs.String("password", "", "пароль клиента")
+	expectedExpiresAt := fs.Int64("expected-expires-at", -1, "ожидаемая дата окончания unix")
+	purgeAfter := fs.Int64("purge-after", -1, "новая дата удаления истёкшей записи unix")
+	if err := fs.Parse(args); err != nil {
+		return adminResponse{}, newAdminCommandError("invalid", err.Error())
+	}
+	if fs.NArg() != 0 {
+		return adminResponse{}, newAdminCommandError("invalid", "лишние аргументы set-retention")
+	}
+	passwordValue := strings.TrimSpace(*password)
+	if passwordValue == "" {
+		return adminResponse{}, newAdminCommandError("invalid", "укажите --password")
+	}
+	if *expectedExpiresAt <= 0 {
+		return adminResponse{}, newAdminCommandError("invalid", "expected-expires-at должен быть положительным unix timestamp")
+	}
+	if *purgeAfter <= 0 {
+		return adminResponse{}, newAdminCommandError("invalid", "purge-after должен быть положительным unix timestamp")
+	}
+
+	entry, err := requireAdminPassword(loaded, passwordValue)
+	if err != nil {
+		return adminResponse{}, err
+	}
+	nowUnix := time.Now().Unix()
+	if isPasswordPurgeableAt(entry, nowUnix) {
+		return adminResponse{}, newAdminCommandError("retention_expired", "истёкшая запись уже подлежит удалению")
+	}
+	if entry.ExpiresAt != *expectedExpiresAt {
+		return adminResponse{}, newAdminCommandError("retention_conflict", "срок доступа изменился; обновите состояние перед повтором")
+	}
+	if entry.ExpiresAt <= 0 || entry.PurgeAfter <= 0 {
+		return adminResponse{}, newAdminCommandError("invalid", "изменить можно только существующий конечный срок хранения")
+	}
+	if *purgeAfter < entry.ExpiresAt {
+		return adminResponse{}, newAdminCommandError("invalid", "purge-after не может быть раньше expires-at")
+	}
+	if *purgeAfter <= entry.PurgeAfter {
+		return adminResponse{}, newAdminCommandError("retention_conflict", "запись уже хранится до такого же или более позднего срока")
+	}
+
+	previousPurgeAfter := entry.PurgeAfter
+	entry.PurgeAfter = *purgeAfter
+	if err := saveAdminDB(configDir, loaded); err != nil {
+		entry.PurgeAfter = previousPurgeAfter
+		return adminResponse{}, err
+	}
+	return adminResponse{
+		OK:       true,
+		Message:  "Срок хранения обновлён",
+		Server:   buildAdminServerInfo(configDir, loaded),
+		Password: ptrAdminPasswordInfo(buildAdminPasswordInfo(loaded, passwordValue, entry)),
 	}, nil
 }
 
@@ -1365,7 +1804,7 @@ func adminRefreshPublicIP(configDir string, loaded *Database, live bool) (adminR
 	return adminResponse{OK: true, Message: "Публичный IP сервера определён: " + value, Server: buildAdminServerInfo(configDir, loaded)}, nil
 }
 
-func adminCleanupExpired(configDir string, loaded *Database, wgDev *device.Device, live bool) (adminResponse, error) {
+func adminCleanupExpired(configDir string, loaded *Database, wgDev wgDevice, live bool) (adminResponse, error) {
 	removed := 0
 	if live {
 		removed = cleanupExpiredPasswordsLocked(wgDev)
@@ -1380,7 +1819,7 @@ func adminCleanupExpired(configDir string, loaded *Database, wgDev *device.Devic
 	return adminResponse{OK: true, Message: fmt.Sprintf("Удалено истёкших клиентов: %d", removed), Server: buildAdminServerInfo(configDir, loaded)}, nil
 }
 
-func adminCleanupOrphans(configDir string, loaded *Database, wgDev *device.Device, live bool) (adminResponse, error) {
+func adminCleanupOrphans(configDir string, loaded *Database, wgDev wgDevice, live bool) (adminResponse, error) {
 	used := make(map[string]struct{})
 	for _, entry := range loaded.Passwords {
 		if entry != nil && entry.DeviceID != "" {
@@ -1427,6 +1866,69 @@ func adminResetTraffic(configDir string, loaded *Database) (adminResponse, error
 	return adminResponse{OK: true, Message: "Счётчики трафика сброшены", Server: buildAdminServerInfo(configDir, loaded)}, nil
 }
 
+func adminMergeClientTraffic(configDir string, loaded *Database, args []string) (adminResponse, error) {
+	fs := flag.NewFlagSet("merge-client-traffic", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	password := fs.String("password", "", "пароль клиента")
+	operationID := fs.String("operation-id", "", "уникальный идентификатор переноса")
+	downBytes := fs.Int64("down-bytes", 0, "скачано на другом сервере")
+	upBytes := fs.Int64("up-bytes", 0, "отдано на другом сервере")
+	if err := fs.Parse(args); err != nil {
+		return adminResponse{}, err
+	}
+	key := strings.TrimSpace(*operationID)
+	if key == "" || len(key) > 160 {
+		return adminResponse{}, errors.New("operation-id должен содержать 1..160 символов")
+	}
+	if *downBytes < 0 || *upBytes < 0 {
+		return adminResponse{}, errors.New("счётчики трафика не могут быть отрицательными")
+	}
+	entry, err := requireAdminPassword(loaded, strings.TrimSpace(*password))
+	if err != nil {
+		return adminResponse{}, err
+	}
+	if entry.TrafficImports == nil {
+		entry.TrafficImports = make(map[string]TrafficImport)
+	}
+	if previous, exists := entry.TrafficImports[key]; exists {
+		if previous.DownBytes != *downBytes || previous.UpBytes != *upBytes {
+			return adminResponse{}, errors.New("этот operation-id уже применён с другими значениями")
+		}
+		return adminResponse{
+			OK:      true,
+			Message: "Трафик уже был учтён",
+			Server:  buildAdminServerInfo(configDir, loaded),
+			Password: ptrAdminPasswordInfo(
+				buildAdminPasswordInfo(loaded, strings.TrimSpace(*password), entry),
+			),
+		}, nil
+	}
+	entry.DownBytes += *downBytes
+	entry.UpBytes += *upBytes
+	entry.Traffic = addTrafficBucket(
+		entry.Traffic,
+		trafficDayKey(time.Now()),
+		*downBytes,
+		*upBytes,
+	)
+	entry.TrafficImports[key] = TrafficImport{
+		DownBytes: *downBytes,
+		UpBytes:   *upBytes,
+		AppliedAt: time.Now().Unix(),
+	}
+	if err := saveAdminDB(configDir, loaded); err != nil {
+		return adminResponse{}, err
+	}
+	return adminResponse{
+		OK:      true,
+		Message: "Трафик клиента учтён",
+		Server:  buildAdminServerInfo(configDir, loaded),
+		Password: ptrAdminPasswordInfo(
+			buildAdminPasswordInfo(loaded, strings.TrimSpace(*password), entry),
+		),
+	}, nil
+}
+
 func adminPasswordArg(command string, args []string) (string, error) {
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -1448,22 +1950,34 @@ func requireAdminPassword(loaded *Database, password string) (*PasswordEntry, er
 	}
 	entry, exists := loaded.Passwords[password]
 	if !exists || entry == nil {
-		return nil, errors.New("пароль не найден")
+		return nil, newAdminCommandError("not_found", "пароль не найден")
 	}
 	return entry, nil
 }
 
 func cleanupExpiredPasswordsAdmin(loaded *Database) int {
+	return cleanupExpiredPasswordsAdminAt(loaded, time.Now().Unix())
+}
+
+func cleanupExpiredPasswordsAdminAt(loaded *Database, nowUnix int64) int {
 	removed := 0
-	nowUnix := time.Now().Unix()
+	deviceCandidates := make(map[string]struct{})
 	for password, entry := range loaded.Passwords {
-		if isPasswordExpired(entry) {
-			if entry != nil {
-				unbindPasswordDeviceAdminAt(loaded, entry, nowUnix)
+		if isPasswordPurgeableAt(entry, nowUnix) {
+			if entry != nil && entry.DeviceID != "" {
+				markActiveBindUnbound(entry, entry.DeviceID, nowUnix)
+				deviceCandidates[entry.DeviceID] = struct{}{}
 			}
 			delete(loaded.Passwords, password)
 			removed++
 		}
+	}
+	adminDevices := adminDeviceIDSet(loaded)
+	for deviceID := range deviceCandidates {
+		if _, isAdminDevice := adminDevices[deviceID]; isAdminDevice || databaseUsesDeviceID(loaded, deviceID) {
+			continue
+		}
+		delete(loaded.Devices, deviceID)
 	}
 	return removed
 }
@@ -1478,10 +1992,10 @@ func unbindPasswordDeviceAdminAt(loaded *Database, entry *PasswordEntry, ts int6
 	}
 	oldDeviceID := entry.DeviceID
 	markActiveBindUnbound(entry, oldDeviceID, ts)
-	if _, isAdminDevice := adminDeviceIDSet(loaded)[oldDeviceID]; !isAdminDevice {
+	entry.DeviceID = ""
+	if _, isAdminDevice := adminDeviceIDSet(loaded)[oldDeviceID]; !isAdminDevice && !databaseUsesDeviceID(loaded, oldDeviceID) {
 		delete(loaded.Devices, oldDeviceID)
 	}
-	entry.DeviceID = ""
 }
 
 func ptrAdminPasswordInfo(value adminPasswordInfo) *adminPasswordInfo {
@@ -1497,7 +2011,7 @@ func writeAdminJSON(response adminResponse) {
 func writeAdminError(err error) {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)
-	_ = enc.Encode(adminResponse{OK: false, Message: err.Error()})
+	_ = enc.Encode(adminErrorResponse(err))
 }
 
 func adminAtoi(value string) (int, error) {

@@ -12,6 +12,11 @@ import javax.crypto.spec.GCMParameterSpec
 
 class SecureStringStore(context: Context) {
     private val appContext = context.applicationContext
+    private val decryptedCache = object : LinkedHashMap<String, String>(32, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, String>?
+        ): Boolean = size > 64
+    }
 
     companion object {
         private const val KEY_ALIAS = "wdtt.settings.secrets"
@@ -29,14 +34,21 @@ class SecureStringStore(context: Context) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
         val encrypted = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
-        return VERSION_PREFIX +
+        val encoded = VERSION_PREFIX +
             Base64.encodeToString(cipher.iv, Base64.NO_WRAP) +
             ":" +
             Base64.encodeToString(encrypted, Base64.NO_WRAP)
+        synchronized(decryptedCache) {
+            decryptedCache[encoded] = value
+        }
+        return encoded
     }
 
     fun decrypt(value: String?): String? {
         if (value.isNullOrBlank() || !value.startsWith(VERSION_PREFIX)) return null
+        synchronized(decryptedCache) {
+            decryptedCache[value]?.let { return it }
+        }
         val payload = value.removePrefix(VERSION_PREFIX)
         val parts = payload.split(":", limit = 2)
         if (parts.size != 2) return null
@@ -47,7 +59,11 @@ class SecureStringStore(context: Context) {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(GCM_TAG_BITS, iv))
             cipher.doFinal(encrypted).toString(Charsets.UTF_8)
-        }.getOrNull()
+        }.getOrNull()?.also { decrypted ->
+            synchronized(decryptedCache) {
+                decryptedCache[value] = decrypted
+            }
+        }
     }
 
     private fun getOrCreateKey(): SecretKey {

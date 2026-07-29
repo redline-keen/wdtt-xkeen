@@ -16,6 +16,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.security.MessageDigest
 
 class WireGuardHelper(context: Context) {
     private val appContext = context.applicationContext
@@ -24,6 +25,7 @@ class WireGuardHelper(context: Context) {
     private companion object {
         val wgMutex = Mutex()
         var sharedTunnel: WgTunnel? = null
+        var sharedConfigFingerprint: String? = null
     }
 
     class WgTunnel(
@@ -38,6 +40,7 @@ class WireGuardHelper(context: Context) {
             val isCurrentTunnel = sharedTunnel === this
             if (isCurrentTunnel) {
                 sharedTunnel = null
+                sharedConfigFingerprint = null
             }
             if (isCurrentTunnel && !suppressDownCallback) {
                 onExternalDown?.invoke()
@@ -53,19 +56,6 @@ class WireGuardHelper(context: Context) {
         try {
             if (VpnService.prepare(appContext) != null) {
                 throw IllegalStateException("VPN-разрешение не выдано")
-            }
-
-            ensureGoBackendServiceStarted()
-
-            sharedTunnel?.let { existingTunnel ->
-                try {
-                    existingTunnel.suppressDownCallback = true
-                    backend.setState(existingTunnel, Tunnel.State.DOWN, null)
-                } catch (e: Exception) {
-                    Log.w("WG", "Failed to stop previous tunnel before restart: ${e.readableMessage()}")
-                }
-                sharedTunnel = null
-                delay(150)
             }
 
             val parsedConfig = Config.parse(ByteArrayInputStream(configString.toByteArray(Charsets.UTF_8)))
@@ -132,11 +122,42 @@ class WireGuardHelper(context: Context) {
                 .addPeer(peerBuilder.build())
                 .build()
 
+            sharedTunnel?.let { existingTunnel ->
+                val existingUp = runCatching {
+                    backend.getState(existingTunnel) == Tunnel.State.UP
+                }.getOrDefault(false)
+                if (
+                    shouldReuseRunningWireGuard(
+                        tunnelUp = existingUp,
+                        currentConfigFingerprint = sharedConfigFingerprint,
+                        updatedConfig = finalConfig,
+                    )
+                ) {
+                    Log.d("WG", "WireGuard config unchanged; keeping the current VPN interface")
+                    return@withContext
+                }
+            }
+
+            ensureGoBackendServiceStarted()
+
+            sharedTunnel?.let { existingTunnel ->
+                try {
+                    existingTunnel.suppressDownCallback = true
+                    backend.setState(existingTunnel, Tunnel.State.DOWN, null)
+                } catch (e: Exception) {
+                    Log.w("WG", "Failed to stop previous tunnel before restart: ${e.readableMessage()}")
+                }
+                sharedTunnel = null
+                sharedConfigFingerprint = null
+                delay(150)
+            }
+
             val nextTunnel = WgTunnel {
                 TunnelManager.onWireGuardStoppedExternally()
             }
             setTunnelUpWithRetry(nextTunnel, finalConfig)
             sharedTunnel = nextTunnel
+            sharedConfigFingerprint = wireGuardConfigFingerprint(finalConfig)
             Log.d("WG", "WireGuard tunnel started successfully")
         } catch (e: Exception) {
             val detailed = "WireGuard start failed: ${e.readableMessage()}; ${configString.describeWireGuardConfig()}"
@@ -154,6 +175,7 @@ class WireGuardHelper(context: Context) {
                 currentTunnel.suppressDownCallback = true
                 backend.setState(currentTunnel, Tunnel.State.DOWN, null)
                 sharedTunnel = null
+                sharedConfigFingerprint = null
                 delay(150)
                 startTunnelLocked(configFlow)
                 Log.d("WG", "WireGuard tunnel reloaded for new exceptions")
@@ -179,6 +201,7 @@ class WireGuardHelper(context: Context) {
                     it.suppressDownCallback = true
                     backend.setState(it, Tunnel.State.DOWN, null)
                     sharedTunnel = null
+                    sharedConfigFingerprint = null
                     Log.d("WG", "WireGuard tunnel stopped")
                 }
             } catch (e: Exception) {
@@ -236,3 +259,17 @@ class WireGuardHelper(context: Context) {
         return "config lines=${lines.size}, interface=$hasInterface, peer=$hasPeer, privateKey=$hasPrivateKey, publicKey=$hasPublicKey, address=$hasAddress, endpoint=$endpoint"
     }
 }
+
+internal fun shouldReuseRunningWireGuard(
+    tunnelUp: Boolean,
+    currentConfigFingerprint: String?,
+    updatedConfig: Config,
+): Boolean =
+    tunnelUp &&
+        currentConfigFingerprint != null &&
+        currentConfigFingerprint == wireGuardConfigFingerprint(updatedConfig)
+
+internal fun wireGuardConfigFingerprint(config: Config): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(config.toWgQuickString().toByteArray(Charsets.UTF_8))
+        .joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }

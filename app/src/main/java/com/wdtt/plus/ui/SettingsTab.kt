@@ -2,7 +2,8 @@ package com.wdtt.plus.ui
 
 import android.content.ClipData
 import android.content.ClipboardManager
-import androidx.compose.animation.animateContentSize
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.animateColorAsState
@@ -20,12 +21,20 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Tag
+import androidx.compose.material.icons.filled.Update
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -35,39 +44,82 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import com.wdtt.plus.BuildConfig
+import com.wdtt.plus.CachedRemoteAction
+import com.wdtt.plus.AccessLifecycleCoordinator
+import com.wdtt.plus.AccessLifecycleRefreshResult
+import com.wdtt.plus.AccessLifecycleSeverity
+import com.wdtt.plus.AccessLifecycleUiState
+import com.wdtt.plus.AccessStartDecision
 import com.wdtt.plus.CaptchaWebViewManager
+import com.wdtt.plus.ConnectionIssueKind
+import com.wdtt.plus.DEFAULT_VK_CLIENT_IDS
 import com.wdtt.plus.ManlCaptchaWebViewManager
+import com.wdtt.plus.MainActivity
+import com.wdtt.plus.MANAGED_CONFIG_FIRST_START_EXTRA
+import com.wdtt.plus.RemoteContinuation
+import com.wdtt.plus.RemoteContinuationLauncher
+import com.wdtt.plus.RemoteActionCatalogGateway
+import com.wdtt.plus.RemoteDocumentGateway
+import com.wdtt.plus.RemoteLaunchTarget
+import com.wdtt.plus.RemoteUiAction
+import com.wdtt.plus.RemoteUiActionLauncher
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.TunnelService
+import com.wdtt.plus.TunnelStopCoordinator
+import com.wdtt.plus.TunnelStopResult
+import com.wdtt.plus.TunnelTransition
+import com.wdtt.plus.TUNNEL_PROFILE_INDEX_EXTRA
+import com.wdtt.plus.normalizeTunnelWorkerCount
+import com.wdtt.plus.shouldUseManagedConfigFirstStart
 import com.wdtt.plus.TrustedWifiManager
 import com.wdtt.plus.VkJoinLink
 import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.WdttDeepLink
+import com.wdtt.plus.WdttDeepLinkApplyPlan
+import com.wdtt.plus.isValidVkClientId
+import com.wdtt.plus.isStandaloneUiIssue
+import com.wdtt.plus.accessLifecycleDismissalSignature
+import com.wdtt.plus.fallbackTitle
 import com.wdtt.plus.vpnProfileDisplayName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CancellationException
 import android.content.Intent
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.widget.Toast
@@ -76,6 +128,95 @@ import androidx.activity.result.contract.ActivityResultContracts
 import kotlin.math.roundToInt
 
 private const val WORKERS_PER_GROUP = 9
+private const val REMOTE_ACTION_REFRESH_MS = 10 * 60 * 1000L
+
+private fun launchRemoteTarget(context: Context, target: RemoteLaunchTarget) {
+    var current: Context? = context
+    while (current != null) {
+        if (current is MainActivity) {
+            current.launchRemoteContinuation(target)
+            return
+        }
+        current = (current as? ContextWrapper)?.baseContext
+    }
+    RemoteContinuationLauncher.launch(context, target)
+}
+
+internal fun usesCompactTunnelInterface(interfaceRole: String): Boolean = interfaceRole == "user"
+
+internal fun resolveConnectionInputMethod(
+    savedMethod: String,
+    hasStoredLink: Boolean,
+    hasManualConnection: Boolean,
+    userInterface: Boolean,
+): String = when (savedMethod) {
+    "link", "manual" -> savedMethod
+    else -> when {
+        hasStoredLink -> "link"
+        hasManualConnection -> "manual"
+        userInterface -> "link"
+        else -> "manual"
+    }
+}
+
+internal fun hasTunnelConnectionSource(
+    linkMode: Boolean,
+    linkValid: Boolean,
+    peer: String,
+    password: String,
+): Boolean = (linkMode && linkValid) || peer.isNotBlank() && password.isNotBlank()
+
+internal fun shouldShowRemoteActionCard(
+    audience: Boolean,
+    hasConnectionSource: Boolean,
+    dismissed: Boolean,
+    dismissCountdown: Int,
+    actionResolved: Boolean,
+    actionAvailable: Boolean,
+): Boolean =
+    audience &&
+        !hasConnectionSource &&
+        (!actionResolved || actionAvailable) &&
+        (!dismissed || dismissCountdown > 0)
+
+internal fun shouldShowTunnelRemoteActionCard(
+    interfaceRole: String,
+    preview: Boolean,
+    hasConnectionSource: Boolean,
+    dismissed: Boolean,
+    dismissCountdown: Int,
+    actionResolved: Boolean,
+    actionAvailable: Boolean,
+): Boolean {
+    val adminInterface = interfaceRole == "admin"
+    return shouldShowRemoteActionCard(
+        audience = preview || interfaceRole == "user" || adminInterface,
+        hasConnectionSource = hasConnectionSource && !adminInterface,
+        dismissed = dismissed,
+        dismissCountdown = dismissCountdown,
+        actionResolved = actionResolved,
+        actionAvailable = actionAvailable,
+    )
+}
+
+internal fun isSelectedCompactConnectionReady(
+    selectedMethod: String,
+    savedMethod: String,
+    storedLinkMode: Boolean,
+    linkPresent: Boolean,
+    linkValid: Boolean,
+    manualValid: Boolean,
+): Boolean = when (selectedMethod) {
+    "link" -> when {
+        storedLinkMode && linkPresent -> linkValid
+        savedMethod == "link" -> manualValid
+        else -> false
+    }
+    "manual" -> !storedLinkMode &&
+        (savedMethod == "manual" || savedMethod.isBlank()) &&
+        manualValid
+    else -> false
+}
 
 private fun isValidTunnelHost(value: String): Boolean {
     val host = value.trim()
@@ -97,17 +238,26 @@ private fun isValidTunnelHost(value: String): Boolean {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsTab(
-    scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) }
+    settingsStore: SettingsStore,
+    scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) },
+    onVkHashesSaved: (Int, List<String>) -> Unit = { _, _ -> },
+    onOpenProjectSupport: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val settingsStore = remember { SettingsStore(context) }
 
     val currentDensity = LocalDensity.current
     CompositionLocalProvider(
         LocalDensity provides Density(currentDensity.density, fontScale = 1f)
     ) {
-        SettingsTabContent(context, scope, settingsStore, scrollPosition)
+        SettingsTabContent(
+            context = context,
+            scope = scope,
+            settingsStore = settingsStore,
+            scrollPosition = scrollPosition,
+            onVkHashesSaved = onVkHashesSaved,
+            onOpenProjectSupport = onOpenProjectSupport,
+        )
     }
 }
 
@@ -117,61 +267,171 @@ fun SettingsTabContent(
     context: android.content.Context,
     scope: kotlinx.coroutines.CoroutineScope,
     settingsStore: SettingsStore,
-    scrollPosition: MutableIntState
+    scrollPosition: MutableIntState,
+    onVkHashesSaved: (Int, List<String>) -> Unit,
+    onOpenProjectSupport: () -> Unit,
 ) {
-    val savedConnectionPassword by settingsStore.connectionPassword.collectAsStateWithLifecycle(initialValue = "")
-    val savedManualPortsEnabled by settingsStore.manualPortsEnabled.collectAsStateWithLifecycle(initialValue = false)
-    val savedServerDtlsPort by settingsStore.serverDtlsPort.collectAsStateWithLifecycle(initialValue = 56000)
-    val savedServerWgPort by settingsStore.serverWgPort.collectAsStateWithLifecycle(initialValue = 56001)
-    val savedListenPort by settingsStore.listenPort.collectAsStateWithLifecycle(initialValue = 9000)
+    val profileSnapshotState by
+        settingsStore.activeTunnelProfileUiSnapshot.collectAsStateWithLifecycle()
+    val profileSnapshot = profileSnapshotState ?: return
+    val savedConnectionPassword = profileSnapshot.connectionPassword
+    val savedPeer = profileSnapshot.peer
+    val savedWorkers = profileSnapshot.workersPerHash
+    val savedManualPortsEnabled = profileSnapshot.manualPortsEnabled
+    val savedServerDtlsPort = profileSnapshot.serverDtlsPort
+    val savedServerWgPort = profileSnapshot.serverWgPort
+    val savedListenPort = profileSnapshot.listenPort
+    val savedSni = profileSnapshot.sni
+    val savedCaptchaMode = profileSnapshot.captchaMode
+    val savedCaptchaMethod = profileSnapshot.captchaSolveMethod
+    val activeProfile = profileSnapshot.profileIndex
+    val profileNames = profileSnapshot.profileNames
+    val wdttLinkMode = profileSnapshot.linkMode
+    val wdttLink = profileSnapshot.link
+    val savedConnectionInputMethod = profileSnapshot.connectionInputMethod
+    val savedVkHashesState = profileSnapshot.vkHashes
+    val activeFingerprint = profileSnapshot.fingerprint
+    val activeClientIds = profileSnapshot.clientIds
+    val customVkCredentialsEnabled = profileSnapshot.customVkCredentialsEnabled
+    val customVkClientId = profileSnapshot.customVkClientId
+    val customVkClientSecret = profileSnapshot.customVkClientSecret
+    val vkCallsPreflight = profileSnapshot.vkCallsPreflight
+    val remoteActionKey = profileSnapshot.remoteActionKey
+    val remoteActionUrl = profileSnapshot.remoteActionUrl
+    val remoteManagedProfile = profileSnapshot.remoteManaged
+    val interfaceRole = if (remoteManagedProfile) "user" else profileSnapshot.interfaceRole
+    val cachedRemoteAction = profileSnapshot.cachedRemoteAction
+    val remoteCardDismissed = profileSnapshot.remoteCardDismissed
+    val accessLifecycle = profileSnapshot.accessLifecycle
+    val accessLifecycleDismissedSignature =
+        profileSnapshot.accessLifecycleDismissedSignature
+    val profileMaxWorkers = profileSnapshot.profileMaxWorkers
+    val refreshingProfiles by
+        AccessLifecycleCoordinator.refreshingProfiles.collectAsStateWithLifecycle()
+    val accessRefreshing = activeProfile in refreshingProfiles
+    var accessActionBusy by remember(activeProfile) { mutableStateOf(false) }
+    var accessManualRefreshBusy by remember(activeProfile) { mutableStateOf(false) }
+    var accessLifecycleDismissCountdown by remember(activeProfile) { mutableIntStateOf(0) }
+    val initialActionCatalog = remember { RemoteActionCatalogGateway.cached() }
+    var actionCatalog by remember { mutableStateOf(initialActionCatalog) }
+    var actionCatalogResolved by remember {
+        mutableStateOf(RemoteActionCatalogGateway.hasFreshCache())
+    }
+    var remoteCardDismissCountdown by remember(activeProfile) { mutableIntStateOf(0) }
+    val lifecycleOwner = LocalLifecycleOwner.current
 
-    val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
-    val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
-    val wdttLinkMode by settingsStore.wdttLinkMode.collectAsStateWithLifecycle(initialValue = false)
-    val wdttLink by settingsStore.wdttLink.collectAsStateWithLifecycle(initialValue = "")
-    val savedVkHashesState by remember(settingsStore) {
-        settingsStore.vkHashes.map<String, String?> { hashes -> hashes }
-    }.collectAsStateWithLifecycle(initialValue = null)
+    val compactTunnelInterface = usesCompactTunnelInterface(interfaceRole)
+    val remoteActionAudience =
+        compactTunnelInterface ||
+            interfaceRole == "admin" ||
+            BuildConfig.REMOTE_ACTION_PREVIEW
+    val remoteActionFetchAllowed = remoteActionAudience
 
-    val activeFingerprint by settingsStore.selectedFingerprint.collectAsStateWithLifecycle(initialValue = "firefox")
-    val activeClientIds by settingsStore.activeClientIds.collectAsStateWithLifecycle(initialValue = "6287487,8202606")
-    val vkCallsPreflight by settingsStore.vkCallsPreflight.collectAsStateWithLifecycle(initialValue = true)
+    LaunchedEffect(remoteActionFetchAllowed, lifecycleOwner) {
+        if (!remoteActionFetchAllowed) {
+            actionCatalog = com.wdtt.plus.RemoteActionCatalog.Empty
+            actionCatalogResolved = true
+            return@LaunchedEffect
+        }
+        if (RemoteActionCatalogGateway.hasFreshCache()) {
+            actionCatalog = RemoteActionCatalogGateway.cached()
+            actionCatalogResolved = true
+        } else {
+            actionCatalogResolved = false
+        }
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (isActive) {
+                actionCatalog = RemoteActionCatalogGateway.fetch(force = true)
+                actionCatalogResolved = true
+                delay(REMOTE_ACTION_REFRESH_MS)
+            }
+        }
+    }
+
+    LaunchedEffect(activeProfile, remoteCardDismissCountdown > 0) {
+        if (remoteCardDismissCountdown <= 0) return@LaunchedEffect
+        while (remoteCardDismissCountdown > 0) {
+            delay(1_000)
+            remoteCardDismissCountdown--
+        }
+    }
+
+    LaunchedEffect(activeProfile, accessLifecycleDismissCountdown > 0) {
+        if (accessLifecycleDismissCountdown <= 0) return@LaunchedEffect
+        while (accessLifecycleDismissCountdown > 0) {
+            delay(1_000)
+            accessLifecycleDismissCountdown--
+        }
+    }
+
+    LaunchedEffect(activeProfile, accessLifecycle.managed) {
+        if (accessLifecycle.managed) {
+            AccessLifecycleCoordinator.refreshProfile(context, activeProfile, force = false)
+        } else {
+            TunnelManager.clearConnectionIssue(ConnectionIssueKind.ACCESS)
+        }
+    }
 
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
+    val tunnelTransition by TunnelManager.transition.collectAsStateWithLifecycle()
     val trustedWifiState by TrustedWifiManager.state.collectAsStateWithLifecycle()
     val trustedWifiWaiting = trustedWifiState.waiting
     val connectionIssue by TunnelManager.connectionIssue.collectAsStateWithLifecycle()
+    val standaloneConnectionIssue =
+        connectionIssue?.takeIf { it.isStandaloneUiIssue }
 
     val cooldownActive by TunnelManager.cooldownActive.collectAsStateWithLifecycle()
-    var wasRunning by remember { mutableStateOf(false) }
 
-    LaunchedEffect(tunnelRunning) {
-        if (wasRunning && !tunnelRunning) {
-            TunnelManager.startCooldown(1500L)
-        }
-        wasRunning = tunnelRunning
+    val loadedHashSlots = remember(profileSnapshot) { parseVkHashSlots(savedVkHashesState) }
+    var peerInput by remember(profileSnapshot) { mutableStateOf(savedPeer) }
+    var vkHash1 by remember(profileSnapshot) { mutableStateOf(loadedHashSlots.getOrElse(0) { "" }) }
+    var vkHash2 by remember(profileSnapshot) { mutableStateOf(loadedHashSlots.getOrElse(1) { "" }) }
+    var vkHash3 by remember(profileSnapshot) { mutableStateOf(loadedHashSlots.getOrElse(2) { "" }) }
+    var vkHash4 by remember(profileSnapshot) { mutableStateOf(loadedHashSlots.getOrElse(3) { "" }) }
+    val loadedWorkers = remember(profileSnapshot) {
+        val normalized = normalizeTunnelWorkerCount(savedWorkers, profileMaxWorkers)
+        roundToGroup(
+            normalized.toFloat(),
+            maxWorkersForHashSlots(loadedHashSlots, profileMaxWorkers)
+        )
     }
-
-    var peerInput by rememberSaveable { mutableStateOf("") }
-    var vkHash1 by rememberSaveable { mutableStateOf("") }
-    var vkHash2 by rememberSaveable { mutableStateOf("") }
-    var vkHash3 by rememberSaveable { mutableStateOf("") }
-    var vkHash4 by rememberSaveable { mutableStateOf("") }
-    var workersInput by rememberSaveable { mutableFloatStateOf(18f) }
+    var workersInput by remember(profileSnapshot) { mutableFloatStateOf(loadedWorkers) }
     var showHashesDialog by rememberSaveable { mutableStateOf(false) }
-    var autoCaptchaEnabled by rememberSaveable { mutableStateOf(true) }
-    var manualPortsEnabled by rememberSaveable { mutableStateOf(false) }
+    var autoCaptchaEnabled by remember(profileSnapshot) {
+        mutableStateOf(savedCaptchaMode != "wv" || savedCaptchaMethod != "manual")
+    }
+    var manualPortsEnabled by remember(profileSnapshot) { mutableStateOf(savedManualPortsEnabled) }
     var showPowerHelp by rememberSaveable { mutableStateOf(false) }
     var showVkCallsHelp by rememberSaveable { mutableStateOf(false) }
     var showAutoCaptchaHelp by rememberSaveable { mutableStateOf(false) }
-    var serverDtlsPortInput by rememberSaveable { mutableStateOf("56000") }
-    var serverWgPortInput by rememberSaveable { mutableStateOf("56001") }
-    var initialized by remember { mutableStateOf(false) }
+    var serverDtlsPortInput by remember(profileSnapshot) { mutableStateOf(savedServerDtlsPort.toString()) }
+    var serverWgPortInput by remember(profileSnapshot) { mutableStateOf(savedServerWgPort.toString()) }
+    var userConnectionEditor by remember(activeProfile) { mutableStateOf("") }
+    var userLinkInput by remember(activeProfile) { mutableStateOf("") }
+    val storedLinkSelected = remember(profileSnapshot) {
+        wdttLinkMode && WdttDeepLink.parse(wdttLink, allowMissingHashes = true) != null
+    }
+    val importedLinkStoredAsManualFields = remember(profileSnapshot) {
+        savedConnectionInputMethod == "link" &&
+            !wdttLinkMode &&
+            savedPeer.isNotBlank() &&
+            savedConnectionPassword.isNotBlank()
+    }
+    var userConnectionMethod by remember(profileSnapshot) {
+        mutableStateOf(
+            resolveConnectionInputMethod(
+                savedMethod = savedConnectionInputMethod,
+                hasStoredLink = storedLinkSelected,
+                hasManualConnection = savedPeer.isNotBlank() && savedConnectionPassword.isNotBlank(),
+                userInterface = compactTunnelInterface,
+            )
+        )
+    }
 
     val allHashes = remember(vkHash1, vkHash2, vkHash3, vkHash4) {
         listOf(vkHash1, vkHash2, vkHash3, vkHash4).map { stripVkUrlStatic(it) }
     }
-    val validHashes = remember(allHashes) { allHashes.filter { it.isNotBlank() && it.length >= 16 } }
+    val validHashes = remember(allHashes) { allHashes.filter(VkJoinLink::isValidHash) }
     val uniqueHashes = remember(validHashes) { validHashes.distinct() }
     val wdttLinkValidation = remember(wdttLink) { WdttDeepLink.validate(wdttLink) }
     val parsedWdttLink = remember(wdttLinkValidation) { wdttLinkValidation.parts }
@@ -183,18 +443,22 @@ fun SettingsTabContent(
     val hashSlotsForStorage = remember(vkHash1, vkHash2, vkHash3, vkHash4) {
         encodeVkHashSlots(vkHash1, vkHash2, vkHash3, vkHash4)
     }
-    val dynamicMaxWorkers = remember(filledHashCount) { maxWorkersForHashCount(filledHashCount) }
-    var portInput by rememberSaveable { mutableStateOf("9000") }
-    var sniInput by rememberSaveable { mutableStateOf("") }
+    val dynamicMaxWorkers = remember(filledHashCount, profileMaxWorkers) {
+        maxWorkersForHashCount(filledHashCount, profileMaxWorkers)
+    }
+    var portInput by remember(profileSnapshot) { mutableStateOf(savedListenPort.toString()) }
+    var sniInput by remember(profileSnapshot) { mutableStateOf(savedSni) }
 
     val currentWorkers = workersInput.coerceIn(WORKERS_PER_GROUP.toFloat(), dynamicMaxWorkers)
 
     val hashErrors = remember(vkHash1, vkHash2, vkHash3, vkHash4) {
         buildList {
             allHashes.forEachIndexed { i, h ->
-                if (h.isNotBlank() && h.length < 16) add("Хеш ${i + 1} — короткий")
+                if (h.isNotBlank() && !VkJoinLink.isValidHash(h)) {
+                    add("Хеш ${i + 1} имеет неверный формат")
+                }
             }
-            val filled = allHashes.filter { it.isNotBlank() && it.length >= 16 }
+            val filled = allHashes.filter(VkJoinLink::isValidHash)
             if (filled.size != filled.distinct().size) add("Есть дубликаты хешей")
         }
     }
@@ -202,80 +466,11 @@ fun SettingsTabContent(
 
     var showSecretsDialog by rememberSaveable { mutableStateOf(false) }
 
-    LaunchedEffect(activeProfile) {
-        initialized = false
-        val peer = settingsStore.peer.first()
-        val hashes = settingsStore.vkHashes.first()
-        val workers = settingsStore.workersPerHash.first()
-        val port = settingsStore.listenPort.first()
-        val manualPorts = settingsStore.manualPortsEnabled.first()
-        val serverDtlsPort = settingsStore.serverDtlsPort.first()
-        val serverWgPort = settingsStore.serverWgPort.first()
-        val sni = settingsStore.sni.first()
-        val captchaMode = settingsStore.captchaMode.first()
-        val captchaMethod = settingsStore.captchaSolveMethod.first()
-        val hashSlots = parseVkHashSlots(hashes)
-        
-        peerInput = peer
-        vkHash1 = hashSlots.getOrElse(0) { "" }
-        vkHash2 = hashSlots.getOrElse(1) { "" }
-        vkHash3 = hashSlots.getOrElse(2) { "" }
-        vkHash4 = hashSlots.getOrElse(3) { "" }
-        workersInput = roundToGroup(
-            workers.toFloat(),
-            maxWorkersForHashSlots(hashSlots)
-        )
-        portInput = port.toString()
-        manualPortsEnabled = manualPorts
-        serverDtlsPortInput = serverDtlsPort.toString()
-        serverWgPortInput = serverWgPort.toString()
-        sniInput = sni
-        // В интерфейсе остаются только реально отличающиеся стратегии:
-        // комбинированная автоцепочка и немедленный ручной WebView.
-        // Устаревшие режимы rjs и wv+auto работают как автоматические.
-        autoCaptchaEnabled = captchaMode != "wv" || captchaMethod != "manual"
-        
-        initialized = true
-    }
-
-    LaunchedEffect(savedVkHashesState) {
-        val savedVkHashes = savedVkHashesState ?: return@LaunchedEffect
-        if (initialized && normalizeVkHashSlots(savedVkHashes) != hashSlotsForStorage) {
-            val hashSlots = parseVkHashSlots(savedVkHashes)
-            vkHash1 = hashSlots.getOrElse(0) { "" }
-            vkHash2 = hashSlots.getOrElse(1) { "" }
-            vkHash3 = hashSlots.getOrElse(2) { "" }
-            vkHash4 = hashSlots.getOrElse(3) { "" }
-            val maxWorkers = maxWorkersForHashSlots(hashSlots)
-            if (workersInput > maxWorkers) {
-                val clamped = roundToGroup(workersInput, maxWorkers)
-                workersInput = clamped
-                settingsStore.saveWorkersPerHash(clamped.toInt())
-            }
+    LaunchedEffect(activeProfile, savedWorkers, profileMaxWorkers) {
+        val normalizedWorkers = normalizeTunnelWorkerCount(savedWorkers, profileMaxWorkers)
+        if (normalizedWorkers != savedWorkers) {
+            settingsStore.saveWorkersPerHash(normalizedWorkers)
         }
-    }
-
-    LaunchedEffect(savedManualPortsEnabled) {
-        manualPortsEnabled = savedManualPortsEnabled
-    }
-
-    LaunchedEffect(savedServerDtlsPort) {
-        serverDtlsPortInput = savedServerDtlsPort.toString()
-    }
-
-    LaunchedEffect(savedServerWgPort) {
-        serverWgPortInput = savedServerWgPort.toString()
-    }
-
-    LaunchedEffect(savedListenPort) {
-        portInput = savedListenPort.toString()
-    }
-
-    if (!initialized) {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-        }
-        return
     }
 
     var saveJob by remember { mutableStateOf<Job?>(null) }
@@ -287,10 +482,15 @@ fun SettingsTabContent(
     ) {
         saveJob?.cancel()
         scope.launch {
+            val normalizedWorkers = normalizeTunnelWorkerCount(workers.toInt(), profileMaxWorkers)
             val savedLocalPort = if (manualPortsEnabled) portInput.toIntOrNull()?.coerceIn(1, 65535) ?: 9000 else 9000
             settingsStore.save(
                 peerInput, hashes, "",
-                workers.toInt(), "udp", savedLocalPort, sniInput, false
+                normalizedWorkers, "udp", savedLocalPort, sniInput, false
+            )
+            onVkHashesSaved(
+                activeProfile,
+                parseVkHashSlots(hashes).filter { it.isNotBlank() },
             )
             onSaved?.invoke()
         }
@@ -298,18 +498,21 @@ fun SettingsTabContent(
 
     fun saveWorkersNow(workers: Float) {
         scope.launch {
-            settingsStore.saveWorkersPerHash(workers.toInt())
+            settingsStore.saveWorkersPerHash(
+                normalizeTunnelWorkerCount(workers.toInt(), profileMaxWorkers)
+            )
         }
     }
 
     fun scheduleSave() {
         saveJob?.cancel()
         saveJob = scope.launch {
+            val normalizedWorkers = normalizeTunnelWorkerCount(workersInput.toInt(), profileMaxWorkers)
             delay(300)
             val savedLocalPort = if (manualPortsEnabled) portInput.toIntOrNull()?.coerceIn(1, 65535) ?: 9000 else 9000
             settingsStore.save(
                 peerInput, hashSlotsForStorage, "",
-                workersInput.toInt(), "udp", savedLocalPort, sniInput, false
+                normalizedWorkers, "udp", savedLocalPort, sniInput, false
             )
         }
     }
@@ -320,7 +523,25 @@ fun SettingsTabContent(
     val isHashesValid = combinedHashes.isNotBlank()
     val isLinkValid = wdttLinkValidation.canStartVpn
     val isManualValid = isPeerValid && isHashesValid && savedConnectionPassword.isNotBlank() && !hasInputHashErrors
-    val isValid = if (wdttLinkMode) isLinkValid else isManualValid
+    val linkConnectionPresent = remember(wdttLink) {
+        WdttDeepLink.parse(wdttLink, allowMissingHashes = true) != null
+    }
+    val selectedCompactMethodValid = isSelectedCompactConnectionReady(
+        selectedMethod = userConnectionMethod,
+        savedMethod = savedConnectionInputMethod,
+        storedLinkMode = wdttLinkMode,
+        linkPresent = linkConnectionPresent,
+        linkValid = isLinkValid,
+        manualValid = isManualValid,
+    )
+    val isValid = selectedCompactMethodValid
+    val hasConnectionSource = hasTunnelConnectionSource(
+        linkMode = wdttLinkMode,
+        linkValid = linkConnectionPresent,
+        peer = peerInput,
+        password = savedConnectionPassword,
+    )
+    val showManualConnectionFields = false
     val effectiveServerDtlsPort = if (manualPortsEnabled) serverDtlsPortInput.toIntOrNull()?.coerceIn(1, 65535) ?: 56000 else 56000
     val effectiveLocalPort = if (manualPortsEnabled) portInput.toIntOrNull()?.coerceIn(1, 65535) ?: 9000 else 9000
     var pendingStartAfterVpnPermission by remember { mutableStateOf(false) }
@@ -328,11 +549,12 @@ fun SettingsTabContent(
     fun startTunnelService() {
         val effectiveCaptchaMode = if (autoCaptchaEnabled) "auto" else "wv"
         val effectiveCaptchaSolveMethod = if (autoCaptchaEnabled) "auto" else "manual"
+        val normalizedWorkers = normalizeTunnelWorkerCount(workersInput.toInt(), profileMaxWorkers)
         saveJob?.cancel()
         scope.launch {
             settingsStore.save(
                 peerInput, hashSlotsForStorage, "",
-                workersInput.toInt(), "udp", effectiveLocalPort, sniInput, false
+                normalizedWorkers, "udp", effectiveLocalPort, sniInput, false
             )
             settingsStore.saveCaptchaMode(effectiveCaptchaMode)
             settingsStore.saveCaptchaSolveMethod(effectiveCaptchaSolveMethod)
@@ -357,7 +579,7 @@ fun SettingsTabContent(
             putExtra("peer", finalPeer)
             putExtra("vk_hashes", finalHashes)
             putExtra("secondary_vk_hash", "")
-            putExtra("workers_per_hash", workersInput.toInt())
+            putExtra("workers_per_hash", normalizedWorkers)
             putExtra("port", finalLocalPort)
             putExtra("sni", sniInput)
             putExtra("connection_password", finalPassword)
@@ -366,6 +588,18 @@ fun SettingsTabContent(
             putExtra("captcha_solve_method", effectiveCaptchaSolveMethod)
             putExtra("fingerprint", activeFingerprint)
             putExtra("client_ids", activeClientIds)
+            putExtra("custom_vk_credentials_enabled", customVkCredentialsEnabled)
+            putExtra("custom_vk_client_id", customVkClientId)
+            putExtra("custom_vk_client_secret", customVkClientSecret)
+            putExtra("profile_max_workers", profileMaxWorkers)
+            putExtra(
+                MANAGED_CONFIG_FIRST_START_EXTRA,
+                shouldUseManagedConfigFirstStart(
+                    remoteManaged = remoteManagedProfile,
+                    profileMaxWorkers = profileMaxWorkers,
+                ),
+            )
+            putExtra(TUNNEL_PROFILE_INDEX_EXTRA, activeProfile)
         }
         if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
         else context.startService(intent)
@@ -384,6 +618,7 @@ fun SettingsTabContent(
                     "VPN-разрешение не выдано",
                     "Разрешите WDTT Plus создать VPN-подключение в системном окне Android и нажмите «Подключить» ещё раз."
                 )
+                TunnelManager.clearTransition()
                 Toast.makeText(context, "VPN-разрешение не выдано", Toast.LENGTH_SHORT).show()
             }
         }
@@ -400,10 +635,274 @@ fun SettingsTabContent(
         }
     }
 
+    fun checkAccessAndStart() {
+        TunnelManager.noteStartRequested()
+        scope.launch {
+            try {
+                when (
+                    val decision = AccessLifecycleCoordinator.prepareStart(
+                        context,
+                        activeProfile,
+                    )
+                ) {
+                    AccessStartDecision.Allowed -> requestVpnAndStart()
+                    is AccessStartDecision.Denied -> {
+                        TunnelManager.clearConnectionIssue(ConnectionIssueKind.ACCESS)
+                        TunnelManager.clearTransition()
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                TunnelManager.clearTransition()
+                throw cancelled
+            } catch (error: Exception) {
+                TunnelManager.clearTransition()
+                TunnelManager.reportConnectionIssue(
+                    if (accessLifecycle.managed) {
+                        "Не удалось проверить доступ"
+                    } else {
+                        "Не удалось начать подключение"
+                    },
+                    error.message ?: "Проверьте интернет и повторите попытку.",
+                )
+            }
+        }
+    }
+
+    fun openHashesSettings() {
+        if (!wdttLinkMode) {
+            showHashesDialog = true
+            return
+        }
+        scope.launch {
+            val parts = settingsStore.materializeActiveLinkProfile()
+            if (parts == null) {
+                Toast.makeText(
+                    context,
+                    "Не удалось подготовить профиль. Получите или добавьте ссылку подключения заново.",
+                    Toast.LENGTH_LONG
+                ).show()
+                return@launch
+            }
+            val slots = parseVkHashSlots(parts.hashes)
+            vkHash1 = slots.getOrElse(0) { "" }
+            vkHash2 = slots.getOrElse(1) { "" }
+            vkHash3 = slots.getOrElse(2) { "" }
+            vkHash4 = slots.getOrElse(3) { "" }
+            userConnectionEditor = ""
+            showHashesDialog = true
+        }
+    }
+
+    fun openUserLinkEditor() {
+        userConnectionMethod = "link"
+        userLinkInput = if (wdttLinkMode) wdttLink else ""
+        userConnectionEditor = "link"
+    }
+
+    fun openRemoteUpdateEditor() {
+        userLinkInput = ""
+        userConnectionEditor = "remote-update"
+    }
+
+    fun openUserManualEditor() {
+        userConnectionMethod = "manual"
+        scope.launch {
+            if (wdttLinkMode && linkConnectionPresent) {
+                val materialized = settingsStore.materializeActiveLinkProfile()
+                if (materialized == null) {
+                    Toast.makeText(
+                        context,
+                        "Не удалось подготовить ссылку для ручного изменения.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@launch
+                }
+            } else if (wdttLinkMode) {
+                settingsStore.saveWdttLinkMode(false)
+                settingsStore.saveWdttLink("")
+            }
+            userLinkInput = ""
+            userConnectionEditor = "manual"
+        }
+    }
+
+    fun saveUserWdttLink() {
+        val cleanLink = userLinkInput.filterNot(Char::isWhitespace)
+        val remoteDocument = RemoteDocumentGateway.extractLink(cleanLink)
+        if (remoteManagedProfile && remoteDocument == null) {
+            Toast.makeText(
+                context,
+                "Вставьте короткую HTTPS-ссылку обновления для этого профиля.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        if (remoteDocument != null) {
+            val opened = runCatching {
+                context.startActivity(
+                    Intent(context, MainActivity::class.java)
+                        .setAction(Intent.ACTION_VIEW)
+                        .setData(Uri.parse(remoteDocument.url))
+                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                )
+            }.isSuccess
+            if (opened) {
+                userLinkInput = ""
+                userConnectionEditor = ""
+            } else {
+                Toast.makeText(
+                    context,
+                    "Не удалось открыть ссылку обновления.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            return
+        }
+        if (WdttDeepLink.parse(cleanLink, allowMissingHashes = true) == null) return
+        scope.launch {
+            val result = settingsStore.applyWdttDeepLink(
+                plan = WdttDeepLinkApplyPlan(
+                    link = cleanLink,
+                    targetProfile = activeProfile,
+                    requiresConfirmation = hasConnectionSource,
+                    storeAsLink = false
+                ),
+                resetRemoteContinuation = true,
+                remoteManaged = false
+            )
+            if (result == null) {
+                Toast.makeText(context, "Ссылка WDTT не распознана.", Toast.LENGTH_LONG).show()
+            } else {
+                userLinkInput = ""
+                userConnectionEditor = ""
+                Toast.makeText(context, "Подключение сохранено", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     // ═══ Dialogs ═══
+    if (userConnectionEditor == "link" || userConnectionEditor == "remote-update") {
+        UserWdttLinkDialog(
+            linkText = userLinkInput,
+            onLinkTextChange = { userLinkInput = it.filterNot(Char::isWhitespace) },
+            onPaste = {
+                val clipboard = context.getSystemService(ClipboardManager::class.java)
+                val pasted = clipboard
+                    ?.primaryClip
+                    ?.takeIf { it.itemCount > 0 }
+                    ?.getItemAt(0)
+                    ?.coerceToText(context)
+                    ?.toString()
+                    .orEmpty()
+                    .filterNot(Char::isWhitespace)
+                if (pasted.isBlank()) {
+                    Toast.makeText(context, "В буфере обмена нет ссылки", Toast.LENGTH_SHORT).show()
+                } else {
+                    userLinkInput = pasted
+                }
+            },
+            onSave = ::saveUserWdttLink,
+            allowMissingHashes = true,
+            importedLinkStoredAsManualFields = importedLinkStoredAsManualFields,
+            remoteUpdateOnly = userConnectionEditor == "remote-update" || remoteManagedProfile,
+            cachedAction = cachedRemoteAction,
+            onCachedAction = {
+                val clipboard = context.getSystemService(ClipboardManager::class.java)
+                clipboard?.setPrimaryClip(
+                    ClipData.newPlainText(
+                        cachedRemoteAction.clipboardLabel.ifBlank { "WDTT Plus" },
+                        cachedRemoteAction.payload,
+                    )
+                )
+                val opened = runCatching {
+                    launchRemoteTarget(context, cachedRemoteAction.target)
+                }.isSuccess
+                Toast.makeText(
+                    context,
+                    if (opened) {
+                        cachedRemoteAction.copiedMessage.ifBlank {
+                            "Данные скопированы. Продолжите в открывшемся приложении."
+                        }
+                    } else {
+                        cachedRemoteAction.failedMessage.ifBlank {
+                            "Данные скопированы, но страницу не удалось открыть."
+                        }
+                    },
+                    Toast.LENGTH_LONG,
+                ).show()
+            },
+            title = if (userConnectionEditor == "remote-update" || remoteManagedProfile) {
+                "Обновить маршрут"
+            } else if (compactTunnelInterface) {
+                "Добавить ссылку WDTT"
+            } else {
+                "Ссылка WDTT"
+            },
+            subtitle = if (userConnectionEditor == "remote-update" || remoteManagedProfile) {
+                ""
+            } else if (compactTunnelInterface) {
+                "Ссылку может бесплатно выдать владелец любого совместимого сервера."
+            } else {
+                "Вставьте ссылку подключения для текущего профиля."
+            },
+            onDismiss = {
+                userLinkInput = ""
+                userConnectionEditor = ""
+            }
+        )
+    }
+
+    if (userConnectionEditor == "manual" && !remoteManagedProfile) {
+        UserManualConnectionDialog(
+            initialPeer = peerInput,
+            initialPassword = savedConnectionPassword,
+            initialManualPortsEnabled = manualPortsEnabled,
+            initialServerDtlsPort = serverDtlsPortInput,
+            initialServerWgPort = serverWgPortInput,
+            initialLocalPort = portInput,
+            portsHint = if (compactTunnelInterface) {
+                "Включите, только если владелец сервера выдал другие порты."
+            } else {
+                "Включите, если сервер настроен на другие порты."
+            },
+            onSave = { draft ->
+                scope.launch {
+                    settingsStore.saveManualTunnelConnection(
+                        peer = draft.peer,
+                        password = draft.password,
+                        manualPortsEnabled = draft.manualPortsEnabled,
+                        serverDtlsPort = draft.serverDtlsPort,
+                        serverWgPort = draft.serverWgPort,
+                        listenPort = draft.localPort,
+                    )
+                    peerInput = draft.peer
+                    manualPortsEnabled = draft.manualPortsEnabled
+                    serverDtlsPortInput = draft.serverDtlsPort.toString()
+                    serverWgPortInput = draft.serverWgPort.toString()
+                    portInput = draft.localPort.toString()
+                    userConnectionEditor = ""
+                    Toast.makeText(context, "Подключение сохранено", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onDismiss = { userConnectionEditor = "" }
+        )
+    }
+
     if (showSecretsDialog) {
         SecretsDialog(
             settingsStore = settingsStore,
+            title = if (compactTunnelInterface) "Пароль и порты" else "Секреты",
+            passwordLabel = if (compactTunnelInterface) {
+                "Пароль подключения"
+            } else {
+                "Пароль туннеля"
+            },
+            passwordPlaceholder = if (compactTunnelInterface) {
+                "Введите пароль, выданный владельцем сервера"
+            } else {
+                "Введите пароль туннеля"
+            },
+            allowPortsSelection = compactTunnelInterface,
             initialPassword = savedConnectionPassword,
             manualPortsEnabled = manualPortsEnabled,
             initialServerDtlsPort = serverDtlsPortInput,
@@ -421,15 +920,26 @@ fun SettingsTabContent(
     if (showHashesDialog) {
         val hashCheckCaptchaMode = if (autoCaptchaEnabled) "auto" else "wv"
         HashesDialog(
+            settingsStore = settingsStore,
             hash1 = vkHash1,
             hash2 = vkHash2,
             hash3 = vkHash3,
             hash4 = vkHash4,
             activeFingerprint = activeFingerprint,
             activeClientIds = activeClientIds,
+            customVkCredentialsEnabled = customVkCredentialsEnabled,
+            customVkClientId = customVkClientId,
+            customVkClientSecret = customVkClientSecret,
+            remoteContinuation = RemoteContinuation(
+                available = remoteActionKey.isNotBlank() && remoteActionUrl.isNotBlank(),
+                key = remoteActionKey,
+                url = remoteActionUrl
+            ),
+            remoteAction = actionCatalog.at("profile"),
             vkCallsPreflight = vkCallsPreflight,
             captchaMode = hashCheckCaptchaMode,
             selectedWebViewManual = !autoCaptchaEnabled,
+            onOpenProjectSupport = onOpenProjectSupport,
             onSave = { h1, h2, h3, h4 ->
                 val cleaned1 = stripVkUrlStatic(h1)
                 val cleaned2 = stripVkUrlStatic(h2)
@@ -439,7 +949,10 @@ fun SettingsTabContent(
                 vkHash2 = cleaned2
                 vkHash3 = cleaned3
                 vkHash4 = cleaned4
-                val maxWorkers = maxWorkersForHashSlots(listOf(cleaned1, cleaned2, cleaned3, cleaned4))
+                val maxWorkers = maxWorkersForHashSlots(
+                    listOf(cleaned1, cleaned2, cleaned3, cleaned4),
+                    profileMaxWorkers
+                )
                 val savedWorkers = if (workersInput > maxWorkers) {
                     roundToGroup(workersInput, maxWorkers).also { workersInput = it }
                 } else {
@@ -463,16 +976,231 @@ fun SettingsTabContent(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            if (!wdttLinkMode) {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    // ═══ Заголовок раздела ═══
-                    Text(
-                        "Настройки туннеля (${vpnProfileDisplayName(activeProfile, profileNames)})",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
+        Column {
+            val tunnelAction = actionCatalog.at("tunnel")
+            if (shouldShowTunnelRemoteActionCard(
+                    interfaceRole = interfaceRole,
+                    preview = BuildConfig.REMOTE_ACTION_PREVIEW,
+                    hasConnectionSource = hasConnectionSource,
+                    dismissed = remoteCardDismissed,
+                    dismissCountdown = remoteCardDismissCountdown,
+                    actionResolved = actionCatalogResolved,
+                    actionAvailable = tunnelAction != null,
+                )
+            ) {
+                Column {
+                    if (remoteCardDismissCountdown > 0) {
+                        DismissedNoticeCard(
+                            title = "Предложение скрыто",
+                            message = "Ссылку всегда можно найти в «Инфо» → «Поддержать проект».",
+                            countdown = remoteCardDismissCountdown,
+                            onProjectSupportClick = onOpenProjectSupport,
+                        )
+                    } else if (tunnelAction != null) {
+                        RemoteActionCard(
+                            action = tunnelAction,
+                            onLinkClick = onOpenProjectSupport,
+                            onClick = {
+                                scope.launch {
+                                    val opened = RemoteUiActionLauncher.open(context, tunnelAction)
+                                    if (!opened) {
+                                        Toast.makeText(
+                                            context,
+                                            "Не удалось открыть страницу. Проверьте браузер.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                }
+                            },
+                            onDismiss = {
+                                remoteCardDismissCountdown = 5
+                                scope.launch {
+                                    settingsStore.saveRemoteCardDismissed(activeProfile, true)
+                                }
+                            }
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
+            }
 
+            Text(
+                "Настройки туннеля (${vpnProfileDisplayName(activeProfile, profileNames)})",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.padding(bottom = 12.dp)
+            )
+
+            val accessDismissible =
+                accessLifecycle.allowConnect &&
+                    accessLifecycle.severity == AccessLifecycleSeverity.WARNING
+            val accessDismissSignature = accessLifecycleDismissalSignature(accessLifecycle)
+            val accessDismissed =
+                accessDismissible &&
+                    accessDismissSignature.isNotBlank() &&
+                    accessDismissSignature == accessLifecycleDismissedSignature
+            val routeUpdateAvailable = remoteManagedProfile
+            val accessCardDismissed =
+                accessDismissible &&
+                    accessDismissed &&
+                    accessLifecycleDismissCountdown <= 0 &&
+                    !routeUpdateAvailable
+            if (
+                accessLifecycle.managed &&
+                    !accessCardDismissed
+            ) {
+                if (accessLifecycleDismissCountdown > 0 && !routeUpdateAvailable) {
+                    DismissedNoticeCard(
+                        title = "Напоминание скрыто",
+                        message = "Действие для профиля остаётся доступно после следующей проверки.",
+                        countdown = accessLifecycleDismissCountdown,
+                    )
+                } else {
+                    AccessLifecycleCard(
+                        lifecycle = accessLifecycle,
+                        refreshing = accessRefreshing || accessManualRefreshBusy,
+                        actionBusy = accessActionBusy,
+                        onRouteUpdate = if (routeUpdateAvailable) {
+                            ::openRemoteUpdateEditor
+                        } else {
+                            null
+                        },
+                        onDismiss = if (accessDismissible) {
+                            {
+                                accessLifecycleDismissCountdown = 5
+                                scope.launch {
+                                    settingsStore.saveAccessLifecycleDismissedSignature(
+                                        activeProfile,
+                                        accessDismissSignature,
+                                    )
+                                }
+                            }
+                        } else {
+                            null
+                        },
+                        onRefresh = {
+                            if (accessManualRefreshBusy) return@AccessLifecycleCard
+                            accessManualRefreshBusy = true
+                            scope.launch {
+                                val startedAt = System.currentTimeMillis()
+                                try {
+                                    when (
+                                        val result = AccessLifecycleCoordinator.refreshProfile(
+                                            context,
+                                            activeProfile,
+                                            force = true,
+                                        )
+                                    ) {
+                                        is AccessLifecycleRefreshResult.Success -> Toast.makeText(
+                                            context,
+                                            "Данные обновлены",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                        is AccessLifecycleRefreshResult.Cached -> Toast.makeText(
+                                            context,
+                                            "Данные уже актуальны",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                        is AccessLifecycleRefreshResult.Throttled -> Toast.makeText(
+                                            context,
+                                            "Проверено недавно. Повторите через несколько секунд",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                        is AccessLifecycleRefreshResult.Failed -> Toast.makeText(
+                                            context,
+                                            result.message,
+                                            Toast.LENGTH_LONG,
+                                        ).show()
+                                        AccessLifecycleRefreshResult.Unmanaged -> Toast.makeText(
+                                            context,
+                                            "Проверка недоступна",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
+                                } finally {
+                                    val visibleFor = System.currentTimeMillis() - startedAt
+                                    if (visibleFor < 450) delay(450 - visibleFor)
+                                    accessManualRefreshBusy = false
+                                }
+                            }
+                        },
+                        onAction = {
+                            if (accessActionBusy) return@AccessLifecycleCard
+                            accessActionBusy = true
+                            scope.launch {
+                                runCatching {
+                                    AccessLifecycleCoordinator.beginAction(
+                                        context,
+                                        activeProfile,
+                                    )
+                                }.onSuccess { target ->
+                                    runCatching {
+                                        launchRemoteTarget(context, target)
+                                    }.onFailure { error ->
+                                        if (error is CancellationException) throw error
+                                        Toast.makeText(
+                                            context,
+                                            error.message ?: "Не удалось открыть страницу.",
+                                            Toast.LENGTH_LONG,
+                                        ).show()
+                                    }
+                                }.onFailure { error ->
+                                    if (error is CancellationException) throw error
+                                    TunnelManager.noteAccessLifecycleEvent(
+                                        key = "action_unavailable_$activeProfile",
+                                        message = error.message ?: "Действие сейчас недоступно",
+                                        warning = true,
+                                    )
+                                    Toast.makeText(
+                                        context,
+                                        error.message ?: "Действие сейчас недоступно.",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                                accessActionBusy = false
+                            }
+                        }
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+
+            if (!remoteManagedProfile) {
+                CompactTunnelProfileCard(
+                    hasConnection = hasConnectionSource,
+                    connectionMethod = userConnectionMethod,
+                    savedConnectionMethod = savedConnectionInputMethod,
+                    onConnectionMethodChange = { method ->
+                        userConnectionMethod = method
+                        userLinkInput = ""
+                        userConnectionEditor = ""
+                    },
+                    onAddLinkClick = ::openUserLinkEditor,
+                    onManualClick = ::openUserManualEditor,
+                )
+                Spacer(Modifier.height(12.dp))
+            }
+            AppSectionCard(
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(0.dp)
+            ) {
+                OutlinedButton(
+                    onClick = ::openHashesSettings,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    Icon(Icons.Default.Tag, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    FlexibleButtonText(
+                        "Настройка VK Хешей ($filledHashCount/4)",
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+
+            if (showManualConnectionFields) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     // ═══ Настройки туннеля ═══
                     AppSectionCard(
                         contentPadding = PaddingValues(16.dp),
@@ -497,7 +1225,7 @@ fun SettingsTabContent(
                         )
 
                         OutlinedButton(
-                            onClick = { showHashesDialog = true },
+                            onClick = ::openHashesSettings,
                             modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
                             shape = RoundedCornerShape(16.dp),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
@@ -524,9 +1252,12 @@ fun SettingsTabContent(
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
+
                     }
                 }
             }
+
+            Spacer(Modifier.height(12.dp))
 
             // ═══ Мощность + Капча ═══
                 AppSectionCard(
@@ -573,19 +1304,31 @@ fun SettingsTabContent(
                     val maxWorkers = dynamicMaxWorkers
                     val minWorkers = WORKERS_PER_GROUP.toFloat()
                     val currentWorkersVal = roundToGroup(currentWorkers.coerceIn(minWorkers, maxWorkers), maxWorkers)
+                    val hasProfileWorkerLimit = profileMaxWorkers >= WORKERS_PER_GROUP
 
                     CompactSteppedSlider(
                         value = currentWorkersVal,
                         onValueChange = { raw ->
                             val rounded = roundToGroup(raw, maxWorkers)
                             workersInput = rounded
-                            saveWorkersNow(rounded)
+                        },
+                        onValueChangeFinished = { selected ->
+                            saveWorkersNow(roundToGroup(selected, maxWorkers))
                         },
                         valueRange = minWorkers..maxWorkers,
                         stepSize = WORKERS_PER_GROUP.toFloat(),
-                        enabled = !tunnelRunning,
+                        enabled = !tunnelRunning && maxWorkers > minWorkers,
                         modifier = Modifier.fillMaxWidth()
                     )
+
+                    if (hasProfileWorkerLimit) {
+                        Text(
+                            text = "Для этого профиля доступно до $profileMaxWorkers потоков. Повысить значение выше нельзя.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(4.dp))
+                    }
 
                     // — Разделитель —
                     HorizontalDivider(
@@ -605,7 +1348,7 @@ fun SettingsTabContent(
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             Text(
-                                "VKCalls",
+                                "Быстрый VKCalls",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Medium
                             )
@@ -672,77 +1415,12 @@ fun SettingsTabContent(
                             onCheckedChange = { enabled ->
                                 autoCaptchaEnabled = enabled
                                 scope.launch {
-                                    if (enabled) {
-                                        settingsStore.saveCaptchaMode("auto")
-                                        settingsStore.saveCaptchaSolveMethod("auto")
-                                    } else {
-                                        settingsStore.saveCaptchaMode("wv")
-                                        settingsStore.saveCaptchaSolveMethod("manual")
-                                        settingsStore.saveWbvCaptchaSolveMethod("manual")
-                                    }
+                                    settingsStore.saveCaptchaPreference(enabled)
                                 }
                             }
                         )
                     }
 
-                    HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 4.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    )
-
-                    // — Режим ссылки —
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp, bottom = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            "Режим ссылки",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Medium,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Switch(
-                            checked = wdttLinkMode,
-                            onCheckedChange = { enabled ->
-                                scope.launch {
-                                    settingsStore.saveWdttLinkMode(enabled)
-                                }
-                            }
-                        )
-                    }
-
-                    if (wdttLinkMode) {
-                        Column {
-                            var linkText by remember(wdttLink) { mutableStateOf(wdttLink) }
-                            val linkValidation = remember(linkText) { WdttDeepLink.validate(linkText) }
-                            val linkInvalid = linkText.isNotBlank() && !linkValidation.canStartVpn
-                            OutlinedTextField(
-                                value = linkText,
-                                onValueChange = {
-                                    val cleaned = it.filter { c -> !c.isWhitespace() }
-                                    linkText = cleaned
-                                    scope.launch { settingsStore.saveWdttLink(cleaned) }
-                                },
-                                label = { Text("Ссылка wdtt://") },
-                                placeholder = { Text("Ссылка wdtt://") },
-                                isError = linkInvalid,
-                                supportingText = {
-                                    if (linkText.isNotBlank()) {
-                                        Text(linkValidation.userMessage())
-                                    }
-                                },
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(16.dp),
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                    unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
-                                )
-                            )
-                        }
-                    }
                 }
             }
 
@@ -753,7 +1431,7 @@ fun SettingsTabContent(
             modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            if (!wdttLinkMode) {
+            if (showManualConnectionFields) {
                 OutlinedButton(
                     onClick = { showSecretsDialog = true },
                     modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 52.dp),
@@ -770,7 +1448,10 @@ fun SettingsTabContent(
                 ) {
                     Icon(imageVector = Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    FlexibleButtonText("Секреты", fontWeight = FontWeight.SemiBold)
+                    FlexibleButtonText(
+                        if (compactTunnelInterface) "Пароль и порты" else "Секреты",
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
             }
 
@@ -782,16 +1463,19 @@ fun SettingsTabContent(
 
             Button(
                 onClick = {
+                    if (tunnelTransition != TunnelTransition.IDLE) return@Button
                     if (tunnelRunning || trustedWifiWaiting) {
+                        TunnelManager.noteStopRequested()
                         context.startService(
                             Intent(context, TunnelService::class.java).apply { action = "STOP" }
                         )
                     } else {
                         TunnelManager.clearConnectionIssue()
-                        requestVpnAndStart()
+                        checkAccessAndStart()
                     }
                 },
-                enabled = (isValid && !cooldownActive) || tunnelRunning || trustedWifiWaiting,
+                enabled = tunnelTransition == TunnelTransition.IDLE &&
+                    ((isValid && !cooldownActive) || tunnelRunning || trustedWifiWaiting),
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
@@ -811,6 +1495,8 @@ fun SettingsTabContent(
                 Spacer(Modifier.width(6.dp))
                 FlexibleButtonText(
                     text = when {
+                        tunnelTransition == TunnelTransition.STOPPING -> "Отключаю…"
+                        tunnelTransition == TunnelTransition.STARTING -> "Подключаю…"
                         tunnelRunning -> "Остановить"
                         trustedWifiWaiting -> "Отменить ожидание"
                         cooldownActive -> "Подождите..."
@@ -849,7 +1535,7 @@ fun SettingsTabContent(
             }
         }
 
-        connectionIssue?.let { issue ->
+        standaloneConnectionIssue?.let { issue ->
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -889,15 +1575,17 @@ fun SettingsTabContent(
             minWorkers = WORKERS_PER_GROUP,
             maxWorkers = dynamicMaxWorkers.toInt(),
             currentWorkers = currentWorkers.toInt(),
+            profileMaxWorkers = profileMaxWorkers,
             onDismiss = { showPowerHelp = false }
         )
     }
     if (showVkCallsHelp) {
         SettingsHelpDialog(
-            title = "VKCalls",
+            title = "Быстрый VKCalls",
             paragraphs = listOf(
-                "Сначала приложение пробует получить TURN-учётные данные через анонимный режим VKCalls без VK Smart Captcha.",
-                "Обычно это быстрее и стабильнее. Если VKCalls не сработал, VK временно ограничил анонимный вход или всё равно запросил проверку, приложение автоматически переходит к обычной captcha-цепочке."
+                "Первым приложение пробует современный анонимный путь VKCalls через системный VK Connect. Ему не нужны ваш Client ID, Client secret или VK Smart Captcha — обычно это самый быстрый и стабильный вариант.",
+                "Если VKCalls временно недоступен, приложение автоматически пробует собственные legacy-реквизиты (если они включены), затем выбранные встроенные legacy Client ID. В legacy-ветке полностью сохраняется авторешение капчи.",
+                "Переключатель отключает только первый быстрый провайдер. Для обычной работы рекомендуется оставить VKCalls включённым."
             ),
             onDismiss = { showVkCallsHelp = false }
         )
@@ -906,11 +1594,196 @@ fun SettingsTabContent(
         SettingsHelpDialog(
             title = "Режим капчи",
             paragraphs = listOf(
+                "Эта настройка применяется только к резервным legacy-провайдерам: основной быстрый VKCalls обычно получает TURN-данные без капчи.",
                 "Авто капча: каждый свежий challenge сначала решается через Auto WebView. Go v2 и ручной WebView используются как запасные этапы, если автоматический WebView не дал рабочий токен или VK потребовал более строгую проверку.",
-                "Всегда вручную: при запросе капчи приложение сразу открывает WebView для самостоятельного прохождения проверки."
+                "Всегда вручную: если legacy-провайдер получил капчу, приложение сразу открывает WebView для самостоятельного прохождения проверки."
             ),
             onDismiss = { showAutoCaptchaHelp = false }
         )
+    }
+}
+
+@Composable
+private fun AccessLifecycleCard(
+    lifecycle: AccessLifecycleUiState,
+    refreshing: Boolean,
+    actionBusy: Boolean,
+    onRouteUpdate: (() -> Unit)?,
+    onDismiss: (() -> Unit)?,
+    onRefresh: () -> Unit,
+    onAction: () -> Unit,
+) {
+    val severity = lifecycle.severity
+    val accent = when {
+        severity == AccessLifecycleSeverity.ERROR -> MaterialTheme.colorScheme.error
+        severity == AccessLifecycleSeverity.WARNING -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.primary
+    }
+    val container = when {
+        severity == AccessLifecycleSeverity.ERROR ->
+            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.68f)
+        severity == AccessLifecycleSeverity.WARNING ->
+            MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.62f)
+        else -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.52f)
+    }
+    val icon = when {
+        lifecycle.checkedAtMillis <= 0 -> Icons.Default.Schedule
+        !lifecycle.allowConnect -> Icons.Default.Lock
+        severity == AccessLifecycleSeverity.WARNING -> Icons.Default.WarningAmber
+        else -> Icons.Default.CheckCircle
+    }
+    val title = lifecycle.title.ifBlank {
+        if (lifecycle.checkedAtMillis <= 0) {
+            "Проверяем профиль"
+        } else {
+            lifecycle.fallbackTitle()
+        }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = container,
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.36f)),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = accent,
+                    modifier = Modifier.size(23.dp),
+                )
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f),
+                )
+                if (onRouteUpdate != null) {
+                    IconButton(
+                        onClick = onRouteUpdate,
+                        enabled = !actionBusy,
+                        modifier = Modifier.size(36.dp),
+                    ) {
+                        Icon(
+                            Icons.Default.WarningAmber,
+                            contentDescription = "Обновить маршрут",
+                            tint = accent,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
+                IconButton(
+                    onClick = onRefresh,
+                    enabled = !refreshing && !actionBusy,
+                    modifier = Modifier.size(36.dp),
+                ) {
+                    if (refreshing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(19.dp),
+                            strokeWidth = 2.dp,
+                            color = accent,
+                        )
+                    } else {
+                        Icon(
+                            Icons.Default.Refresh,
+                            contentDescription = "Проверить профиль",
+                            tint = accent,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
+                if (onDismiss != null) {
+                    CardDismissButton(
+                        contentDescription = "Скрыть напоминание",
+                        onClick = onDismiss,
+                    )
+                }
+            }
+            if (lifecycle.message.isNotBlank()) {
+                Text(
+                    text = lifecycle.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (lifecycle.actionMessage.isNotBlank() && !lifecycle.actionAvailable) {
+                Text(
+                    text = lifecycle.actionMessage,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (lifecycle.detailValue.isNotBlank() || lifecycle.actionAvailable) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    if (lifecycle.detailValue.isNotBlank()) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            if (lifecycle.detailLabel.isNotBlank()) {
+                                Text(
+                                    text = lifecycle.detailLabel,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = accent.copy(alpha = 0.78f),
+                                )
+                            }
+                            Text(
+                                text = lifecycle.detailValue,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = accent,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    } else {
+                        Spacer(Modifier.weight(1f))
+                    }
+                    if (lifecycle.actionAvailable) {
+                        Button(
+                            onClick = onAction,
+                            enabled = !refreshing && !actionBusy,
+                            modifier = Modifier
+                                .widthIn(min = 132.dp)
+                                .heightIn(min = 46.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            contentPadding = PaddingValues(
+                                horizontal = 8.dp,
+                                vertical = 6.dp,
+                            ),
+                        ) {
+                            if (actionBusy) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(17.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                )
+                            } else {
+                                if (lifecycle.actionIcon == "update") {
+                                    Icon(Icons.Default.Update, null, Modifier.size(17.dp))
+                                    Spacer(Modifier.width(5.dp))
+                                }
+                                FlexibleButtonText(
+                                    lifecycle.actionLabel.ifBlank { "Продолжить" }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -981,6 +1854,7 @@ private fun PowerHelpDialog(
     minWorkers: Int,
     maxWorkers: Int,
     currentWorkers: Int,
+    profileMaxWorkers: Int,
     onDismiss: () -> Unit
 ) {
     Dialog(onDismissRequest = onDismiss) {
@@ -1032,6 +1906,14 @@ private fun PowerHelpDialog(
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (profileMaxWorkers >= WORKERS_PER_GROUP) {
+                        Text(
+                            "Владелец этого профиля установил предел $profileMaxWorkers потоков с учётом возможностей сервера. Приложение не позволит выбрать больше для этого профиля. Ограничение не действует на другие самостоятельно настроенные профили.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                     Text(
                         "Сейчас: $currentWorkers. Доступный диапазон для текущего числа VK-хешей: $minWorkers-$maxWorkers.",
                         style = MaterialTheme.typography.bodySmall,
@@ -1064,6 +1946,16 @@ private fun FlexibleButtonText(
         fontWeight = fontWeight,
         color = color,
         textAlign = TextAlign.Center
+    )
+}
+
+@Composable
+private fun FullWidthFieldMessage(text: String, color: Color) {
+    Text(
+        text = text,
+        modifier = Modifier.fillMaxWidth(),
+        style = MaterialTheme.typography.bodySmall,
+        color = color
     )
 }
 
@@ -1102,6 +1994,7 @@ private fun ProtocolChip(label: String, selected: Boolean, enabled: Boolean = tr
 private fun CompactSteppedSlider(
     value: Float,
     onValueChange: (Float) -> Unit,
+    onValueChangeFinished: (Float) -> Unit,
     valueRange: ClosedFloatingPointRange<Float>,
     stepSize: Float,
     enabled: Boolean,
@@ -1113,6 +2006,9 @@ private fun CompactSteppedSlider(
     val density = LocalDensity.current
     val thumbRadiusPx = with(density) { 9.dp.toPx() }
     val trackWidthPx = with(density) { 5.dp.toPx() }
+    val currentValue by rememberUpdatedState(value)
+    val currentOnValueChange by rememberUpdatedState(onValueChange)
+    val currentOnValueChangeFinished by rememberUpdatedState(onValueChangeFinished)
 
     fun snap(raw: Float): Float {
         val min = valueRange.start
@@ -1134,13 +2030,21 @@ private fun CompactSteppedSlider(
             .pointerInput(enabled, valueRange, stepSize) {
                 if (!enabled) return@pointerInput
                 detectTapGestures { offset ->
-                    onValueChange(positionToValue(offset.x, size.width.toFloat()))
+                    val selected = positionToValue(offset.x, size.width.toFloat())
+                    currentOnValueChange(selected)
+                    currentOnValueChangeFinished(selected)
                 }
             }
             .pointerInput(enabled, valueRange, stepSize) {
                 if (!enabled) return@pointerInput
-                detectDragGestures { change, _ ->
-                    onValueChange(positionToValue(change.position.x, size.width.toFloat()))
+                var selected = currentValue
+                detectDragGestures(
+                    onDragStart = { selected = currentValue },
+                    onDragEnd = { currentOnValueChangeFinished(selected) },
+                    onDragCancel = { currentOnValueChangeFinished(selected) },
+                ) { change, _ ->
+                    selected = positionToValue(change.position.x, size.width.toFloat())
+                    currentOnValueChange(selected)
                 }
             }
     ) {
@@ -1231,7 +2135,7 @@ fun ImportantInfoDialog(onDismiss: () -> Unit) {
 
                     InfoSection(
                         "Профили VPN",
-                        "В боковых настройках доступны VPN 1, VPN 2 и VPN 3. Короткое нажатие переключает профиль, долгое нажатие позволяет переименовать его."
+                        "В боковых настройках доступны VPN 1, VPN 2 и VPN 3. Короткое нажатие выбирает профиль и закрывает настройки, долгое открывает переименование и полную локальную очистку профиля."
                     )
                     InfoSection(
                         "VK-хеши",
@@ -1243,7 +2147,7 @@ fun ImportantInfoDialog(onDismiss: () -> Unit) {
                     )
                     InfoSection(
                         "Передача подключения",
-                        "Обычное подключение передаётся через «Настройки» → «Передать или получить». Перенос отдельного клиента выполняется именно в блоке «Клиенты и сервер»."
+                        "Обычное подключение передаётся через «Настройки» → «Получить или передать». Перенос отдельного клиента выполняется именно в блоке «Клиенты и сервер»."
                     )
                     InfoSection(
                         "После новых серверных функций",
@@ -1251,7 +2155,7 @@ fun ImportantInfoDialog(onDismiss: () -> Unit) {
                     )
                     InfoSection(
                         "Капча и мощность",
-                        "Авто-режим старается пройти капчу сам. Несколько VK-хешей распределяют нагрузку, а мощность лучше держать умеренной: чем она выше, тем больше расход батареи и шанс чаще видеть капчу."
+                        "Сначала работает быстрый VKCalls без капчи; авторешение подключается только для резервного способа. Несколько VK-хешей распределяют нагрузку, а мощность лучше держать умеренной: чем она выше, тем больше расход батареи и шанс чаще видеть капчу."
                     )
 
                     Spacer(Modifier.height(20.dp))
@@ -1291,16 +2195,25 @@ private fun roundToGroup(value: Float, maxW: Float = 96f): Float {
     return rounded.coerceIn(WORKERS_PER_GROUP.toFloat(), maxW)
 }
 
-private fun maxWorkersForHashCount(hashCount: Int): Float {
-    return (hashCount.coerceAtLeast(1) * 27).toFloat()
+private fun maxWorkersForHashCount(hashCount: Int, profileMaxWorkers: Int = 0): Float {
+    val hashMaximum = hashCount.coerceAtLeast(1) * 27
+    return if (profileMaxWorkers >= WORKERS_PER_GROUP) {
+        minOf(hashMaximum, profileMaxWorkers).toFloat()
+    } else {
+        hashMaximum.toFloat()
+    }
 }
 
-private fun maxWorkersForHashSlots(hashSlots: List<String>): Float {
+private fun maxWorkersForHashSlots(
+    hashSlots: List<String>,
+    profileMaxWorkers: Int = 0
+): Float {
     return maxWorkersForHashCount(
         hashSlots.count { slot ->
             val hash = stripVkUrlStatic(slot)
-            hash.isNotBlank() && hash.length >= 16
-        }
+            VkJoinLink.isValidHash(hash)
+        },
+        profileMaxWorkers
     )
 }
 
@@ -1319,6 +2232,89 @@ private fun parseVkHashSlots(raw: String): List<String> {
         .map { stripVkUrlStatic(it) }
         .take(4)
         .let { slots -> slots + List((4 - slots.size).coerceAtLeast(0)) { "" } }
+}
+
+internal fun parseBulkVkHashes(raw: String): List<String> {
+    val normalized = raw
+        .replace(Regex("(?i)%2c"), ",")
+        .replace(Regex("(?i)%3b"), ";")
+        .replace(Regex("(?i)%20"), " ")
+        .replace(Regex("(?i)%09"), " ")
+        .replace(Regex("(?i)%0d%0a|%0a|%0d"), "\n")
+    return normalized
+        .split(Regex("[,;\\s]+"))
+        .asSequence()
+        .map { stripVkUrlStatic(it) }
+        .filter(VkJoinLink::isValidHash)
+        .distinct()
+        .take(4)
+        .toList()
+}
+
+internal enum class BulkVkHashPasteMode {
+    FillEmpty,
+    ReplaceAll
+}
+
+internal data class BulkVkHashPasteResult(
+    val slots: List<String>,
+    val insertedCount: Int,
+    val skippedCount: Int
+)
+
+private data class PendingBulkVkHashes(
+    val hashes: List<String>
+)
+
+internal fun mergeBulkVkHashes(
+    existingSlots: List<String>,
+    incomingHashes: List<String>,
+    mode: BulkVkHashPasteMode
+): BulkVkHashPasteResult {
+    val normalizedExisting = existingSlots
+        .map { stripVkUrlStatic(it) }
+        .take(4)
+        .let { values -> values + List((4 - values.size).coerceAtLeast(0)) { "" } }
+    val incoming = incomingHashes
+        .map { stripVkUrlStatic(it) }
+        .filter(VkJoinLink::isValidHash)
+        .distinct()
+        .take(4)
+    return when (mode) {
+        BulkVkHashPasteMode.ReplaceAll -> {
+            val slots = incoming + List((4 - incoming.size).coerceAtLeast(0)) { "" }
+            BulkVkHashPasteResult(
+                slots = slots,
+                insertedCount = incoming.size,
+                skippedCount = 0
+            )
+        }
+        BulkVkHashPasteMode.FillEmpty -> {
+            val slots = normalizedExisting.toMutableList()
+            var inserted = 0
+            var skipped = 0
+            val occupied = slots.filter(VkJoinLink::isValidHash).toMutableSet()
+            incoming.forEach { hash ->
+                if (hash in occupied) {
+                    skipped++
+                    return@forEach
+                }
+                val emptyIndex = slots.indexOfFirst { !VkJoinLink.isValidHash(it) }
+                if (emptyIndex < 0) {
+                    skipped++
+                } else {
+                    slots[emptyIndex] = hash
+                    occupied += hash
+                    inserted++
+                }
+            }
+            BulkVkHashPasteResult(
+                slots = slots,
+                insertedCount = inserted,
+                skippedCount = skipped
+            )
+        }
+    }
 }
 
 private fun encodeVkHashSlots(vararg hashes: String): String {
@@ -1340,30 +2336,814 @@ private fun copyVkHashesToClipboard(context: android.content.Context, label: Str
     Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
 }
 
+private fun Int.hashPlural(): String {
+    val mod100 = this % 100
+    val mod10 = this % 10
+    return when {
+        mod100 in 11..14 -> "хешей"
+        mod10 == 1 -> "хеш"
+        mod10 in 2..4 -> "хеша"
+        else -> "хешей"
+    }
+}
+
+@Composable
+private fun CompactTunnelProfileCard(
+    hasConnection: Boolean,
+    connectionMethod: String,
+    savedConnectionMethod: String,
+    onConnectionMethodChange: (String) -> Unit,
+    onAddLinkClick: () -> Unit,
+    onManualClick: () -> Unit,
+) {
+    AppSectionCard(
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text(
+            "Способ подключения",
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold
+        )
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            listOf("link" to "Ссылка WDTT", "manual" to "Вручную")
+                .forEachIndexed { index, (mode, label) ->
+                    SegmentedButton(
+                        selected = connectionMethod == mode,
+                        onClick = { onConnectionMethodChange(mode) },
+                        shape = SegmentedButtonDefaults.itemShape(index, 2),
+                        icon = {
+                            StableSegmentedButtonIcon(selected = connectionMethod == mode)
+                        },
+                    ) {
+                        Text(label, textAlign = TextAlign.Center)
+                    }
+                }
+        }
+        val selectedMethodConfigured = hasConnection && (
+            savedConnectionMethod == connectionMethod ||
+                savedConnectionMethod.isBlank() && connectionMethod == "manual"
+            )
+        if (connectionMethod == "link") {
+            OutlinedButton(
+                onClick = onAddLinkClick,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+            ) {
+                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                FlexibleButtonText(
+                    if (selectedMethodConfigured) "Изменить ссылку" else "Вставить ссылку WDTT",
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        } else {
+            OutlinedButton(
+                onClick = onManualClick,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+            ) {
+                Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                FlexibleButtonText(
+                    if (selectedMethodConfigured) "Изменить настройки" else "Настроить вручную",
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+    }
+}
+
+private data class ManualTunnelConnectionDraft(
+    val peer: String,
+    val password: String,
+    val manualPortsEnabled: Boolean,
+    val serverDtlsPort: Int,
+    val serverWgPort: Int,
+    val localPort: Int,
+)
+
+@Composable
+private fun UserManualConnectionDialog(
+    initialPeer: String,
+    initialPassword: String,
+    initialManualPortsEnabled: Boolean,
+    initialServerDtlsPort: String,
+    initialServerWgPort: String,
+    initialLocalPort: String,
+    portsHint: String,
+    onSave: (ManualTunnelConnectionDraft) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val focusManager = LocalFocusManager.current
+    var peer by rememberSaveable { mutableStateOf(initialPeer) }
+    var password by rememberSaveable { mutableStateOf(initialPassword) }
+    var passwordFocused by remember { mutableStateOf(false) }
+    var manualPortsEnabled by rememberSaveable { mutableStateOf(initialManualPortsEnabled) }
+    var serverDtlsPort by rememberSaveable {
+        mutableStateOf(initialServerDtlsPort.ifBlank { "56000" })
+    }
+    var serverWgPort by rememberSaveable {
+        mutableStateOf(initialServerWgPort.ifBlank { "56001" })
+    }
+    var localPort by rememberSaveable {
+        mutableStateOf(initialLocalPort.ifBlank { "9000" })
+    }
+
+    val passwordValid = password.isNotEmpty() &&
+        password.matches(Regex("^[a-zA-Z0-9_.!?:#/-]+$"))
+    val parsedDtlsPort = serverDtlsPort.toIntOrNull()
+    val parsedWgPort = serverWgPort.toIntOrNull()
+    val parsedLocalPort = localPort.toIntOrNull()
+    val portsValid = !manualPortsEnabled || listOf(
+        parsedDtlsPort,
+        parsedWgPort,
+        parsedLocalPort
+    ).all { it != null && it in 1..65535 }
+    val canSave = isValidTunnelHost(peer) && passwordValid && portsValid
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(8.dp)
+                .pointerInput(focusManager) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            if (event.type == PointerEventType.Press) {
+                                focusManager.clearFocus()
+                            }
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.92f)
+                    .widthIn(max = 560.dp)
+                    .heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 8.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(22.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            "Подключение вручную",
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        IconButton(onClick = onDismiss) {
+                            Icon(Icons.Default.Close, contentDescription = "Закрыть ручную настройку")
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        val peerInvalid = peer.isNotBlank() && !isValidTunnelHost(peer)
+                        OutlinedTextField(
+                            value = peer,
+                            onValueChange = { peer = it.filterNot(Char::isWhitespace) },
+                            label = { Text("IP сервера или домен") },
+                            placeholder = { Text("1.2.3.4 или server.example") },
+                            singleLine = true,
+                            isError = peerInvalid,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp)
+                        )
+                        if (peerInvalid) {
+                            FullWidthFieldMessage(
+                                text = "Укажите адрес без порта",
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        val passwordInvalid = password.isNotBlank() && !passwordValid
+                        OutlinedTextField(
+                            value = password,
+                            onValueChange = { password = it.filterNot(Char::isWhitespace) },
+                            label = { Text("Пароль подключения") },
+                            placeholder = { Text("Введите пароль туннеля") },
+                            singleLine = true,
+                            isError = passwordInvalid,
+                            visualTransformation = if (passwordFocused) {
+                                VisualTransformation.None
+                            } else {
+                                PasswordVisualTransformation()
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onFocusChanged { passwordFocused = it.isFocused },
+                            shape = RoundedCornerShape(16.dp)
+                        )
+                        if (passwordInvalid) {
+                            FullWidthFieldMessage(
+                                text = "Разрешены буквы, цифры и знаки . ! ? : # - _ /",
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text("Нестандартные порты", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                portsHint,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = manualPortsEnabled,
+                            onCheckedChange = { manualPortsEnabled = it }
+                        )
+                    }
+
+                    if (manualPortsEnabled) {
+                        listOf(
+                            Triple(serverDtlsPort, "Порт сервера DTLS", { value: String -> serverDtlsPort = value }),
+                            Triple(serverWgPort, "Порт сервера WireGuard", { value: String -> serverWgPort = value }),
+                            Triple(localPort, "Локальный порт VPN", { value: String -> localPort = value }),
+                        ).forEach { (value, label, update) ->
+                            val parsed = value.toIntOrNull()
+                            OutlinedTextField(
+                                value = value,
+                                onValueChange = { update(it.filter(Char::isDigit).take(5)) },
+                                label = { Text(label) },
+                                singleLine = true,
+                                isError = value.isNotBlank() && (parsed == null || parsed !in 1..65535),
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(16.dp),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                            )
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            onSave(
+                                ManualTunnelConnectionDraft(
+                                    peer = peer.trim(),
+                                    password = password,
+                                    manualPortsEnabled = manualPortsEnabled,
+                                    serverDtlsPort = if (manualPortsEnabled) parsedDtlsPort!! else 56000,
+                                    serverWgPort = if (manualPortsEnabled) parsedWgPort!! else 56001,
+                                    localPort = if (manualPortsEnabled) parsedLocalPort!! else 9000,
+                                )
+                            )
+                        },
+                        enabled = canSave,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        FlexibleButtonText("Сохранить подключение", fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(Modifier.height(2.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun UserWdttLinkDialog(
+    linkText: String,
+    onLinkTextChange: (String) -> Unit,
+    onPaste: () -> Unit,
+    onSave: () -> Unit,
+    allowMissingHashes: Boolean,
+    remoteUpdateOnly: Boolean,
+    cachedAction: CachedRemoteAction = CachedRemoteAction.Unavailable,
+    onCachedAction: () -> Unit = {},
+    importedLinkStoredAsManualFields: Boolean,
+    title: String,
+    subtitle: String,
+    onDismiss: () -> Unit,
+) {
+    var showRemoteUpdateHelp by rememberSaveable { mutableStateOf(false) }
+    val remoteDocument = remember(linkText) {
+        RemoteDocumentGateway.extractLink(linkText) != null
+    }
+    val parsed = remember(linkText, allowMissingHashes) {
+        if (remoteUpdateOnly) {
+            null
+        } else {
+            WdttDeepLink.parse(linkText, allowMissingHashes = allowMissingHashes)
+        }
+    }
+    val validation = remember(linkText, allowMissingHashes) {
+        WdttDeepLink.validate(linkText, allowMissingHashes = allowMissingHashes)
+    }
+    val invalid =
+        linkText.isNotBlank() && parsed == null && !remoteDocument
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.92f)
+                    .widthIn(max = 560.dp)
+                    .heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 8.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(22.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                title,
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            if (subtitle.isNotBlank()) {
+                                Text(
+                                    subtitle,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        if (remoteUpdateOnly) {
+                            IconButton(
+                                onClick = { showRemoteUpdateHelp = true },
+                                modifier = Modifier.size(40.dp),
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.HelpOutline,
+                                    contentDescription = "Как обновить маршрут",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(22.dp),
+                                )
+                            }
+                        }
+                        IconButton(onClick = onDismiss) {
+                            Icon(Icons.Default.Close, contentDescription = "Закрыть ввод ссылки")
+                        }
+                    }
+
+                    if (remoteUpdateOnly && cachedAction.available) {
+                        ElevatedCard(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.elevatedCardColors(
+                                containerColor =
+                                    MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+                            ),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                if (cachedAction.title.isNotBlank()) {
+                                    Text(
+                                        cachedAction.title,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    )
+                                }
+                                Text(
+                                    cachedAction.message,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                )
+                                OutlinedButton(
+                                    onClick = onCachedAction,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(14.dp),
+                                ) {
+                                    Icon(
+                                        Icons.AutoMirrored.Filled.OpenInNew,
+                                        contentDescription = null,
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    FlexibleButtonText(
+                                        cachedAction.label.ifBlank { "Открыть другой способ" }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (!remoteUpdateOnly && importedLinkStoredAsManualFields && linkText.isBlank()) {
+                            Text(
+                                "Ссылка принята. Данные сохранены в «Вручную»: там их можно изменить, либо здесь вставить новую ссылку.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        OutlinedTextField(
+                            value = linkText,
+                            onValueChange = onLinkTextChange,
+                            label = {
+                                Text(if (remoteUpdateOnly) "Ссылка обновления" else "Ссылка wdtt://")
+                            },
+                            placeholder = {
+                                Text(if (remoteUpdateOnly) "https://…" else "wdtt://...")
+                            },
+                            minLines = 2,
+                            maxLines = 4,
+                            isError = invalid,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp)
+                        )
+                        if (linkText.isNotBlank()) {
+                        FullWidthFieldMessage(
+                            text = when {
+                                remoteDocument ->
+                                    "Короткая ссылка откроет обновление в WDTT Plus."
+                                remoteUpdateOnly ->
+                                    "Вставьте короткую HTTPS-ссылку обновления."
+                                parsed == null -> validation.userMessage()
+                                validation.canStartVpn -> "Ссылка распознана и готова к подключению."
+                                else -> "Ссылка распознана. VK-хеши можно добавить после сохранения."
+                                },
+                                color = if (invalid) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                        }
+                    }
+
+                    OutlinedButton(
+                        onClick = onPaste,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        FlexibleButtonText("Вставить из буфера")
+                    }
+
+                    Button(
+                        onClick = onSave,
+                        enabled = if (remoteUpdateOnly) {
+                            remoteDocument
+                        } else {
+                            parsed != null || remoteDocument
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        FlexibleButtonText("Сохранить подключение", fontWeight = FontWeight.Bold)
+                    }
+
+                    Text(
+                        if (remoteUpdateOnly) {
+                            "Ссылка предназначена только для этого профиля и устройства — не публикуйте её."
+                        } else {
+                            "Ссылку также можно отправить в WDTT Plus через системное меню «Поделиться». Она содержит пароль подключения — не публикуйте её."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(Modifier.height(2.dp))
+                }
+            }
+        }
+    }
+    if (remoteUpdateOnly && showRemoteUpdateHelp) {
+        RemoteUpdateHelpDialog(
+            cachedAction = cachedAction,
+            onDismiss = { showRemoteUpdateHelp = false },
+        )
+    }
+}
+
+@Composable
+private fun RemoteUpdateHelpDialog(
+    cachedAction: CachedRemoteAction,
+    onDismiss: () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.92f)
+                    .widthIn(max = 540.dp)
+                    .heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 10.dp,
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            cachedAction.helpTitle.ifBlank { "Как обновить маршрут" },
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        IconButton(onClick = onDismiss) {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "Вернуться к обновлению маршрута",
+                            )
+                        }
+                    }
+                    Text(
+                        cachedAction.helpIntro.ifBlank {
+                            ("Обычно профиль обновляется автоматически. Это меню понадобится, "
+                                + "если короткая ссылка не открыла WDTT Plus."
+                            )
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        cachedAction.helpSteps.ifBlank {
+                            ("1. Откройте полученную короткую HTTPS-ссылку на телефоне с "
+                                + "WDTT Plus.\n\n"
+                                + "2. Если приложение не открылось автоматически, скопируйте "
+                                + "эту же ссылку, вставьте её в поле «Ссылка обновления» и "
+                                + "нажмите «Сохранить подключение».\n\n"
+                                + "3. Если доступен другой способ, используйте отдельную кнопку "
+                                + "над полем ссылки."
+                            )
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteActionCard(
+    action: RemoteUiAction,
+    onClick: () -> Unit,
+    onLinkClick: (() -> Unit)? = null,
+    onDismiss: (() -> Unit)? = null,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.48f),
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+        border = BorderStroke(
+            1.dp,
+            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(9.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(9.dp)
+            ) {
+                Icon(Icons.Default.Cloud, contentDescription = null, modifier = Modifier.size(21.dp))
+                Text(
+                    action.title,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                if (onDismiss != null) {
+                    CardDismissButton(
+                        contentDescription = "Скрыть карточку",
+                        onClick = onDismiss,
+                    )
+                }
+            }
+            RemoteActionLinkedText(
+                text = action.compactMessage.ifBlank { action.message },
+                linkText = action.compactLinkText,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.86f),
+                onClick = onLinkClick ?: onClick,
+            )
+            if (action.compactButtonVisible) {
+                OutlinedButton(
+                    onClick = onClick,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 7.dp)
+                ) {
+                    FlexibleButtonText(
+                        action.compactLabel.ifBlank { action.label },
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Icon(
+                        Icons.AutoMirrored.Filled.OpenInNew,
+                        contentDescription = null,
+                        modifier = Modifier.size(17.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteActionLinkedText(
+    text: String,
+    linkText: String,
+    color: Color,
+    onClick: (() -> Unit)?,
+) {
+    val linkStart = text.indexOf(linkText)
+        .takeIf { onClick != null && linkText.isNotBlank() && it >= 0 }
+    if (linkStart == null) {
+        Text(text = text, style = MaterialTheme.typography.bodySmall, color = color)
+        return
+    }
+    val linkColor = MaterialTheme.colorScheme.primary
+    val annotatedText = buildAnnotatedString {
+        append(text.substring(0, linkStart))
+        withLink(
+            LinkAnnotation.Clickable(
+                tag = "remote-action",
+                styles = TextLinkStyles(
+                    style = SpanStyle(
+                        color = linkColor,
+                        fontWeight = FontWeight.SemiBold,
+                        textDecoration = TextDecoration.Underline,
+                    ),
+                    pressedStyle = SpanStyle(color = linkColor.copy(alpha = 0.68f)),
+                ),
+                linkInteractionListener = { onClick?.invoke() },
+            )
+        ) {
+            append(linkText)
+        }
+        append(text.substring(linkStart + linkText.length))
+    }
+    Text(
+        text = annotatedText,
+        style = MaterialTheme.typography.bodySmall,
+        color = color,
+    )
+}
+
+@Composable
+private fun CardDismissButton(
+    contentDescription: String,
+    onClick: () -> Unit,
+) {
+    IconButton(
+        onClick = onClick,
+        modifier = Modifier.size(32.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Default.Close,
+            contentDescription = contentDescription,
+            modifier = Modifier.size(18.dp),
+            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+        )
+    }
+}
+
+@Composable
+private fun DismissedNoticeCard(
+    title: String,
+    message: String,
+    countdown: Int,
+    onProjectSupportClick: (() -> Unit)? = null,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.48f),
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+        border = BorderStroke(
+            1.dp,
+            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(7.dp)
+        ) {
+            Text(
+                title,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold
+            )
+            RemoteActionLinkedText(
+                text = message,
+                linkText = "«Инфо» → «Поддержать проект»",
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.86f),
+                onClick = onProjectSupportClick,
+            )
+            Text(
+                "Карточка исчезнет через $countdown с",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.68f)
+            )
+        }
+    }
+}
+
 // ═══ Модальное окно хешей ═══
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HashesDialog(
+    settingsStore: SettingsStore,
     hash1: String,
     hash2: String,
     hash3: String,
     hash4: String,
     activeFingerprint: String,
     activeClientIds: String,
+    customVkCredentialsEnabled: Boolean,
+    customVkClientId: String,
+    customVkClientSecret: String,
+    remoteContinuation: RemoteContinuation,
+    remoteAction: RemoteUiAction?,
     vkCallsPreflight: Boolean,
     captchaMode: String,
     selectedWebViewManual: Boolean,
+    onOpenProjectSupport: () -> Unit,
     onSave: (String, String, String, String) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var h1 by remember { mutableStateOf(hash1) }
-    var h2 by remember { mutableStateOf(hash2) }
-    var h3 by remember { mutableStateOf(hash3) }
-    var h4 by remember { mutableStateOf(hash4) }
+    var h1 by remember(hash1) { mutableStateOf(hash1) }
+    var h2 by remember(hash2) { mutableStateOf(hash2) }
+    var h3 by remember(hash3) { mutableStateOf(hash3) }
+    var h4 by remember(hash4) { mutableStateOf(hash4) }
     var isChecking by remember { mutableStateOf(false) }
     var checkJob by remember { mutableStateOf<Job?>(null) }
+    var isRemoteActionRunning by remember { mutableStateOf(false) }
+    var remoteActionJob by remember { mutableStateOf<Job?>(null) }
+    var remoteActionMessage by rememberSaveable { mutableStateOf<String?>(null) }
+    var remoteActionHasError by rememberSaveable { mutableStateOf(false) }
+    var bulkPasteMessage by rememberSaveable { mutableStateOf<String?>(null) }
+    var bulkPasteHasError by rememberSaveable { mutableStateOf(false) }
+    var pendingBulkPasteHashes by remember { mutableStateOf<PendingBulkVkHashes?>(null) }
+    var showRemoteActionInfo by rememberSaveable { mutableStateOf(false) }
+    var showHashesHelp by rememberSaveable { mutableStateOf(false) }
     var checkResults by remember { mutableStateOf<Map<Int, HashCheckResult>>(emptyMap()) }
     var detailSlot by remember { mutableStateOf<Int?>(null) }
     val dialogScrollState = rememberScrollState()
@@ -1377,9 +3157,21 @@ fun HashesDialog(
     }
     val checkableHashes = remember(currentHashes) {
         currentHashes.mapIndexedNotNull { index, hash ->
-            if (hash.length >= 16) index + 1 to hash else null
+            if (VkJoinLink.isValidHash(hash)) index + 1 to hash else null
         }
     }
+    val dialogHashErrors = remember(currentHashes) {
+        buildList {
+            currentHashes.forEachIndexed { index, hash ->
+                if (hash.isNotBlank() && !VkJoinLink.isValidHash(hash)) {
+                    add("VK Хеш ${index + 1} имеет неверный формат")
+                }
+            }
+            val filled = currentHashes.filter(VkJoinLink::isValidHash)
+            if (filled.size != filled.distinct().size) add("Есть дубликаты VK-хешей")
+        }
+    }
+    val canSaveHashes = dialogHashErrors.isEmpty()
     val completedChecks = checkResults.values.count { it.status !in setOf("pending", "checking", "solving_captcha") }
     val currentCheckSlot = checkResults.entries.firstOrNull { it.value.status in setOf("checking", "solving_captcha") }?.key
     val detailResult = detailSlot?.let { slot -> checkResults[slot]?.let { slot to it } }
@@ -1397,14 +3189,165 @@ fun HashesDialog(
             }
         }
     }
+    fun cancelRemoteAction(updateUi: Boolean = true) {
+        remoteActionJob?.cancel(CancellationException("Remote action cancelled by user"))
+        remoteActionJob = null
+        isRemoteActionRunning = false
+        if (updateUi) {
+            remoteActionMessage = remoteAction?.cancelledMessage
+                ?.takeIf { it.isNotBlank() }
+                ?: "Действие остановлено."
+        }
+    }
+    fun applyBulkHashes(
+        hashes: List<String>,
+        mode: BulkVkHashPasteMode
+    ) {
+        val result = mergeBulkVkHashes(
+            existingSlots = listOf(h1, h2, h3, h4),
+            incomingHashes = hashes,
+            mode = mode
+        )
+        h1 = result.slots[0]
+        h2 = result.slots[1]
+        h3 = result.slots[2]
+        h4 = result.slots[3]
+        bulkPasteHasError = when (mode) {
+            BulkVkHashPasteMode.ReplaceAll -> result.insertedCount < 4
+            BulkVkHashPasteMode.FillEmpty -> result.insertedCount == 0
+        }
+        bulkPasteMessage = when (mode) {
+            BulkVkHashPasteMode.ReplaceAll -> {
+                if (result.insertedCount == 4) {
+                    "Готово: все четыре поля перезаписаны из буфера обмена."
+                } else {
+                    "Перезаписал поля: найдено ${result.insertedCount} ${result.insertedCount.hashPlural()}."
+                }
+            }
+            BulkVkHashPasteMode.FillEmpty -> {
+                when {
+                    result.insertedCount == 0 ->
+                        "Пустых мест для новых хешей нет или все найденные хеши уже были в полях."
+                    result.skippedCount > 0 ->
+                        "Заполнил ${result.insertedCount} ${result.insertedCount.hashPlural()} в пустых полях, ${result.skippedCount} пропущено."
+                    else ->
+                        "Заполнил ${result.insertedCount} ${result.insertedCount.hashPlural()} в пустых полях."
+                }
+            }
+        }
+        pendingBulkPasteHashes = null
+    }
+    fun startRemoteAction() {
+        cancelHashCheck()
+        remoteActionJob?.cancel(CancellationException("Restarting remote action"))
+        if (!remoteContinuation.available) {
+            isRemoteActionRunning = false
+            remoteActionHasError = true
+            remoteActionMessage = remoteAction?.message
+                ?.takeIf { it.isNotBlank() }
+                ?: remoteContinuation.message.takeIf { it.isNotBlank() }
+                ?: "Автоматическое заполнение недоступно. Данные можно добавить вручную."
+            return
+        }
+        remoteActionJob = scope.launch {
+            val runningJob = coroutineContext[Job]
+            isRemoteActionRunning = true
+            remoteActionHasError = false
+            remoteActionMessage = remoteAction?.preparingMessage
+                ?.takeIf { it.isNotBlank() }
+                ?: "Подготавливаю переход..."
+            try {
+                if (
+                    TunnelManager.running.value ||
+                    TunnelManager.transition.value != TunnelTransition.IDLE
+                ) {
+                    remoteActionMessage = remoteAction?.stoppingMessage
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "Останавливаю VPN перед продолжением..."
+                }
+                val stopResult = TunnelStopCoordinator.stopAndAwait(context)
+                if (!stopResult.succeeded) {
+                    throw IllegalStateException(
+                        if (stopResult == TunnelStopResult.TIMED_OUT) {
+                            "VPN не остановился за 20 секунд. Повторите попытку."
+                        } else {
+                            "Не удалось запросить остановку VPN. Остановите туннель и повторите попытку."
+                        }
+                    )
+                }
+                if (stopResult == TunnelStopResult.STOPPED) {
+                    delay(TunnelStopCoordinator.DIRECT_NETWORK_SETTLE_MS)
+                }
+                remoteActionMessage = remoteAction?.openingMessage
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "Открываю продолжение..."
+                val target = RemoteContinuationLauncher.begin(
+                    capability = remoteContinuation,
+                    device = settingsStore.getOrCreateConnectDeviceId()
+                )
+                try {
+                    launchRemoteTarget(context, target)
+                } catch (error: Exception) {
+                    throw IllegalStateException(
+                        error.message
+                            ?: "Не удалось открыть страницу. Проверьте доступные приложения и браузер."
+                    )
+                }
+                remoteActionMessage = remoteAction?.successMessage
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "Страница открыта. Завершите действие и вернитесь в WDTT Plus."
+            } catch (cancelled: CancellationException) {
+                remoteActionMessage = remoteAction?.cancelledMessage
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "Действие остановлено."
+            } catch (error: Exception) {
+                remoteActionHasError = true
+                remoteActionMessage = error.message
+                    ?: remoteAction?.failureMessage?.takeIf { it.isNotBlank() }
+                    ?: "Не удалось выполнить действие."
+            } finally {
+                if (remoteActionJob === runningJob) {
+                    isRemoteActionRunning = false
+                }
+                if (remoteActionJob === runningJob) {
+                    remoteActionJob = null
+                }
+            }
+        }
+    }
+    fun pasteHashesFromClipboard() {
+        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val raw = clipboard.primaryClip
+            ?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)
+            ?.coerceToText(context)
+            ?.toString()
+            .orEmpty()
+        val hashes = parseBulkVkHashes(raw)
+        if (hashes.isEmpty()) {
+            bulkPasteHasError = true
+            bulkPasteMessage = "В буфере обмена не нашёл VK-хеши или ссылки VK Звонков."
+            return
+        }
+        val hasExistingHashes = listOf(h1, h2, h3, h4)
+            .map { stripVkUrlStatic(it) }
+            .any(VkJoinLink::isValidHash)
+        if (hasExistingHashes) {
+            pendingBulkPasteHashes = PendingBulkVkHashes(hashes)
+        } else {
+            applyBulkHashes(hashes, BulkVkHashPasteMode.ReplaceAll)
+        }
+    }
     fun closeDialog() {
         cancelHashCheck()
+        cancelRemoteAction(updateUi = false)
         onDismiss()
     }
 
     DisposableEffect(Unit) {
         onDispose {
             cancelHashCheck(updateUi = false)
+            cancelRemoteAction(updateUi = false)
         }
     }
 
@@ -1428,6 +3371,127 @@ fun HashesDialog(
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
                 ) {
                     FlexibleButtonText("Понятно")
+                }
+            }
+        )
+    }
+
+    if (showRemoteActionInfo) {
+        AlertDialog(
+            onDismissRequest = { showRemoteActionInfo = false },
+            title = {
+                Text(
+                    remoteAction?.confirmationTitle
+                        ?.takeIf { it.isNotBlank() }
+                        ?: remoteAction?.title?.takeIf { it.isNotBlank() }
+                        ?: "Получение VK-хешей",
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    (
+                        remoteAction?.confirmationMessage
+                            ?.takeIf { it.isNotBlank() }
+                            ?: remoteAction?.message?.takeIf { it.isNotBlank() }
+                            ?: "Продолжите действие на открывшейся странице."
+                        )
+                        .split("\n\n")
+                        .filter { it.isNotBlank() }
+                        .forEach { paragraph -> Text(paragraph) }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showRemoteActionInfo = false
+                        startRemoteAction()
+                    },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    FlexibleButtonText(
+                        remoteAction?.confirmationLabel
+                            ?.takeIf { it.isNotBlank() }
+                            ?: remoteAction?.label?.takeIf { it.isNotBlank() }
+                            ?: "Получить 4 хеша через VK",
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showRemoteActionInfo = false },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    FlexibleButtonText("Отмена")
+                }
+            }
+        )
+    }
+
+    pendingBulkPasteHashes?.let { pending ->
+        val hashes = pending.hashes
+        val titleText = "Вставить хеши из буфера?"
+        val sourceText = "В буфере найдено"
+        AlertDialog(
+            onDismissRequest = { pendingBulkPasteHashes = null },
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(titleText)
+                    IconButton(
+                        onClick = { pendingBulkPasteHashes = null },
+                        modifier = Modifier.size(42.dp)
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Default.Close,
+                                    contentDescription = "Отмена",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("В полях уже есть сохранённые хеши. $sourceText ${hashes.size} ${hashes.size.hashPlural()}.")
+                    Text("«Заполнить пустые» сохранит уже заполненные поля и вставит новые хеши только в свободные места.")
+                    Text(
+                        if (hashes.size >= 4) {
+                            "«Перезаписать все 4» полностью заменит текущие четыре поля хешами из буфера."
+                        } else {
+                            "«Перезаписать» заменит поля найденными хешами, а оставшиеся позиции очистит."
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { applyBulkHashes(hashes, BulkVkHashPasteMode.ReplaceAll) },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    FlexibleButtonText(
+                        if (hashes.size >= 4) "Перезаписать все 4" else "Перезаписать",
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { applyBulkHashes(hashes, BulkVkHashPasteMode.FillEmpty) },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    FlexibleButtonText("Заполнить пустые")
                 }
             }
         )
@@ -1469,9 +3533,45 @@ fun HashesDialog(
                             Icon(Icons.Default.Tag, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(24.dp))
                             Spacer(Modifier.width(8.dp))
                             Text("VK Хеши", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.width(4.dp))
+                            IconButton(
+                                onClick = { showHashesHelp = true },
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Surface(
+                                    shape = CircleShape,
+                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f),
+                                    modifier = Modifier.size(28.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            Icons.AutoMirrored.Filled.HelpOutline,
+                                            contentDescription = "Как получить VK-хеши",
+                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
                         }
-                        IconButton(onClick = { closeDialog() }) {
-                            Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                        IconButton(
+                            onClick = { closeDialog() },
+                            modifier = Modifier.size(44.dp)
+                        ) {
+                            Surface(
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.78f),
+                                modifier = Modifier.size(34.dp)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        Icons.Default.Close,
+                                        contentDescription = "Закрыть",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -1479,6 +3579,10 @@ fun HashesDialog(
                         text = if (isChecking) {
                             val current = currentCheckSlot?.let { " Сейчас: VK Хеш $it." } ?: ""
                             "Проверено $completedChecks из ${checkableHashes.size}.$current"
+                        } else if (isRemoteActionRunning) {
+                            remoteActionMessage
+                                ?: remoteAction?.progressLabel?.takeIf { it.isNotBlank() }
+                                ?: "Выполняется…"
                         } else {
                             "Больше хешей — выше лимит потоков и лучшее распределение нагрузки."
                         },
@@ -1487,8 +3591,66 @@ fun HashesDialog(
                         modifier = Modifier.padding(bottom = 4.dp)
                     )
 
+                    remoteActionMessage?.takeIf { it.isNotBlank() && !isRemoteActionRunning }?.let { message ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp),
+                            color = if (remoteActionHasError) {
+                                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f)
+                            } else {
+                                MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+                            },
+                            contentColor = if (remoteActionHasError) {
+                                MaterialTheme.colorScheme.onErrorContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSecondaryContainer
+                            }
+                        ) {
+                            Text(
+                                text = message,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+
+                    OutlinedButton(
+                        onClick = { pasteHashesFromClipboard() },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        enabled = !isChecking && !isRemoteActionRunning,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                    ) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        FlexibleButtonText("Вставить хеши из буфера", fontWeight = FontWeight.SemiBold)
+                    }
+
+                    bulkPasteMessage?.takeIf { it.isNotBlank() }?.let { message ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp),
+                            color = if (bulkPasteHasError) {
+                                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.62f)
+                            } else {
+                                MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.48f)
+                            },
+                            contentColor = if (bulkPasteHasError) {
+                                MaterialTheme.colorScheme.onErrorContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSecondaryContainer
+                            }
+                        ) {
+                            Text(
+                                text = message,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+
                 listOf(
-                    Triple("VK Хеш 1 *", h1) { v: String -> h1 = v },
+                    Triple("VK Хеш 1", h1) { v: String -> h1 = v },
                     Triple("VK Хеш 2", h2) { v: String -> h2 = v },
                     Triple("VK Хеш 3", h3) { v: String -> h3 = v },
                     Triple("VK Хеш 4", h4) { v: String -> h4 = v }
@@ -1506,7 +3668,12 @@ fun HashesDialog(
                         result = checkResults[slot],
                         onInfoClick = { detailSlot = slot },
                         canCopy = cleanedValue.isNotBlank(),
-                        onCopyClick = { copyVkHashesToClipboard(context, "VK Хеш $slot", cleanedValue) }
+                        onCopyClick = { copyVkHashesToClipboard(context, "VK Хеш $slot", cleanedValue) },
+                        canClear = value.isNotBlank(),
+                        onClearClick = {
+                            onChange("")
+                            checkResults = checkResults - slot
+                        }
                     )
                 }
 
@@ -1520,6 +3687,72 @@ fun HashesDialog(
                     Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
                     FlexibleButtonText("Скопировать все хеши", fontWeight = FontWeight.SemiBold)
+                }
+
+                if (remoteContinuation.available) {
+                    OutlinedButton(
+                        onClick = { showRemoteActionInfo = true },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        enabled = !isChecking && !isRemoteActionRunning,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                    ) {
+                        if (isRemoteActionRunning) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            FlexibleButtonText(
+                                remoteAction?.progressLabel
+                                    ?.takeIf { it.isNotBlank() }
+                                    ?: "Выполняется…",
+                            )
+                        } else {
+                            Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            FlexibleButtonText(
+                                remoteAction?.label
+                                    ?.takeIf { it.isNotBlank() }
+                                    ?: "Получить 4 хеша через VK",
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+                } else if (remoteAction != null) {
+                    RemoteActionCard(
+                        action = remoteAction,
+                        onLinkClick = {
+                            closeDialog()
+                            onOpenProjectSupport()
+                        },
+                        onClick = {
+                            scope.launch {
+                                val opened = RemoteUiActionLauncher.open(context, remoteAction)
+                                if (!opened) {
+                                    Toast.makeText(
+                                        context,
+                                        "Не удалось открыть страницу. Проверьте браузер.",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                            }
+                        },
+                    )
+                }
+
+                if (isRemoteActionRunning) {
+                    TextButton(
+                        onClick = { cancelRemoteAction() },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                    ) {
+                        FlexibleButtonText(
+                            remoteAction?.cancelLabel?.takeIf { it.isNotBlank() } ?: "Остановить",
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
                 }
 
                 OutlinedButton(
@@ -1536,6 +3769,9 @@ fun HashesDialog(
                                     hashes = checkableHashes,
                                     fingerprint = activeFingerprint,
                                     clientIds = activeClientIds,
+                                    customVkCredentialsEnabled = customVkCredentialsEnabled,
+                                    customVkClientId = customVkClientId,
+                                    customVkClientSecret = customVkClientSecret,
                                     vkCallsPreflight = vkCallsPreflight,
                                     captchaMode = captchaMode,
                                     selectedWebViewManual = selectedWebViewManual,
@@ -1588,6 +3824,14 @@ fun HashesDialog(
                     }
                 }
 
+                dialogHashErrors.firstOrNull()?.let { error ->
+                    Text(
+                        text = error,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
                 Button(
                     onClick = {
                         cancelHashCheck()
@@ -1595,7 +3839,7 @@ fun HashesDialog(
                     },
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                     shape = RoundedCornerShape(16.dp),
-                    enabled = h1.isNotBlank() && h1.length >= 16,
+                    enabled = canSaveHashes,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
                 ) {
@@ -1604,7 +3848,243 @@ fun HashesDialog(
             }
         }
     }
+
+    if (showHashesHelp) {
+        VkHashesInstructionDialog(
+            remoteAction = remoteAction,
+            onOpenProjectSupport = {
+                showHashesHelp = false
+                closeDialog()
+                onOpenProjectSupport()
+            },
+            onDismiss = { showHashesHelp = false },
+        )
+    }
 }
+}
+
+@Composable
+private fun VkHashesInstructionDialog(
+    remoteAction: RemoteUiAction?,
+    onOpenProjectSupport: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.96f)
+                    .widthIn(max = 680.dp)
+                    .heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 8.dp
+            ) {
+                Box {
+                    Column(
+                        modifier = Modifier
+                            .padding(22.dp)
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(end = 44.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Surface(
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.primaryContainer,
+                                modifier = Modifier.size(38.dp)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        Icons.AutoMirrored.Filled.HelpOutline,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                }
+                            }
+                            Text(
+                                "Как получить VK-хеши",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f),
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                    ) {
+                        Text(
+                            "VK-хеш не нужно вычислять: это часть ссылки-приглашения в групповой звонок VK.",
+                            modifier = Modifier.padding(14.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    Text(
+                        "Самый простой способ",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    VkHashInstructionStep(1, "Откройте приложение VK или VK Звонки.")
+                    VkHashInstructionStep(2, "Создайте либо откройте групповой звонок.")
+                    VkHashInstructionStep(3, "Нажмите приглашение участников и выберите «Поделиться ссылкой».")
+                    VkHashInstructionStep(4, "В системном меню Android выберите WDTT Plus.")
+                    VkHashInstructionStep(5, "Приложение извлечёт хэш и добавит его в первое свободное поле активного профиля.")
+                    VkHashInstructionStep(6, "Для дополнительных хэшей повторите действия с другими звонками. Можно использовать до четырёх хэшей.")
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                    Text(
+                        "Как добавить вручную",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "Скопируйте ссылку из VK Звонков и вставьте её целиком в поле либо нажмите «Вставить хеши из буфера».",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                "https://vk.ru/call/join/AbCdEf123456789",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "Хэш — часть после /join/:",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                "AbCdEf123456789",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                    Text(
+                        "Параметр ?from=share необязателен. Если после хэша есть знак ? или #, он и всё после него в хэш не входят. Поддерживаются ссылки vk.ru и vk.com.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f),
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text("Важно", fontWeight = FontWeight.Bold)
+                            Text(
+                                "Не выбирайте «Завершить для всех»: после закрытия комнаты ссылка может перестать работать. Можно просто выйти из звонка — постоянно оставаться в нём не требуется.",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+
+                    if (remoteAction != null) {
+                        RemoteActionCard(
+                            action = remoteAction,
+                            onLinkClick = onOpenProjectSupport,
+                            onClick = {
+                                scope.launch {
+                                    RemoteUiActionLauncher.open(context, remoteAction)
+                                }
+                            },
+                        )
+                    }
+
+                    Spacer(Modifier.height(4.dp))
+                }
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 10.dp)
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.78f),
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Default.Close,
+                                    contentDescription = "Вернуться к настройке VK-хешей",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun VkHashInstructionStep(number: Int, text: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.primaryContainer,
+            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+            modifier = Modifier.size(28.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    number.toString(),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+        Text(
+            text,
+            modifier = Modifier.weight(1f).padding(top = 3.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
 }
 
 private data class HashCheckResult(
@@ -1622,13 +4102,15 @@ private fun HashInputField(
     result: HashCheckResult?,
     onInfoClick: () -> Unit,
     canCopy: Boolean,
-    onCopyClick: () -> Unit
+    onCopyClick: () -> Unit,
+    canClear: Boolean,
+    onClearClick: () -> Unit
 ) {
-    val isShort = value.isNotBlank() && value.length < 16
+    val isInvalid = value.isNotBlank() && !VkJoinLink.isValidHash(value)
     val visibleResult = result?.takeIf { it.status != "pending" }
     val statusColor = visibleResult?.let { hashStatusColor(it.status) }
     val borderColor = when {
-        isShort -> MaterialTheme.colorScheme.error
+        isInvalid -> MaterialTheme.colorScheme.error
         statusColor != null -> statusColor
         else -> MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)
     }
@@ -1636,27 +4118,35 @@ private fun HashInputField(
         ?.takeIf { it.status in setOf("checking", "solving_captcha") }
         ?.message
 
-    OutlinedTextField(
-        value = value,
-        onValueChange = onValueChange,
-        label = { Text(label) },
-        placeholder = { Text("Ссылка звонка или хеш") },
-        singleLine = true,
-        isError = isShort,
-        supportingText = when {
-            isShort -> {
-                { Text("Хеш $slot — короткий (мин. 16)", color = MaterialTheme.colorScheme.error) }
-            }
-            progressMessage != null -> {
-                { Text(progressMessage, color = borderColor) }
-            }
-            else -> null
-        },
-        trailingIcon = {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            label = { Text(label) },
+            placeholder = { Text("Ссылка звонка или хеш") },
+            singleLine = true,
+            isError = isInvalid,
+            trailingIcon = {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(2.dp)
             ) {
+                if (canClear) {
+                    IconButton(
+                        onClick = onClearClick,
+                        modifier = Modifier.size(34.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Очистить VK Хеш $slot",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
                 IconButton(
                     onClick = onCopyClick,
                     enabled = canCopy,
@@ -1692,25 +4182,38 @@ private fun HashInputField(
                     }
                 }
             }
-        },
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = borderColor,
-            unfocusedBorderColor = borderColor,
-            errorBorderColor = MaterialTheme.colorScheme.error,
-            focusedLabelColor = borderColor,
-            cursorColor = MaterialTheme.colorScheme.primary
+            },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = borderColor,
+                unfocusedBorderColor = borderColor,
+                errorBorderColor = MaterialTheme.colorScheme.error,
+                focusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                errorLabelColor = MaterialTheme.colorScheme.error,
+                cursorColor = MaterialTheme.colorScheme.primary
+            )
         )
-    )
+        when {
+            isInvalid -> FullWidthFieldMessage(
+                text = "Хеш $slot имеет неверный формат",
+                color = MaterialTheme.colorScheme.error
+            )
+            progressMessage != null -> FullWidthFieldMessage(
+                text = progressMessage,
+                color = borderColor
+            )
+        }
+    }
 }
 
 @Composable
 private fun hashStatusColor(status: String): Color {
     return when (status) {
         "ok" -> WDTTColors.connected
-        "dead" -> MaterialTheme.colorScheme.error
-        "captcha", "solving_captcha", "limited", "network" -> WDTTColors.warning
+        "dead", "blocked" -> MaterialTheme.colorScheme.error
+        "full", "captcha", "solving_captcha", "limited", "network" -> WDTTColors.warning
         "checking" -> MaterialTheme.colorScheme.primary
         "pending" -> MaterialTheme.colorScheme.outline
         "cancelled" -> MaterialTheme.colorScheme.outline
@@ -1722,6 +4225,8 @@ private fun hashStatusLabel(status: String): String {
     return when (status) {
         "ok" -> "живой"
         "dead" -> "закрыт"
+        "blocked" -> "вход запрещён"
+        "full" -> "заполнен"
         "captcha" -> "капча"
         "solving_captcha" -> "решаем капчу"
         "limited" -> "лимит VK"
@@ -1771,12 +4276,18 @@ private suspend fun checkVkHashes(
     hashes: List<Pair<Int, String>>,
     fingerprint: String,
     clientIds: String,
+    customVkCredentialsEnabled: Boolean,
+    customVkClientId: String,
+    customVkClientSecret: String,
     vkCallsPreflight: Boolean,
     captchaMode: String,
     selectedWebViewManual: Boolean,
     onUpdate: (Int, HashCheckResult) -> Unit
 ): Map<Int, HashCheckResult> = withContext(Dispatchers.IO) {
     if (hashes.isEmpty()) return@withContext emptyMap()
+    if (customVkCredentialsEnabled && (!isValidVkClientId(customVkClientId) || customVkClientSecret.isBlank())) {
+        error("Заполните Client ID и Client secret в настройках собственных резервных реквизитов")
+    }
     val binaryPath = context.applicationInfo.nativeLibraryDir + "/libclient.so"
     val command = mutableListOf(
         binaryPath,
@@ -1787,10 +4298,7 @@ private suspend fun checkVkHashes(
         captchaMode,
         "-vkcalls-preflight=$vkCallsPreflight",
         "-device-id",
-        android.provider.Settings.Secure.getString(
-            context.contentResolver,
-            android.provider.Settings.Secure.ANDROID_ID
-        ) ?: "unknown"
+        SettingsStore(context).getOrCreateTunnelDeviceId()
     )
     if (fingerprint.isNotBlank()) {
         command += listOf("-fingerprint", fingerprint)
@@ -1803,6 +4311,13 @@ private suspend fun checkVkHashes(
         .redirectErrorStream(true)
         .apply {
             environment()["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
+            if (customVkCredentialsEnabled) {
+                environment()["WDTT_CUSTOM_VK_CLIENT_ID"] = customVkClientId
+                environment()["WDTT_CUSTOM_VK_CLIENT_SECRET"] = customVkClientSecret
+            } else {
+                environment().remove("WDTT_CUSTOM_VK_CLIENT_ID")
+                environment().remove("WDTT_CUSTOM_VK_CLIENT_SECRET")
+            }
         }
         .start()
 
@@ -1963,6 +4478,8 @@ private fun hashStatusMessage(status: String): String {
     return when (status) {
         "ok" -> "Хеш работает, TURN-креды получены"
         "dead" -> "Звонок не найден или закрыт"
+        "blocked" -> "Звонок существует, но в нём запрещён анонимный вход"
+        "full" -> "Звонок существует, но сейчас в нём нет свободных мест"
         "captcha" -> "VK запросил капчу, но решить её не удалось"
         "limited" -> "VK временно ограничил запросы"
         "network" -> "Сетевая ошибка при проверке"
@@ -1976,6 +4493,10 @@ private fun hashStatusMessage(status: String): String {
 @Composable
 fun SecretsDialog(
     settingsStore: SettingsStore,
+    title: String = "Секреты",
+    passwordLabel: String = "Заданный пароль туннеля",
+    passwordPlaceholder: String = "Придумайте надежный пароль",
+    allowPortsSelection: Boolean = false,
     initialPassword: String,
     manualPortsEnabled: Boolean,
     initialServerDtlsPort: String,
@@ -1990,6 +4511,7 @@ fun SecretsDialog(
     var serverDtlsPort by rememberSaveable { mutableStateOf(initialServerDtlsPort.ifBlank { "56000" }) }
     var serverWgPort by rememberSaveable { mutableStateOf(initialServerWgPort.ifBlank { "56001" }) }
     var localPort by rememberSaveable { mutableStateOf(initialLocalPort.ifBlank { "9000" }) }
+    var portsEnabled by rememberSaveable { mutableStateOf(manualPortsEnabled) }
 
     fun normalizePort(value: String, fallback: String): String {
         return value.toIntOrNull()?.takeIf { it in 1..65535 }?.toString() ?: fallback
@@ -2023,7 +4545,7 @@ fun SecretsDialog(
                                 modifier = Modifier.size(24.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Секреты", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         }
                         IconButton(onClick = onDismiss) {
                             Icon(imageVector = Icons.Default.Close, contentDescription = "Закрыть")
@@ -2034,24 +4556,59 @@ fun SecretsDialog(
 
                 val isPasswordValid = passwordInput.isNotEmpty() && passwordInput.matches(Regex("^[a-zA-Z0-9_.!?:#/-]+$"))
 
-                OutlinedTextField(
-                    value = passwordInput,
-                    onValueChange = { passwordInput = it.filter { c -> !c.isWhitespace() } },
-                    label = { Text("Заданный пароль туннеля") },
-                    placeholder = { Text("Придумайте надежный пароль") },
-                    singleLine = true,
-                    isError = passwordInput.isNotEmpty() && !isPasswordValid,
-                    supportingText = if (passwordInput.isNotEmpty() && !isPasswordValid) {
-                        { Text("Разрешены только буквы, цифры и знаки . ! ? : # - _ /", color = MaterialTheme.colorScheme.error) }
-                    } else null,
-                    visualTransformation = if (passwordFocused) VisualTransformation.None else PasswordVisualTransformation(),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .onFocusChanged { passwordFocused = it.isFocused },
-                    shape = RoundedCornerShape(16.dp),
-                )
+                val passwordInvalid = passwordInput.isNotEmpty() && !isPasswordValid
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    OutlinedTextField(
+                        value = passwordInput,
+                        onValueChange = { passwordInput = it.filter { c -> !c.isWhitespace() } },
+                        label = { Text(passwordLabel) },
+                        placeholder = { Text(passwordPlaceholder) },
+                        singleLine = true,
+                        isError = passwordInvalid,
+                        visualTransformation = if (passwordFocused) VisualTransformation.None else PasswordVisualTransformation(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .onFocusChanged { passwordFocused = it.isFocused },
+                        shape = RoundedCornerShape(16.dp),
+                    )
+                    if (passwordInvalid) {
+                        FullWidthFieldMessage(
+                            text = "Разрешены только буквы, цифры и знаки . ! ? : # - _ /",
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
 
-                if (manualPortsEnabled) {
+                if (allowPortsSelection) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text(
+                                "Нестандартные порты",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "Включите, если владелец сервера выдал порты, отличающиеся от стандартных.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = portsEnabled,
+                            onCheckedChange = { portsEnabled = it }
+                        )
+                    }
+                }
+
+                if (portsEnabled) {
                     Spacer(modifier = Modifier.height(16.dp))
                     HorizontalDivider()
                     Spacer(modifier = Modifier.height(8.dp))
@@ -2100,6 +4657,9 @@ fun SecretsDialog(
                             val finalLocal = normalizePort(localPort, "9000")
                             scope.launch {
                                 settingsStore.saveConnectionPassword(passwordInput)
+                                if (allowPortsSelection) {
+                                    settingsStore.saveManualPortsEnabled(portsEnabled)
+                                }
                                 settingsStore.savePorts(finalDtls.toInt(), finalWg.toInt(), finalLocal.toInt())
                                 onSaved(finalDtls, finalWg, finalLocal)
                                 onDismiss()

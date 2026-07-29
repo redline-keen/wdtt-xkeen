@@ -2,6 +2,8 @@ package com.wdtt.plus
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import androidx.core.content.FileProvider
@@ -33,8 +35,16 @@ private const val UPDATE_CHECK_TOTAL_TIMEOUT_MS = 25_000L
 private const val UPDATE_CHECK_REQUEST_TIMEOUT_MS = 6_000L
 private const val UPDATE_CHECK_MIN_REQUEST_TIMEOUT_MS = 1_000L
 private const val UPDATE_APK_HASH_TIMEOUT_MS = 4_000L
+private const val MAX_UPDATE_APK_BYTES = 200L * 1024L * 1024L
+private const val MAX_UPDATE_METADATA_BYTES = 1024 * 1024
+private const val MAX_UPDATE_WEB_BYTES = 512 * 1024
+private const val MAX_UPDATE_REDIRECTS = 5
 private const val GITHUB_API_RATE_LIMIT_FALLBACK_MS = 30L * 60L * 1000L
 private val SIMPLE_VERSION_TAG_REGEX = Regex("^v?(\\d+)$", RegexOption.IGNORE_CASE)
+private val TRUSTED_UPDATE_ASSET_HOSTS = setOf(
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
 
 @Volatile
 private var githubApiCooldownUntilMs = 0L
@@ -185,7 +195,12 @@ suspend fun resolveAppUpdateCandidate(
 
 fun selectUpdateApkAsset(release: AppReleaseInfo): AppReleaseAsset? {
     val apkAssets = release.assets
-        .filter { it.name.endsWith(".apk", ignoreCase = true) && it.downloadUrl.isNotBlank() }
+        .filter {
+            it.name.endsWith(".apk", ignoreCase = true) &&
+                it.sha256 != null &&
+                it.sizeBytes in 1..MAX_UPDATE_APK_BYTES &&
+                isTrustedUpdateDownloadUrl(it.downloadUrl, initialRequest = true)
+        }
     if (apkAssets.isEmpty()) return null
 
     Build.SUPPORTED_ABIS.orEmpty().forEach { abi ->
@@ -201,6 +216,14 @@ suspend fun downloadUpdateApk(
     asset: AppReleaseAsset,
     onProgress: suspend (AppUpdateDownloadProgress) -> Unit = {}
 ): File = withContext(Dispatchers.IO) {
+    val expectedSha256 = asset.sha256
+        ?: throw SecurityException("Для APK отсутствует обязательный SHA-256.")
+    require(asset.sizeBytes in 1..MAX_UPDATE_APK_BYTES) {
+        "Размер APK отсутствует или превышает безопасный лимит."
+    }
+    require(isTrustedUpdateDownloadUrl(asset.downloadUrl, initialRequest = true)) {
+        "Адрес APK не принадлежит официальному выпуску WDTT Plus."
+    }
     val appContext = context.applicationContext
     val updatesDir = File(appContext.cacheDir, "updates").apply { mkdirs() }
     updatesDir.listFiles()?.forEach { file ->
@@ -217,28 +240,58 @@ suspend fun downloadUpdateApk(
     }
 
     try {
-        conn = URL(asset.downloadUrl).openConnection() as HttpURLConnection
-        applyNoCacheHeaders(conn)
-        conn.instanceFollowRedirects = true
-        conn.requestMethod = "GET"
-        conn.setRequestProperty("Accept", "application/vnd.android.package-archive,application/octet-stream,*/*")
-        conn.setRequestProperty("User-Agent", "WDTTAndroid/${BuildConfig.VERSION_NAME}")
-        conn.connectTimeout = 15_000
-        conn.readTimeout = 30_000
-
-        val responseCode = conn.responseCode
+        var currentUrl = URL(asset.downloadUrl)
+        var responseCode = 0
+        for (redirect in 0..MAX_UPDATE_REDIRECTS) {
+            val currentConnection = currentUrl.openConnection() as HttpURLConnection
+            conn = currentConnection
+            applyNoCacheHeaders(currentConnection)
+            currentConnection.instanceFollowRedirects = false
+            currentConnection.requestMethod = "GET"
+            currentConnection.setRequestProperty(
+                "Accept",
+                "application/vnd.android.package-archive,application/octet-stream",
+            )
+            currentConnection.setRequestProperty(
+                "User-Agent",
+                "WDTTAndroid/${BuildConfig.VERSION_NAME}",
+            )
+            currentConnection.connectTimeout = 15_000
+            currentConnection.readTimeout = 30_000
+            responseCode = currentConnection.responseCode
+            if (responseCode !in 300..399) break
+            val location = currentConnection.getHeaderField("Location")
+                ?.takeIf { it.isNotBlank() }
+                ?: throw IOException("GitHub вернул перенаправление без адреса.")
+            if (redirect >= MAX_UPDATE_REDIRECTS) {
+                throw IOException("GitHub вернул слишком много перенаправлений.")
+            }
+            val nextUrl = URL(currentUrl, location)
+            require(isTrustedUpdateDownloadUrl(nextUrl.toString(), initialRequest = false)) {
+                "GitHub перенаправил загрузку на недоверенный адрес."
+            }
+            currentConnection.disconnect()
+            conn = null
+            currentUrl = nextUrl
+        }
+        val activeConnection = conn ?: throw IOException("Не удалось открыть загрузку APK.")
         if (responseCode !in 200..299) {
             throw IOException("GitHub вернул HTTP $responseCode при скачивании APK")
         }
 
-        val total = asset.sizeBytes.takeIf { it > 0L }
-            ?: conn.contentLengthLong.takeIf { it > 0L }
-            ?: 0L
+        val responseLength = activeConnection.contentLengthLong
+        if (responseLength > MAX_UPDATE_APK_BYTES) {
+            throw IOException("APK превышает безопасный лимит размера.")
+        }
+        if (responseLength > 0L && responseLength != asset.sizeBytes) {
+            throw IOException("Размер APK не совпал с данными выпуска.")
+        }
+        val total = asset.sizeBytes
         var downloaded = 0L
         var lastEmitAt = 0L
         emit(0L, total)
 
-        conn.inputStream.use { input ->
+        activeConnection.inputStream.use { input ->
             outputFile.outputStream().use { output ->
                 val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                 while (true) {
@@ -246,6 +299,9 @@ suspend fun downloadUpdateApk(
                     if (read < 0) break
                     output.write(buffer, 0, read)
                     downloaded += read
+                    if (downloaded > MAX_UPDATE_APK_BYTES || downloaded > asset.sizeBytes) {
+                        throw IOException("APK превышает заявленный размер.")
+                    }
                     val now = System.currentTimeMillis()
                     if (now - lastEmitAt >= 250L || downloaded == total) {
                         lastEmitAt = now
@@ -260,13 +316,12 @@ suspend fun downloadUpdateApk(
             throw IOException("Размер APK не совпал с GitHub asset")
         }
 
-        asset.sha256?.let { expected ->
-            val actual = outputFile.sha256Hex()
-            if (!actual.equals(expected, ignoreCase = true)) {
-                outputFile.delete()
-                throw SecurityException("SHA-256 скачанного APK не совпал с GitHub digest")
-            }
+        val actual = outputFile.sha256Hex()
+        if (!actual.equals(expectedSha256, ignoreCase = true)) {
+            outputFile.delete()
+            throw SecurityException("SHA-256 скачанного APK не совпал с GitHub digest")
         }
+        validateUpdatePackage(appContext, outputFile)
 
         emit(outputFile.length(), total.takeIf { it > 0L } ?: outputFile.length())
         outputFile
@@ -285,6 +340,7 @@ fun canRequestApkInstall(context: Context): Boolean {
 
 fun installUpdateApk(context: Context, apkFile: File) {
     val appContext = context.applicationContext
+    validateUpdatePackage(appContext, apkFile)
     val uri = FileProvider.getUriForFile(appContext, "${appContext.packageName}.files", apkFile)
     val intent = Intent(Intent.ACTION_VIEW).apply {
         setDataAndType(uri, "application/vnd.android.package-archive")
@@ -292,6 +348,90 @@ fun installUpdateApk(context: Context, apkFile: File) {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     appContext.startActivity(intent)
+}
+
+internal fun isTrustedUpdateDownloadUrl(
+    value: String,
+    initialRequest: Boolean,
+): Boolean {
+    val uri = runCatching { java.net.URI(value) }.getOrNull() ?: return false
+    val host = uri.host?.lowercase(Locale.US)?.trimEnd('.') ?: return false
+    if (
+        !uri.scheme.equals("https", ignoreCase = true) ||
+        !uri.rawUserInfo.isNullOrBlank() ||
+        (uri.port != -1 && uri.port != 443) ||
+        !uri.rawFragment.isNullOrBlank()
+    ) {
+        return false
+    }
+    if (initialRequest) {
+        return host == "github.com" &&
+            uri.path.orEmpty().startsWith(
+                "/Ivan4537/WDTT-Plus/releases/download/",
+                ignoreCase = true,
+            )
+    }
+    return host in TRUSTED_UPDATE_ASSET_HOSTS ||
+        host.endsWith(".release-assets.githubusercontent.com")
+}
+
+private fun validateUpdatePackage(context: Context, apkFile: File) {
+    require(apkFile.isFile && apkFile.length() in 1..MAX_UPDATE_APK_BYTES) {
+        "Файл обновления отсутствует или имеет недопустимый размер."
+    }
+    val packageManager = context.packageManager
+    val archive = packageManager.updateArchiveInfo(apkFile)
+        ?: throw SecurityException("Не удалось проверить пакет обновления.")
+    val installed = packageManager.installedUpdateTargetInfo(context.packageName)
+    if (archive.packageName != context.packageName) {
+        throw SecurityException("APK предназначен для другого приложения.")
+    }
+    val archiveSigners = archive.currentSignerDigests()
+    val installedSigners = installed.currentSignerDigests()
+    if (
+        archiveSigners.isEmpty() ||
+        installedSigners.isEmpty() ||
+        archiveSigners != installedSigners
+    ) {
+        throw SecurityException("Подпись APK не совпадает с установленным WDTT Plus.")
+    }
+}
+
+@Suppress("DEPRECATION")
+private fun PackageManager.updateArchiveInfo(apkFile: File): PackageInfo? {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getPackageArchiveInfo(
+            apkFile.absolutePath,
+            PackageManager.PackageInfoFlags.of(
+                PackageManager.GET_SIGNING_CERTIFICATES.toLong(),
+            ),
+        )
+    } else {
+        getPackageArchiveInfo(apkFile.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES)
+    }
+}
+
+@Suppress("DEPRECATION")
+private fun PackageManager.installedUpdateTargetInfo(packageName: String): PackageInfo {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getPackageInfo(
+            packageName,
+            PackageManager.PackageInfoFlags.of(
+                PackageManager.GET_SIGNING_CERTIFICATES.toLong(),
+            ),
+        )
+    } else {
+        getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+    }
+}
+
+private fun PackageInfo.currentSignerDigests(): Set<String> {
+    val signers = signingInfo?.apkContentsSigners.orEmpty()
+    return signers.mapTo(linkedSetOf()) { signature ->
+        MessageDigest.getInstance("SHA-256")
+            .digest(signature.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+    }
 }
 
 fun isNewerVersion(local: String, remote: String): Boolean {
@@ -442,7 +582,9 @@ private fun fetchReleaseFromLatestWebRedirect(budget: UpdateCheckBudget): AppRel
         }
 
         if (responseCode in 200..299) {
-            val response = conn.inputStream.bufferedReader().use { it.readText() }
+            val response = conn.inputStream.use {
+                it.readUtf8TextLimited(MAX_UPDATE_WEB_BYTES)
+            }
             val versionTag = Regex("/releases/tag/([^\"?#<]+)").find(response)?.groupValues?.getOrNull(1)
             if (!versionTag.isNullOrBlank()) {
                 return AppReleaseInfo(versionTag, "$GITHUB_RELEASE_TAG_URL_PREFIX$versionTag", RemoteVersionSource.Release)
@@ -494,7 +636,9 @@ private fun fetchHttpText(
 
         val responseCode = conn.responseCode
         val stream = if (responseCode in 200..299) conn.inputStream else conn.errorStream
-        val response = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        val response = stream?.use {
+            it.readUtf8TextLimited(MAX_UPDATE_METADATA_BYTES)
+        }.orEmpty()
 
         if (responseCode in 200..299) {
             if (isGitHubApi) githubApiCooldownUntilMs = 0L

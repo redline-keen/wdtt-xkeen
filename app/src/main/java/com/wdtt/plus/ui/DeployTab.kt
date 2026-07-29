@@ -107,11 +107,20 @@ import java.util.Locale
 import org.json.JSONObject
 
 private const val CMD_TIMEOUT = 900000L // 15 minutes
-private const val WGCF_VERSION = "2.2.31"
-private const val WGCF_LINUX_AMD64_SHA256 = "69147e1a517c66129edd8ac8cb60484d6c9515178d7b4a2f95e3c925f225572a"
+private const val SERVER_BACKUP_FORMAT_VERSION = 2
+private const val MAX_SERVER_BACKUP_FILE_CHARS = 8_000_000
+private const val MAX_SERVER_DATABASE_CHARS = 5_000_000
+private const val MAX_SERVER_WG_KEYS_CHARS = 4_096
+internal const val WGCF_VERSION = "2.2.32"
+private const val WGCF_LINUX_AMD64_SHA256 = "2ff97f2201972ce582a424455d50a3719a380eef0cd1f3144f7779348e122a2c"
 private const val WGCF_LINUX_AMD64_URL =
     "https://github.com/ViRb3/wgcf/releases/download/v$WGCF_VERSION/wgcf_${WGCF_VERSION}_linux_amd64"
 private const val WGCF_LATEST_RELEASE_API = "https://api.github.com/repos/ViRb3/wgcf/releases/latest"
+internal const val THREEPROXY_VERSION = "0.9.7"
+private const val THREEPROXY_SOURCE_SHA256 =
+    "efe862ef8b7c0ddf7b1c45d6b5d72f0b7cd0a3c54447419c7f1bd2239a06fc30"
+private const val THREEPROXY_SOURCE_URL =
+    "https://github.com/3proxy/3proxy/archive/refs/tags/$THREEPROXY_VERSION.tar.gz"
 
 private enum class DeployMode {
     PreserveData,
@@ -123,7 +132,7 @@ private enum class ServerImportMode {
     Merge
 }
 
-private enum class OutboundDialog {
+internal enum class OutboundDialog {
     LocalProxy,
     ExternalProxy,
     WireGuardVps,
@@ -195,6 +204,30 @@ private enum class ProxyKind(val label: String, val protocol: String) {
     Http("HTTP", "http")
 }
 
+internal fun localProxyCredentialsIssue(login: String, password: String): String? = when {
+    login.isBlank() -> "Укажите логин прокси."
+    !login.matches(Regex("^[A-Za-z0-9._@+-]{1,40}$")) ->
+        "В логине допустимы латинские буквы, цифры и знаки . _ @ + -"
+    password.length !in 8..80 -> "Пароль должен содержать от 8 до 80 символов."
+    !password.matches(Regex("^[A-Za-z0-9._~!@%+?,=-]{8,80}$")) ->
+        "В пароле допустимы латинские буквы, цифры и знаки . _ ~ ! @ % + ? , = -"
+    else -> null
+}
+
+internal fun externalProxyCredentialsIssue(login: String, password: String): String? = when {
+    login.isBlank() && password.isNotBlank() -> "Для пароля внешнего прокси укажите логин."
+    login.isNotBlank() && password.isBlank() -> "Для указанного логина внешнего прокси введите пароль."
+    login.length > 80 -> "Логин внешнего прокси не должен быть длиннее 80 символов."
+    password.length > 120 -> "Пароль внешнего прокси не должен быть длиннее 120 символов."
+    ':' in login -> "Логин внешнего прокси не должен содержать двоеточие."
+    login.any(Char::isISOControl) || password.any(Char::isISOControl) ->
+        "Логин и пароль внешнего прокси содержат недопустимые символы."
+    else -> null
+}
+
+internal fun escapeRedsocksQuotedValue(value: String): String =
+    value.replace("\\", "\\\\").replace("\"", "\\\"")
+
 private data class OutboundSshTarget(
     val host: String,
     val user: String,
@@ -208,7 +241,7 @@ private data class OutboundSshTarget(
         get() = SshCredentials(pass, privateKey, keyPassphrase, allowPasswordAuthentication)
 }
 
-private data class ServerBackup(
+internal data class ServerBackup(
     val passwordsJson: String,
     val wgKeysDat: String?,
     val createdAt: String,
@@ -218,7 +251,9 @@ private data class ServerBackup(
     val mainPassword: String,
     val adminId: String,
     val botToken: String,
-    val dns: String
+    val dns: String,
+    val formatVersion: Int = SERVER_BACKUP_FORMAT_VERSION,
+    val integrityVerified: Boolean = true
 ) {
     val hasWgKeys: Boolean
         get() = !wgKeysDat.isNullOrBlank()
@@ -286,7 +321,7 @@ private data class ExistingInstallInfo(
         get() = serviceExists || binaryExists || configDirExists || accessDbExists || wgKeysExist
 }
 
-private data class OutboundProfileForms(
+internal data class OutboundProfileForms(
     val localProxyPort: String,
     val localProxyLogin: String,
     val localProxyPassword: String,
@@ -304,7 +339,7 @@ private data class OutboundProfileForms(
     val importedWireGuardConfig: String
 )
 
-private data class OutboundServerSnapshot(
+internal data class OutboundServerSnapshot(
     val mode: String,
     val detail: String,
     val updatedAt: String,
@@ -332,7 +367,20 @@ private data class OutboundServerSnapshot(
     val warpPresent: Boolean,
     val warpMtu: String,
     val importedWireGuardConfig: String,
-    val checkedAtMillis: Long = System.currentTimeMillis()
+    val checkedAtMillis: Long = System.currentTimeMillis(),
+    val externalProxyServiceActive: Boolean = externalProxyActive,
+    val externalProxyRouteActive: Boolean = externalProxyActive,
+    val wireGuardInterfaceActive: Boolean = wireGuardActive,
+    val wireGuardServiceActive: Boolean = wireGuardActive,
+    val wireGuardPolicyRuleActive: Boolean = wireGuardActive,
+    val wireGuardDefaultRouteActive: Boolean = wireGuardActive,
+    val wireGuardNatActive: Boolean = wireGuardActive,
+    val wireGuardOwnerMode: String = "",
+    val wireGuardConfigOwnerMode: String = "",
+    val wireGuardMatchesWarp: Boolean = false,
+    val localProxyServiceEnabled: Boolean = localProxyActive,
+    val externalProxyServiceEnabled: Boolean = externalProxyServiceActive,
+    val wireGuardServiceEnabled: Boolean = wireGuardServiceActive
 ) {
     val modeLabel: String
         get() = when (mode) {
@@ -355,16 +403,28 @@ private data class OutboundServerSnapshot(
 
     val activeRouteLabels: List<String>
         get() = buildList {
-            if (externalProxyActive) add("внешний TCP-прокси")
-            if (wireGuardActive) add("WireGuard-выход")
+            if (externalProxyRouteActive) add("внешний TCP-прокси")
+            if (wireGuardRoutingPresent) add("WireGuard-выход")
         }
 
+    val externalProxyRoutingPresent: Boolean
+        get() = externalProxyServiceActive || externalProxyRouteActive
+
+    val wireGuardRoutingPresent: Boolean
+        get() = wireGuardInterfaceActive ||
+            wireGuardPolicyRuleActive ||
+            wireGuardDefaultRouteActive ||
+            wireGuardNatActive
+
+    val wireGuardHealthy: Boolean
+        get() = wireGuardActive && wireGuardServiceActive && wireGuardServiceEnabled
+
     val hasRouteConflict: Boolean
-        get() = externalProxyActive && wireGuardActive
+        get() = externalProxyRouteActive && wireGuardRoutingPresent
 
     val routeConflictMessage: String?
         get() = if (hasRouteConflict) {
-            "На сервере одновременно активны внешний TCP-прокси и WireGuard-выход. Так можно сломать выход клиентов; сначала верните прямой выход или выполните диагностику/очистку."
+            "На сервере одновременно остались правила внешнего TCP-прокси и WireGuard-выхода. Это может нарушить интернет у клиентов; нажмите «Вернуть прямой выход», затем включите только один режим."
         } else {
             null
         }
@@ -387,7 +447,7 @@ private object OutboundProcessCache {
     }
 }
 
-private enum class OutboundModeVisualState {
+internal enum class OutboundModeVisualState {
     Unknown,
     Off,
     Active,
@@ -395,21 +455,45 @@ private enum class OutboundModeVisualState {
     Error
 }
 
-private data class OutboundModeIndicator(
+internal data class OutboundModeIndicator(
     val state: OutboundModeVisualState,
     val text: String
 )
 
 private val wireGuardOutboundModes = setOf("wireguard_vps", "warp_free", "imported_wg")
 
-private fun outboundModeIndicator(snapshot: OutboundServerSnapshot?, dialog: OutboundDialog): OutboundModeIndicator {
+private fun OutboundServerSnapshot.orphanedWireGuardDialog(): OutboundDialog? {
+    if (!wireGuardRoutingPresent || mode in wireGuardOutboundModes) return null
+    return when {
+        wireGuardOwnerMode == "warp_free" -> OutboundDialog.FreeWarp
+        wireGuardOwnerMode == "imported_wg" -> OutboundDialog.ImportedWireGuard
+        wireGuardOwnerMode == "wireguard_vps" -> OutboundDialog.WireGuardVps
+        wireGuardConfigOwnerMode == "warp_free" -> OutboundDialog.FreeWarp
+        wireGuardConfigOwnerMode == "imported_wg" -> OutboundDialog.ImportedWireGuard
+        wireGuardConfigOwnerMode == "wireguard_vps" -> OutboundDialog.WireGuardVps
+        wireGuardMatchesWarp -> OutboundDialog.FreeWarp
+        importedWireGuardConfig.isNotBlank() && wireGuardExitHost.isBlank() ->
+            OutboundDialog.ImportedWireGuard
+        wireGuardExitHost.isNotBlank() -> OutboundDialog.WireGuardVps
+        warpPresent -> OutboundDialog.FreeWarp
+        else -> null
+    }
+}
+
+internal fun outboundModeIndicator(
+    snapshot: OutboundServerSnapshot?,
+    dialog: OutboundDialog
+): OutboundModeIndicator {
     if (snapshot == null) {
         return OutboundModeIndicator(OutboundModeVisualState.Unknown, "не проверено")
     }
 
     if (dialog == OutboundDialog.LocalProxy) {
         return when {
-            snapshot.localProxyActive -> OutboundModeIndicator(OutboundModeVisualState.Active, "запущен")
+            snapshot.localProxyActive && snapshot.localProxyServiceEnabled ->
+                OutboundModeIndicator(OutboundModeVisualState.Active, "запущен")
+            snapshot.localProxyActive ->
+                OutboundModeIndicator(OutboundModeVisualState.Warning, "без автозапуска")
             snapshot.localProxyPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "найден")
             else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
         }
@@ -417,10 +501,17 @@ private fun outboundModeIndicator(snapshot: OutboundServerSnapshot?, dialog: Out
 
     if (dialog == OutboundDialog.ExternalProxy) {
         return when {
-            snapshot.hasRouteConflict && snapshot.externalProxyActive -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
-            snapshot.mode == "external_proxy" && snapshot.externalProxyActive -> OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.hasRouteConflict && snapshot.externalProxyRouteActive -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
+            snapshot.mode == "external_proxy" &&
+                snapshot.externalProxyActive &&
+                snapshot.externalProxyServiceEnabled ->
+                OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.mode == "external_proxy" && snapshot.externalProxyActive ->
+                OutboundModeIndicator(OutboundModeVisualState.Warning, "без автозапуска")
+            snapshot.mode == "external_proxy" && snapshot.externalProxyRoutingPresent ->
+                OutboundModeIndicator(OutboundModeVisualState.Error, "запущен частично")
             snapshot.mode == "external_proxy" -> OutboundModeIndicator(OutboundModeVisualState.Error, "не запущен")
-            snapshot.externalProxyActive -> OutboundModeIndicator(OutboundModeVisualState.Warning, "активен вне режима")
+            snapshot.externalProxyRoutingPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "остались правила")
             snapshot.externalProxyPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "настроен")
             else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
         }
@@ -428,8 +519,14 @@ private fun outboundModeIndicator(snapshot: OutboundServerSnapshot?, dialog: Out
 
     if (dialog == OutboundDialog.FreeWarp) {
         return when {
-            snapshot.hasRouteConflict && snapshot.wireGuardActive && snapshot.mode == "warp_free" -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
-            snapshot.mode == "warp_free" && snapshot.wireGuardActive -> OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.hasRouteConflict && snapshot.wireGuardRoutingPresent && snapshot.mode == "warp_free" -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
+            snapshot.mode == "warp_free" && snapshot.wireGuardHealthy -> OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.mode == "warp_free" && snapshot.wireGuardActive ->
+                OutboundModeIndicator(OutboundModeVisualState.Warning, "без автозапуска")
+            snapshot.mode == "warp_free" && snapshot.wireGuardRoutingPresent ->
+                OutboundModeIndicator(OutboundModeVisualState.Error, "запущен частично")
+            snapshot.orphanedWireGuardDialog() == OutboundDialog.FreeWarp ->
+                OutboundModeIndicator(OutboundModeVisualState.Error, "не отключён")
             snapshot.mode == "warp_free" && snapshot.warpPresent -> OutboundModeIndicator(OutboundModeVisualState.Error, "не запущен")
             snapshot.warpPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "настроен")
             else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
@@ -443,11 +540,16 @@ private fun outboundModeIndicator(snapshot: OutboundServerSnapshot?, dialog: Out
     }
     if (expectedMode.isNotBlank()) {
         return when {
-            snapshot.hasRouteConflict && snapshot.wireGuardActive -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
-            snapshot.mode == expectedMode && snapshot.wireGuardActive -> OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.hasRouteConflict && snapshot.wireGuardRoutingPresent -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
+            snapshot.mode == expectedMode && snapshot.wireGuardHealthy -> OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.mode == expectedMode && snapshot.wireGuardActive ->
+                OutboundModeIndicator(OutboundModeVisualState.Warning, "без автозапуска")
+            snapshot.mode == expectedMode && snapshot.wireGuardRoutingPresent ->
+                OutboundModeIndicator(OutboundModeVisualState.Error, "запущен частично")
             snapshot.mode == expectedMode && snapshot.wireGuardPresent -> OutboundModeIndicator(OutboundModeVisualState.Error, "не запущен")
             snapshot.mode == expectedMode -> OutboundModeIndicator(OutboundModeVisualState.Error, "нет конфига")
-            snapshot.wireGuardActive && snapshot.mode !in wireGuardOutboundModes -> OutboundModeIndicator(OutboundModeVisualState.Warning, "WG активен")
+            snapshot.orphanedWireGuardDialog() == dialog ->
+                OutboundModeIndicator(OutboundModeVisualState.Error, "не отключён")
             else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
         }
     }
@@ -457,16 +559,26 @@ private fun outboundModeIndicator(snapshot: OutboundServerSnapshot?, dialog: Out
 
 private fun OutboundServerSnapshot.outboundModeMismatchWarning(): String? = when {
     routeConflictMessage != null -> routeConflictMessage
-    mode == "direct" && activeRouteLabels.isNotEmpty() ->
-        "в профиле указан прямой выход, но на сервере активен ${activeRouteLabels.joinToString(" и ")}."
+    mode == "direct" && (externalProxyRoutingPresent || wireGuardRoutingPresent) ->
+        "записан прямой выход, но на сервере остались внешние службы или правила маршрутизации. Нажмите «Вернуть прямой выход» для полной очистки."
+    mode == "external_proxy" && externalProxyServiceActive && !externalProxyRouteActive ->
+        "служба внешнего TCP-прокси запущена, но правило перенаправления трафика WDTT отсутствует."
+    mode == "external_proxy" && !externalProxyServiceActive && externalProxyRouteActive ->
+        "правило внешнего TCP-прокси осталось, но его служба не запущена; TCP-трафик клиентов может не работать."
+    mode == "external_proxy" && externalProxyActive && !externalProxyServiceEnabled ->
+        "внешний TCP-прокси работает, но его автозапуск выключен; после перезагрузки сервера режим пропадёт."
     mode == "external_proxy" && !externalProxyActive ->
-        "режим записан как внешний TCP-прокси, но служба маршрутизации через прокси не запущена."
+        "режим записан как внешний TCP-прокси, но он запущен не полностью."
+    mode in wireGuardOutboundModes && wireGuardActive && !wireGuardServiceActive ->
+        "WireGuard-маршрут работает, но постоянная служба не активна; после перезагрузки сервера режим может пропасть."
+    mode in wireGuardOutboundModes && wireGuardActive && !wireGuardServiceEnabled ->
+        "WireGuard-маршрут работает, но автозапуск службы выключен; после перезагрузки сервера режим пропадёт."
     mode in wireGuardOutboundModes && !wireGuardActive ->
-        "режим записан как ${modeLabel}, но WireGuard-выход не запущен."
-    externalProxyActive && mode != "external_proxy" ->
-        "внешний TCP-прокси запущен, но профиль режима указывает «${modeLabel}»."
-    wireGuardActive && mode !in wireGuardOutboundModes ->
-        "WireGuard-выход запущен, но профиль режима указывает «${modeLabel}»."
+        "режим записан как ${modeLabel}, но не все компоненты WireGuard-маршрута запущены."
+    externalProxyRoutingPresent && mode != "external_proxy" ->
+        "на сервере остались компоненты внешнего TCP-прокси, хотя записан режим «${modeLabel}»."
+    wireGuardRoutingPresent && mode !in wireGuardOutboundModes ->
+        "на сервере остались компоненты WireGuard-выхода, хотя записан режим «${modeLabel}»."
     else -> null
 }
 
@@ -474,6 +586,9 @@ private fun outboundServerShortState(snapshot: OutboundServerSnapshot): String =
     snapshot.hasRouteConflict -> "конфликт — ${snapshot.activeRouteLabels.joinToString(" и ")}"
     snapshot.externalProxyActive -> "внешний TCP-прокси"
     snapshot.wireGuardActive -> snapshot.modeLabel.takeIf { snapshot.mode in wireGuardOutboundModes } ?: "WireGuard-выход"
+    snapshot.externalProxyRoutingPresent -> "внешний TCP-прокси запущен частично"
+    snapshot.wireGuardRoutingPresent -> "WireGuard-выход запущен частично"
+    snapshot.mode != "direct" -> "${snapshot.modeLabel} не запущен"
     else -> "прямой выход"
 }
 
@@ -491,7 +606,10 @@ private fun outboundServerStateHint(snapshot: OutboundServerSnapshot): String {
     return buildString {
         append("Конфликтных режимов не найдено.")
         if (snapshot.localProxyActive) {
-            append(" Прокси VPS запущен отдельно и не переключает выход WDTT-клиентов.")
+            append(" Прокси на этом VPS запущен отдельно и не переключает выход WDTT-клиентов.")
+            if (!snapshot.localProxyServiceEnabled) {
+                append(" Его автозапуск выключен.")
+            }
         }
         if (checkedAt.isNotBlank()) {
             append(" Проверено: $checkedAt.")
@@ -508,9 +626,13 @@ private fun outboundServerStateSummary(snapshot: OutboundServerSnapshot): String
     snapshot.routeConflictMessage?.let { parts += it }
     snapshot.outboundModeMismatchWarning()?.takeIf { it != snapshot.routeConflictMessage }?.let { parts += it }
     if (snapshot.localProxyActive) {
-        parts += "Прокси VPS запущен отдельно; он не конфликтует с маршрутизацией выхода WDTT."
+        parts += if (snapshot.localProxyServiceEnabled) {
+            "Прокси на этом VPS запущен отдельно; он не конфликтует с маршрутизацией выхода WDTT."
+        } else {
+            "Прокси на этом VPS работает, но его автозапуск выключен."
+        }
     } else if (snapshot.localProxyPresent) {
-        parts += "Прокси VPS найден, но служба не запущена."
+        parts += "Прокси на этом VPS найден, но служба не запущена."
     }
     formatOutboundCheckTime(snapshot.checkedAtMillis).takeIf { it.isNotBlank() }?.let {
         parts += "Состояние проверено: $it."
@@ -521,16 +643,30 @@ private fun outboundServerStateSummary(snapshot: OutboundServerSnapshot): String
     return parts.joinToString(" ")
 }
 
-private fun canReturnDirect(snapshot: OutboundServerSnapshot?): Boolean =
-    snapshot != null && (snapshot.mode != "direct" || snapshot.externalProxyActive || snapshot.wireGuardActive)
+internal fun canReturnDirect(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot != null && (
+        snapshot.mode != "direct" ||
+            snapshot.externalProxyRoutingPresent ||
+            snapshot.wireGuardRoutingPresent
+        )
 
-private fun canDisableOutboundDialog(snapshot: OutboundServerSnapshot?, dialog: OutboundDialog): Boolean {
+internal fun canDisableOutboundDialog(
+    snapshot: OutboundServerSnapshot?,
+    dialog: OutboundDialog
+): Boolean {
     if (snapshot == null) return false
     return when (dialog) {
-        OutboundDialog.ExternalProxy -> snapshot.externalProxyActive
-        OutboundDialog.WireGuardVps -> snapshot.mode == "wireguard_vps" && snapshot.wireGuardActive
-        OutboundDialog.FreeWarp -> snapshot.mode == "warp_free" && snapshot.wireGuardActive
-        OutboundDialog.ImportedWireGuard -> snapshot.mode == "imported_wg" && snapshot.wireGuardActive
+        OutboundDialog.ExternalProxy ->
+            snapshot.mode == "external_proxy" || snapshot.externalProxyRoutingPresent
+        OutboundDialog.WireGuardVps ->
+            snapshot.mode == "wireguard_vps" ||
+                snapshot.orphanedWireGuardDialog() == OutboundDialog.WireGuardVps
+        OutboundDialog.FreeWarp ->
+            snapshot.mode == "warp_free" ||
+                snapshot.orphanedWireGuardDialog() == OutboundDialog.FreeWarp
+        OutboundDialog.ImportedWireGuard ->
+            snapshot.mode == "imported_wg" ||
+                snapshot.orphanedWireGuardDialog() == OutboundDialog.ImportedWireGuard
         else -> false
     }
 }
@@ -552,7 +688,22 @@ private fun canDeleteFreeWarp(snapshot: OutboundServerSnapshot?): Boolean =
     snapshot?.warpPresent == true
 
 private fun canDeleteImportedWireGuard(snapshot: OutboundServerSnapshot?): Boolean =
-    snapshot != null && (snapshot.mode == "imported_wg" || snapshot.importedWireGuardConfig.isNotBlank())
+    snapshot != null && (
+        snapshot.mode == "imported_wg" ||
+            snapshot.wireGuardConfigOwnerMode == "imported_wg" ||
+            snapshot.importedWireGuardConfig.isNotBlank()
+        )
+
+private fun canDeleteExternalProxy(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot?.externalProxyPresent == true
+
+private fun canDeleteWireGuardVps(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot != null && (
+        snapshot.mode == "wireguard_vps" ||
+            snapshot.wireGuardOwnerMode == "wireguard_vps" ||
+            snapshot.wireGuardConfigOwnerMode == "wireguard_vps" ||
+            snapshot.wireGuardExitHost.isNotBlank()
+        )
 
 private fun canStopLocalProxy(snapshot: OutboundServerSnapshot?): Boolean =
     snapshot?.localProxyActive == true
@@ -564,7 +715,7 @@ private fun outboundDialogServerStateSummary(snapshot: OutboundServerSnapshot, d
     val indicator = outboundModeIndicator(snapshot, dialog)
     val checkedAt = formatOutboundCheckTime(snapshot.checkedAtMillis)
     val prefix = when (dialog) {
-        OutboundDialog.LocalProxy -> "Прокси VPS"
+        OutboundDialog.LocalProxy -> "Прокси на этом VPS"
         OutboundDialog.ExternalProxy -> "Внешний TCP-прокси"
         OutboundDialog.WireGuardVps -> "Выход через другой сервер"
         OutboundDialog.FreeWarp -> "Бесплатный WARP"
@@ -574,28 +725,46 @@ private fun outboundDialogServerStateSummary(snapshot: OutboundServerSnapshot, d
     val parts = mutableListOf("$prefix: ${indicator.text}.")
     when (dialog) {
         OutboundDialog.LocalProxy -> when {
-            snapshot.localProxyActive -> parts += "Служба прокси на сервере запущена."
+            snapshot.localProxyActive && snapshot.localProxyServiceEnabled ->
+                parts += "Служба прокси на сервере запущена и включена в автозапуск."
+            snapshot.localProxyActive ->
+                parts += "Служба прокси запущена, но её автозапуск выключен."
             snapshot.localProxyPresent -> parts += "Настройки прокси найдены, но служба сейчас не запущена."
             else -> parts += "Настройки прокси на сервере не найдены."
         }
         OutboundDialog.ExternalProxy -> when {
             snapshot.externalProxyActive -> parts += "Маршрутизация обычного TCP-трафика WDTT через внешний прокси включена."
+            snapshot.externalProxyRoutingPresent -> parts +=
+                "Служба или правило внешнего прокси запущены не полностью. Нажмите «Отключить» для очистки либо включите режим заново."
             snapshot.externalProxyPresent -> parts += "Настройки внешнего прокси найдены, но маршрутизация сейчас не активна."
             else -> parts += "Внешний TCP-прокси на сервере не настроен."
         }
         OutboundDialog.WireGuardVps -> when {
-            snapshot.mode == "wireguard_vps" && snapshot.wireGuardActive -> parts += "WireGuard-выход через другой сервер активен."
+            snapshot.mode == "wireguard_vps" && snapshot.wireGuardHealthy -> parts += "WireGuard-выход через другой сервер активен."
+            snapshot.mode == "wireguard_vps" && snapshot.wireGuardActive -> parts +=
+                "Маршрут через другой сервер работает, но постоянная служба не активна."
+            snapshot.mode == "wireguard_vps" && snapshot.wireGuardRoutingPresent -> parts +=
+                "WireGuard-выход через другой сервер запущен не полностью."
             snapshot.mode == "wireguard_vps" && snapshot.wireGuardPresent -> parts += "Конфиг выхода через другой сервер найден, но WireGuard сейчас не запущен."
             snapshot.wireGuardExitHost.isNotBlank() || snapshot.wireGuardExitPort.isNotBlank() -> parts += "Сохранённые поля второго сервера найдены; нажмите «Настроить выход», чтобы включить режим."
             else -> parts += "Настройки выхода через другой сервер на сервере не найдены."
         }
         OutboundDialog.FreeWarp -> when {
-            snapshot.mode == "warp_free" && snapshot.wireGuardActive -> parts += "WARP активен; можно выполнить глубокую проверку Cloudflare."
+            snapshot.mode == "warp_free" && snapshot.wireGuardHealthy -> parts += "WARP активен; можно выполнить глубокую проверку Cloudflare."
+            snapshot.mode == "warp_free" && snapshot.wireGuardActive -> parts +=
+                "WARP-маршрут работает, но постоянная служба не активна."
+            snapshot.mode == "warp_free" && snapshot.wireGuardRoutingPresent -> parts +=
+                "WARP запущен не полностью. Нажмите «Отключить» для очистки либо выполните восстановление."
+            snapshot.orphanedWireGuardDialog() == OutboundDialog.FreeWarp -> parts += "После неудачного включения WARP его общий WireGuard-интерфейс остался запущен. Нажмите «Отключить», чтобы принудительно вернуть прямой выход; регистрация WARP сохранится."
             snapshot.warpPresent -> parts += "Регистрация или профиль WARP найдены, но WARP сейчас не активен. Нажмите «Установить / восстановить», чтобы включить его без новой регистрации, если сохранённый аккаунт рабочий."
             else -> parts += "Регистрация WARP на сервере не найдена."
         }
         OutboundDialog.ImportedWireGuard -> when {
-            snapshot.mode == "imported_wg" && snapshot.wireGuardActive -> parts += "Импортированный VPN/WireGuard-файл активен."
+            snapshot.mode == "imported_wg" && snapshot.wireGuardHealthy -> parts += "Импортированный VPN/WireGuard-файл активен."
+            snapshot.mode == "imported_wg" && snapshot.wireGuardActive -> parts +=
+                "Маршрут из VPN/WireGuard-файла работает, но постоянная служба не активна."
+            snapshot.mode == "imported_wg" && snapshot.wireGuardRoutingPresent -> parts +=
+                "VPN/WireGuard-выход запущен не полностью."
             snapshot.importedWireGuardConfig.isNotBlank() -> parts += "Сохранённый VPN/WireGuard-файл найден, но сейчас не активен. Нажмите «Включить», чтобы применить его."
             snapshot.mode == "imported_wg" && snapshot.wireGuardPresent -> parts += "Рабочий WireGuard-конфиг найден, но интерфейс сейчас не запущен."
             else -> parts += "Импортированный VPN/WireGuard-файл на сервере не найден."
@@ -683,7 +852,7 @@ fun DeployTab(
     val savedConnectionPassword by settingsStore.connectionPassword.collectAsStateWithLifecycle(initialValue = "")
     val savedVkHashes by settingsStore.vkHashes.collectAsStateWithLifecycle(initialValue = "")
     val savedSecondaryVkHash by settingsStore.secondaryVkHash.collectAsStateWithLifecycle(initialValue = "")
-    val savedWorkersPerHash by settingsStore.workersPerHash.collectAsStateWithLifecycle(initialValue = 16)
+    val savedWorkersPerHash by settingsStore.workersPerHash.collectAsStateWithLifecycle(initialValue = 18)
     val savedProtocol by settingsStore.protocol.collectAsStateWithLifecycle(initialValue = "udp")
     val savedSni by settingsStore.sni.collectAsStateWithLifecycle(initialValue = "")
     val savedNoDns by settingsStore.noDns.collectAsStateWithLifecycle(initialValue = false)
@@ -753,29 +922,64 @@ fun DeployTab(
     var outboundLastCheckAttemptAt by remember { mutableLongStateOf(0L) }
     var outboundLastCheckError by remember { mutableStateOf("") }
     var outboundAutoCheckedTargetKey by remember { mutableStateOf("") }
-    var importedWgConfigText by rememberSaveable { mutableStateOf("") }
-    val outboundPrefs = remember { context.getSharedPreferences("wdtt_outbound_forms", Context.MODE_PRIVATE) }
-    var localProxyPortInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("local_proxy_port", "1080") ?: "1080") }
-    var localProxyLoginInput by rememberSaveable {
-        mutableStateOf(outboundPrefs.getString("local_proxy_login", "")?.takeIf { it.isNotBlank() } ?: "wdtt_${randomToken(5).lowercase()}")
+    val outboundFormsStore = remember { OutboundFormsStore(context) }
+    val storedOutboundForms = remember(activeProfile) {
+        outboundFormsStore.load(activeProfile)
     }
-    var localProxyPasswordInput by rememberSaveable {
-        mutableStateOf(outboundPrefs.getString("local_proxy_password", "")?.takeIf { it.isNotBlank() } ?: randomToken(18))
+    var importedWgConfigText by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.importedWireGuardConfig)
     }
-    var externalProxyKindName by rememberSaveable {
-        mutableStateOf(outboundPrefs.getString("external_proxy_kind", ProxyKind.Socks5.name) ?: ProxyKind.Socks5.name)
+    var localProxyPortInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.localProxyPort)
     }
-    var externalProxyHostInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("external_proxy_host", "") ?: "") }
-    var externalProxyPortInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("external_proxy_port", "1080") ?: "1080") }
-    var externalProxyLoginInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("external_proxy_login", "") ?: "") }
-    var externalProxyPasswordInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("external_proxy_password", "") ?: "") }
-    var wireGuardExitHostInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("wg_exit_host", "") ?: "") }
-    var wireGuardExitSshPortInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("wg_exit_ssh_port", "22") ?: "22") }
-    var wireGuardExitUserInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("wg_exit_user", "root") ?: "root") }
-    var wireGuardExitPasswordInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("wg_exit_password", "") ?: "") }
-    var wireGuardExitPortInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("wg_exit_port", "51820") ?: "51820") }
-    var wireGuardExitDnsInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("wg_exit_dns", "1.1.1.1,8.8.8.8") ?: "1.1.1.1,8.8.8.8") }
-    var freeWarpMtuInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("warp_mtu", "1280") ?: "1280") }
+    var localProxyLoginInput by rememberSaveable(activeProfile) {
+        mutableStateOf(
+            storedOutboundForms.forms.localProxyLogin.takeIf(String::isNotBlank)
+                ?: "wdtt_${randomToken(5).lowercase()}"
+        )
+    }
+    var localProxyPasswordInput by rememberSaveable(activeProfile) {
+        mutableStateOf(
+            storedOutboundForms.forms.localProxyPassword.takeIf(String::isNotBlank)
+                ?: randomToken(18)
+        )
+    }
+    var externalProxyKindName by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.externalProxyKindName)
+    }
+    var externalProxyHostInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.externalProxyHost)
+    }
+    var externalProxyPortInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.externalProxyPort)
+    }
+    var externalProxyLoginInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.externalProxyLogin)
+    }
+    var externalProxyPasswordInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.externalProxyPassword)
+    }
+    var wireGuardExitHostInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.wireGuardExitHost)
+    }
+    var wireGuardExitSshPortInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.wireGuardExitSshPort)
+    }
+    var wireGuardExitUserInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.wireGuardExitUser)
+    }
+    var wireGuardExitPasswordInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.wireGuardExitPassword)
+    }
+    var wireGuardExitPortInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.wireGuardExitPort)
+    }
+    var wireGuardExitDnsInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.wireGuardExitDns)
+    }
+    var freeWarpMtuInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.warpMtu)
+    }
 
     var showSuccessBanner by rememberSaveable { mutableStateOf(false) }
     var successCountdown by rememberSaveable { mutableIntStateOf(5) }
@@ -794,6 +998,7 @@ fun DeployTab(
     val deployProgress by DeployManager.deployProgress.collectAsStateWithLifecycle()
     val currentStep by DeployManager.currentStep.collectAsStateWithLifecycle()
     val lastDeployResult by DeployManager.lastResult.collectAsStateWithLifecycle()
+    val installedServerVersion by DeployManager.installedServerVersion.collectAsStateWithLifecycle()
 
     LaunchedEffect(savedIp) { ip = savedIp }
     LaunchedEffect(savedLogin) { login = savedLogin }
@@ -890,6 +1095,7 @@ fun DeployTab(
         serverDiagnosticsReport = null
     }
     LaunchedEffect(
+        activeProfile,
         localProxyPortInput,
         localProxyLoginInput,
         localProxyPasswordInput,
@@ -905,25 +1111,31 @@ fun DeployTab(
         selectedWireGuardExitSshAuthMode,
         wireGuardExitPortInput,
         wireGuardExitDnsInput,
-        freeWarpMtuInput
+        freeWarpMtuInput,
+        importedWgConfigText,
     ) {
-        outboundPrefs.edit()
-            .putString("local_proxy_port", localProxyPortInput)
-            .putString("local_proxy_login", localProxyLoginInput)
-            .putString("local_proxy_password", localProxyPasswordInput)
-            .putString("external_proxy_kind", externalProxyKindName)
-            .putString("external_proxy_host", externalProxyHostInput)
-            .putString("external_proxy_port", externalProxyPortInput)
-            .putString("external_proxy_login", externalProxyLoginInput)
-            .putString("external_proxy_password", externalProxyPasswordInput)
-            .putString("wg_exit_host", wireGuardExitHostInput)
-            .putString("wg_exit_ssh_port", wireGuardExitSshPortInput)
-            .putString("wg_exit_user", wireGuardExitUserInput)
-            .putString("wg_exit_password", wireGuardExitPasswordInput)
-            .putString("wg_exit_port", wireGuardExitPortInput)
-            .putString("wg_exit_dns", wireGuardExitDnsInput)
-            .putString("warp_mtu", freeWarpMtuInput)
-            .apply()
+        kotlinx.coroutines.delay(250)
+        outboundFormsStore.save(
+            activeProfile,
+            OutboundProfileForms(
+                localProxyPort = localProxyPortInput,
+                localProxyLogin = localProxyLoginInput,
+                localProxyPassword = localProxyPasswordInput,
+                externalProxyKindName = externalProxyKindName,
+                externalProxyHost = externalProxyHostInput,
+                externalProxyPort = externalProxyPortInput,
+                externalProxyLogin = externalProxyLoginInput,
+                externalProxyPassword = externalProxyPasswordInput,
+                wireGuardExitHost = wireGuardExitHostInput,
+                wireGuardExitSshPort = wireGuardExitSshPortInput,
+                wireGuardExitUser = wireGuardExitUserInput,
+                wireGuardExitPassword = wireGuardExitPasswordInput,
+                wireGuardExitPort = wireGuardExitPortInput,
+                wireGuardExitDns = wireGuardExitDnsInput,
+                importedWireGuardConfig = importedWgConfigText,
+            ),
+            freeWarpMtuInput,
+        )
     }
     val animatedProgress by animateFloatAsState(
         targetValue = deployProgress,
@@ -952,7 +1164,7 @@ fun DeployTab(
         scope.launch {
             try {
                 writeServerBackupToUri(context, uri, backup)
-                migrationStatus = "${if (backup.hasWgKeys) "Полный" else "Частичный"} экспорт готов: паролей ${backup.passwordCount}, устройств ${backup.deviceCount}."
+                migrationStatus = "${if (backup.hasWgKeys) "Полный" else "Частичный"} экспорт готов: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}."
             } catch (e: Exception) {
                 migrationStatus = "Ошибка экспорта: ${friendlyDeployError(e, "экспорт")}"
                 DeployManager.writeError("Server export error: ${e.message}")
@@ -972,7 +1184,16 @@ fun DeployTab(
                 val backup = loadServerBackupFromUri(context, uri)
                 selectedImportBackup = backup
                 selectedImportModeName = ServerImportMode.Replace.name
-                migrationStatus = "Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: паролей ${backup.passwordCount}, устройств ${backup.deviceCount}."
+                migrationStatus = buildString {
+                    append("Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}.")
+                    append(
+                        if (backup.integrityVerified) {
+                            " Целостность файла проверена."
+                        } else {
+                            " Это совместимый старый формат без контрольной суммы."
+                        }
+                    )
+                }
             } catch (e: Exception) {
                 selectedImportBackup = null
                 migrationStatus = "Ошибка файла импорта: ${friendlyDeployError(e, "файл импорта")}"
@@ -1357,6 +1578,7 @@ fun DeployTab(
     fun runOutboundAction(
         title: String,
         preflightRouteMode: String? = null,
+        onSuccess: (() -> Unit)? = null,
         action: suspend (OutboundSshTarget) -> String
     ) {
         val owner = outboundDialog?.name
@@ -1397,10 +1619,13 @@ fun DeployTab(
                     afterWarning?.let { "Проверьте сервер: $it" }
                 ).joinToString("\n")
                 outboundStatusOwner = owner
+                onSuccess?.invoke()
             } catch (e: Exception) {
-                outboundStatus = "$title: ${friendlyDeployError(e, "выходной IP")}"
+                val friendly = friendlyDeployError(e, "выходной IP")
+                outboundStatus = "$title: $friendly"
                 outboundStatusOwner = owner
-                DeployManager.writeError("Outbound action failed: ${e.message}")
+                DeployManager.writeError("Ошибка действия «$title»: $friendly")
+                TunnelManager.addDeployErrorLog("$title: $friendly")
             } finally {
                 outboundBusy = false
                 outboundSnapshotBusy = false
@@ -1739,7 +1964,10 @@ fun DeployTab(
                             scope.launch { settingsStore.saveDeploySshAuthMode(mode) }
                         },
                         shape = SegmentedButtonDefaults.itemShape(index, 2),
-                        enabled = !isDeploying
+                        enabled = !isDeploying,
+                        icon = {
+                            StableSegmentedButtonIcon(selected = selectedSshAuthMode == mode)
+                        },
                     ) { Text(label) }
                 }
             }
@@ -1944,7 +2172,10 @@ fun DeployTab(
             }
 
             if (showSuccessBanner) {
-                DeploySuccessBanner(successCountdown = successCountdown)
+                DeploySuccessBanner(
+                    successCountdown = successCountdown,
+                    serverVersion = installedServerVersion
+                )
             }
         }
 
@@ -1959,7 +2190,7 @@ fun DeployTab(
                 color = MaterialTheme.colorScheme.onSurface
             )
             Text(
-                "Подключение без установки работает только в направлении сервер → приложение: WDTT Plus проверяет главный пароль, показывает отличия и после подтверждения заполняет локальные поля. На сервер ничего не записывается, пользовательские доступы не меняются.\n\nНаправление приложение → сервер используется при установке с сохранением данных или с нуля. Настройки выходного IP восстанавливаются отдельно кнопкой «Заполнить» в соответствующем блоке.",
+                "Подключение без установки работает только в направлении сервер → приложение: WDTT Plus проверяет главный пароль, показывает отличия и после подтверждения заполняет локальные поля. На сервер ничего не записывается, пользовательские доступы не меняются.\n\nНаправление приложение → сервер используется при установке с сохранением данных или с нуля. Настройки выходного IP восстанавливаются отдельно кнопкой «Загрузить настройки» в соответствующем блоке.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -2217,7 +2448,14 @@ fun DeployTab(
                         runOutboundAction("Останавливаю прокси на этом сервере") { stopLocalProxy(it) }
                     },
                     onRemove = {
-                        runOutboundAction("Удаляю прокси с этого сервера") { removeLocalProxy(it) }
+                        runOutboundAction(
+                            title = "Удаляю прокси с этого сервера",
+                            onSuccess = {
+                                localProxyPortInput = ""
+                                localProxyLoginInput = ""
+                                localProxyPasswordInput = ""
+                            }
+                        ) { removeLocalProxy(it) }
                     }
                 )
                 OutboundDialog.ExternalProxy -> ExternalProxyDialog(
@@ -2233,6 +2471,7 @@ fun DeployTab(
                     loginInput = externalProxyLoginInput,
                     passwordInput = externalProxyPasswordInput,
                     disableEnabled = canDisableOutboundDialog(outboundSnapshot, OutboundDialog.ExternalProxy),
+                    deleteEnabled = canDeleteExternalProxy(outboundSnapshot),
                     onKindChanged = { externalProxyKindName = it.name },
                     onHostChanged = { externalProxyHostInput = it },
                     onPortChanged = { externalProxyPortInput = it },
@@ -2260,6 +2499,18 @@ fun DeployTab(
                     },
                     onDisable = {
                         runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) }
+                    },
+                    onDelete = {
+                        runOutboundAction(
+                            title = "Удаляю настройки внешнего TCP-прокси",
+                            onSuccess = {
+                                externalProxyKindName = ProxyKind.Socks5.name
+                                externalProxyHostInput = ""
+                                externalProxyPortInput = ""
+                                externalProxyLoginInput = ""
+                                externalProxyPasswordInput = ""
+                            }
+                        ) { deleteExternalProxy(it) }
                     }
                 )
                 OutboundDialog.WireGuardVps -> WireGuardExitVpsDialog(
@@ -2277,9 +2528,9 @@ fun DeployTab(
                     privateKeyConfigured = savedWireGuardExitSshPrivateKey.isNotBlank(),
                     hasSshAuthentication = wireGuardExitSshCredentials.hasAuthentication,
                     wgPortInput = wireGuardExitPortInput,
-                    dnsInput = wireGuardExitDnsInput,
                     disableEnabled = canDisableOutboundDialog(outboundSnapshot, OutboundDialog.WireGuardVps),
                     checkEnabled = true,
+                    deleteEnabled = canDeleteWireGuardVps(outboundSnapshot),
                     onHostChanged = { wireGuardExitHostInput = it },
                     onSshPortChanged = { wireGuardExitSshPortInput = it },
                     onUserChanged = { wireGuardExitUserInput = it },
@@ -2291,16 +2542,14 @@ fun DeployTab(
                     onEditSshKey = { showWireGuardExitSshKeyDialog = true },
                     onSshHelp = { showWireGuardExitSshHelp = true },
                     onWgPortChanged = { wireGuardExitPortInput = it },
-                    onDnsChanged = { wireGuardExitDnsInput = it },
                     onDismiss = { outboundDialog = null },
-                    onInstall = { foreignHost, foreignPort, foreignUser, foreignPassword, wgPort, dns ->
+                    onInstall = { foreignHost, foreignPort, foreignUser, foreignPassword, wgPort ->
                         val forms = currentOutboundProfileForms().copy(
                             wireGuardExitHost = foreignHost,
                             wireGuardExitSshPort = foreignPort.toString(),
                             wireGuardExitUser = foreignUser,
                             wireGuardExitPassword = foreignPassword,
-                            wireGuardExitPort = wgPort.toString(),
-                            wireGuardExitDns = dns
+                            wireGuardExitPort = wgPort.toString()
                         )
                         runOutboundAction("Настраиваю WireGuard-выход через другой сервер", preflightRouteMode = "wireguard_vps") {
                             val result = installWireGuardExitVps(
@@ -2310,8 +2559,7 @@ fun DeployTab(
                                 foreignPort = foreignPort,
                                 foreignUser = foreignUser,
                                 foreignCredentials = wireGuardExitSshCredentials,
-                                wgPort = wgPort,
-                                dns = dns
+                                wgPort = wgPort
                             )
                             val saveMessage = saveOutboundProfileMessage(context, it, forms, "Поля выхода через другой сервер сохранены на сервере для восстановления.")
                             "$result\n$saveMessage"
@@ -2330,6 +2578,35 @@ fun DeployTab(
                     },
                     onDisable = {
                         runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) }
+                    },
+                    onDelete = {
+                        val foreignHost = wireGuardExitHostInput.trim()
+                        val foreignPort = wireGuardExitSshPortInput.toIntOrNull() ?: 0
+                        val foreignUser = wireGuardExitUserInput.trim()
+                        runOutboundAction(
+                            title = "Удаляю выход через другой сервер",
+                            onSuccess = {
+                                wireGuardExitHostInput = ""
+                                wireGuardExitSshPortInput = ""
+                                wireGuardExitUserInput = ""
+                                wireGuardExitPasswordInput = ""
+                                wireGuardExitPortInput = ""
+                                wireGuardExitDnsInput = ""
+                                scope.launch {
+                                    settingsStore.saveWireGuardExitSshKey("", "")
+                                    settingsStore.saveWireGuardExitSshAuthMode("password")
+                                }
+                                wireGuardExitSshAuthMode = "password"
+                            }
+                        ) {
+                            deleteWireGuardExitVps(
+                                current = it,
+                                foreignHost = foreignHost,
+                                foreignPort = foreignPort,
+                                foreignUser = foreignUser,
+                                foreignCredentials = wireGuardExitSshCredentials
+                            )
+                        }
                     }
                 )
                 OutboundDialog.FreeWarp -> FreeWarpDialog(
@@ -2429,8 +2706,10 @@ fun DeployTab(
                         }
                     },
                     onDelete = {
-                        importedWgConfigText = ""
-                        runOutboundAction("Удаляю VPN/WireGuard-файл и возвращаю прямой выход") { deleteImportedWireGuardExit(it) }
+                        runOutboundAction(
+                            title = "Удаляю VPN/WireGuard-файл",
+                            onSuccess = { importedWgConfigText = "" }
+                        ) { deleteImportedWireGuardExit(it) }
                     }
                 )
                 OutboundDialog.Diagnostics -> OutboundDiagnosticsDialog(
@@ -2554,7 +2833,7 @@ fun DeployTab(
                 ) {
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
             Text(
-                "Экспорт сохраняет базу WDTT Plus: профиль владельца, Telegram-бота, клиентов, привязки устройств, статистику и историю. Полный экспорт дополнительно сохраняет WireGuard-ключи сервера.",
+                "Экспорт сохраняет базу WDTT Plus: профиль и устройства владельца, настройки Telegram-бота, клиентов, сроки хранения записей, привязки устройств, статистику и историю. Полный экспорт дополнительно сохраняет WireGuard-ключи сервера.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -2572,6 +2851,11 @@ fun DeployTab(
                 "Файл экспорта содержит секреты доступа. Храните его как пароль от сервера.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error
+            )
+            Text(
+                "Новые файлы экспорта получают контрольные суммы. Перед импортом приложение проверяет целостность базы и WireGuard-ключей; старые файлы остаются совместимыми.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             Row(
@@ -2629,7 +2913,7 @@ fun DeployTab(
                                     includeWgKeys = includeKeys
                                 )
                                 pendingExportBackup = backup
-                                migrationStatus = "Бэкап подготовлен: паролей ${backup.passwordCount}, устройств ${backup.deviceCount}. Выберите место сохранения."
+                                migrationStatus = "Бэкап подготовлен: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}. Выберите место сохранения."
                                 val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
                                 val safeHost = ip.replace(Regex("[^A-Za-z0-9_.-]"), "_").ifBlank { "server" }
                                 exportLauncher.launch("wdtt-backup-$safeHost-$stamp.json")
@@ -2674,9 +2958,22 @@ fun DeployTab(
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
-                            "Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: ${backup.passwordCount} паролей, ${backup.deviceCount} устройств${if (backup.hasWgKeys) ", WG-ключи сервера включены" else ", без WG-ключей сервера"}.",
+                            "Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: ${backup.passwordCount} клиентов, ${backup.deviceCount} устройств${if (backup.hasWgKeys) ", WG-ключи сервера включены" else ", без WG-ключей сервера"}.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            if (backup.integrityVerified) {
+                                "Целостность файла подтверждена."
+                            } else {
+                                "Старый совместимый формат: контрольной суммы в файле нет."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (backup.integrityVerified) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            }
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                             FilterChip(
@@ -2698,7 +2995,7 @@ fun DeployTab(
                             if (selectedImportMode == ServerImportMode.Replace) {
                                 "Заменить: база сервера будет перезаписана бэкапом. Это режим для переезда на новый сервер."
                             } else {
-                                "Добавить: текущие настройки сервера сохранятся, отсутствующие пароли и устройства будут добавлены без перезаписи конфликтов."
+                                "Добавить: текущие настройки сервера сохранятся, отсутствующие клиенты и устройства будут добавлены без перезаписи конфликтов."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -3031,7 +3328,7 @@ private fun DeployResultPanel(
 }
 
 @Composable
-private fun DeploySuccessBanner(successCountdown: Int) {
+private fun DeploySuccessBanner(successCountdown: Int, serverVersion: String) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -3045,12 +3342,19 @@ private fun DeploySuccessBanner(successCountdown: Int) {
         ) {
             Icon(Icons.Default.CheckCircle, contentDescription = null, tint = WDTTColors.connected)
             Spacer(Modifier.width(8.dp))
-            Text(
-                text = "Деплой успешно завершён ($successCountdown)",
-                color = WDTTColors.connected,
-                fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.bodyMedium
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = "Деплой успешно завершён ($successCountdown)",
+                    color = WDTTColors.connected,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Text(
+                    text = "Серверная часть: WDTT Plus $serverVersion",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
         }
     }
 }
@@ -3147,6 +3451,11 @@ private fun OutboundRoutingSection(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Text(
+                    "Отдельного переключателя режимов нет: кнопка включения или установки внутри выбранного варианта делает его текущим и отключает прежний выход. «Вернуть прямой выход» принудительно отключает все внешние маршруты WDTT, но сохраняет их настройки для повторного включения.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.tertiary
+                )
                 OutboundServerStateCard(
                     snapshot = snapshot,
                     snapshotBusy = snapshotBusy,
@@ -3158,7 +3467,7 @@ private fun OutboundRoutingSection(
                 )
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutboundModeButton(
-                        title = "Прокси VPS",
+                        title = "Прокси на этом VPS",
                         description = "Создаёт SOCKS5/HTTP на этом сервере. IP не скрывает: выход будет через тот же VPS.",
                         enabled = enabled,
                         indicator = outboundModeIndicator(snapshot, OutboundDialog.LocalProxy)
@@ -3199,7 +3508,7 @@ private fun OutboundRoutingSection(
                     }
                 }
                 Text(
-                    "«Заполнить» читает сохранённые настройки с сервера и заменяет ими только локальные поля этого блока. На сервер ничего не записывается; активный режим выхода не переключается.",
+                    "«Загрузить настройки» читает сохранённые значения с сервера и заменяет ими только поля текущего VPN-профиля в приложении. На сервер ничего не записывается; активный режим выхода не переключается.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -3219,7 +3528,7 @@ private fun OutboundRoutingSection(
                             CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(6.dp))
                         }
-                        Text(if (restoring) "Читаю..." else "Заполнить", fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
+                        Text(if (restoring) "Загрузка..." else "Загрузить настройки", fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
                     }
                     OutlinedButton(
                         onClick = onStatus,
@@ -3232,7 +3541,7 @@ private fun OutboundRoutingSection(
                             CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(6.dp))
                         }
-                        Text(if (readingStatus) "Читаю..." else "Статус", fontWeight = FontWeight.SemiBold)
+                        Text(if (readingStatus) "Проверка..." else "Подробный статус", fontWeight = FontWeight.SemiBold)
                     }
                 }
                 if (status.isNotBlank()) {
@@ -3488,8 +3797,10 @@ private fun LocalProxyDialog(
     onRemove: () -> Unit
 ) {
     var passwordFocused by rememberSaveable { mutableStateOf(false) }
+    var confirmRemove by rememberSaveable { mutableStateOf(false) }
     val port = portInput.toIntOrNull()?.takeIf { it in 1..65533 }
-    OutboundDialogFrame("Прокси VPS", status, progressTitle, progress, onDismiss) {
+    val credentialsIssue = localProxyCredentialsIssue(loginInput, passwordInput)
+    OutboundDialogFrame("Прокси на этом VPS", status, progressTitle, progress, onDismiss) {
         OutboundDialogStateBanner(indicator)
         Text(
             "На этом же VPS будут созданы два входа с одним логином и паролем: SOCKS5 и HTTP. Это удобно как прокси, но IP не маскирует: наружу будет виден текущий сервер.",
@@ -3510,6 +3821,7 @@ private fun LocalProxyDialog(
             onValueChange = { onLoginChanged(it.filter { c -> !c.isWhitespace() }.take(40)) },
             label = { Text("Логин") },
             singleLine = true,
+            isError = credentialsIssue != null && loginInput.isNotBlank(),
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp)
         )
@@ -3518,12 +3830,16 @@ private fun LocalProxyDialog(
             onValueChange = { onPasswordChanged(it.filter { c -> !c.isWhitespace() }.take(80)) },
             label = { Text("Пароль") },
             singleLine = true,
+            isError = credentialsIssue != null && passwordInput.isNotBlank(),
             visualTransformation = if (passwordFocused) VisualTransformation.None else PasswordVisualTransformation(),
             modifier = Modifier
                 .fillMaxWidth()
                 .onFocusChanged { passwordFocused = it.isFocused },
             shape = RoundedCornerShape(16.dp)
         )
+        if (credentialsIssue != null) {
+            InlineActionMessage(credentialsIssue)
+        }
         if (port != null) {
             Text(
                 "SOCKS5: порт $port. HTTP: порт ${port + 1}. Веб-страница 3proxy: порт ${port + 2}. Логин и пароль одинаковые для всех вариантов. «Проверить» не устанавливает прокси, а подключается к уже запущенному SOCKS5 с этими данными.",
@@ -3537,11 +3853,11 @@ private fun LocalProxyDialog(
             secondaryBusy = actionTitle.contains("Проверяю прокси", ignoreCase = true),
             primaryText = "Установить",
             primaryBusyText = "Установка...",
-            primaryEnabled = port != null && loginInput.isNotBlank() && passwordInput.length >= 8,
+            primaryEnabled = port != null && credentialsIssue == null,
             onPrimary = { onInstall(port ?: 1080, loginInput, passwordInput) },
             secondaryText = "Проверить",
             secondaryBusyText = "Проверка...",
-            secondaryEnabled = port != null && loginInput.isNotBlank() && passwordInput.isNotBlank(),
+            secondaryEnabled = port != null && credentialsIssue == null,
             onSecondary = { onCheck(port ?: 1080, loginInput, passwordInput) }
         )
         OutlinedButton(
@@ -3572,7 +3888,7 @@ private fun LocalProxyDialog(
                 Text(if (stopping) "Остановка..." else "Остановить", textAlign = TextAlign.Center)
             }
             OutlinedButton(
-                onClick = onRemove,
+                onClick = { confirmRemove = true },
                 enabled = !busy && removeEnabled,
                 modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(16.dp),
@@ -3586,6 +3902,29 @@ private fun LocalProxyDialog(
                 Text(if (removing) "Удаление..." else "Удалить", textAlign = TextAlign.Center)
             }
         }
+    }
+    if (confirmRemove) {
+        AlertDialog(
+            onDismissRequest = { if (!busy) confirmRemove = false },
+            title = { Text("Удалить прокси с этого VPS?") },
+            text = {
+                Text(
+                    "Будут удалены служба, конфигурация и правила доступа к портам. Установленный бинарник 3proxy останется в системе и сможет использоваться при повторной установке."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirmRemove = false
+                        onRemove()
+                    },
+                    enabled = !busy
+                ) { Text("Удалить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRemove = false }, enabled = !busy) { Text("Отмена") }
+            }
+        )
     }
 }
 
@@ -3603,6 +3942,7 @@ private fun ExternalProxyDialog(
     loginInput: String,
     passwordInput: String,
     disableEnabled: Boolean,
+    deleteEnabled: Boolean,
     onKindChanged: (ProxyKind) -> Unit,
     onHostChanged: (String) -> Unit,
     onPortChanged: (String) -> Unit,
@@ -3611,11 +3951,14 @@ private fun ExternalProxyDialog(
     onDismiss: () -> Unit,
     onCheck: (ProxyKind, String, Int, String, String) -> Unit,
     onEnable: (ProxyKind, String, Int, String, String) -> Unit,
-    onDisable: () -> Unit
+    onDisable: () -> Unit,
+    onDelete: () -> Unit
 ) {
     var passwordFocused by rememberSaveable { mutableStateOf(false) }
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
     val port = portInput.toIntOrNull()?.takeIf { it in 1..65535 }
     val hostValid = hostInput.isValidPublicHost()
+    val credentialsIssue = externalProxyCredentialsIssue(loginInput, passwordInput)
     OutboundDialogFrame("Внешний TCP-прокси", status, progressTitle, progress, onDismiss) {
         OutboundDialogStateBanner(indicator)
         Text(
@@ -3670,6 +4013,9 @@ private fun ExternalProxyDialog(
                 .onFocusChanged { passwordFocused = it.isFocused },
             shape = RoundedCornerShape(16.dp)
         )
+        if (credentialsIssue != null) {
+            InlineActionMessage(credentialsIssue)
+        }
         Text(
             "При включении прежний внешний выход WDTT будет выключен, затем начнёт работать этот прокси. Это маскирует только поддерживаемый TCP-трафик пользователей; обычный интернет самого сервера не меняется.",
             style = MaterialTheme.typography.bodySmall,
@@ -3681,21 +4027,60 @@ private fun ExternalProxyDialog(
             secondaryBusy = actionTitle.contains("Проверяю доступность", ignoreCase = true),
             primaryText = "Включить",
             primaryBusyText = "Включение...",
-            primaryEnabled = hostValid && port != null,
+            primaryEnabled = hostValid && port != null && credentialsIssue == null,
             onPrimary = { onEnable(kind, hostInput.trim(), port ?: 1080, loginInput, passwordInput) },
             secondaryText = "Проверить",
             secondaryBusyText = "Проверка...",
-            secondaryEnabled = hostValid && port != null,
+            secondaryEnabled = hostValid && port != null && credentialsIssue == null,
             onSecondary = { onCheck(kind, hostInput.trim(), port ?: 1080, loginInput, passwordInput) }
         )
-        OutlinedButton(onClick = onDisable, enabled = !busy && disableEnabled, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-            val disabling = actionTitle.contains("Возвращаю", ignoreCase = true)
-            if (disabling) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.width(6.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = onDisable,
+                enabled = !busy && disableEnabled,
+                modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                val disabling = actionTitle.contains("Возвращаю", ignoreCase = true)
+                if (disabling) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(if (disabling) "Отключение..." else "Отключить")
             }
-            Text(if (disabling) "Отключение..." else "Отключить")
+            OutlinedButton(
+                onClick = { confirmDelete = true },
+                enabled = !busy && deleteEnabled,
+                modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text("Удалить")
+            }
         }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { if (!busy) confirmDelete = false },
+            title = { Text("Удалить настройки внешнего прокси?") },
+            text = {
+                Text("С текущего VPS будут удалены служба, конфигурация, сохранённые реквизиты и правила перенаправления внешнего TCP-прокси.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirmDelete = false
+                        onDelete()
+                    },
+                    enabled = !busy
+                ) { Text("Удалить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }, enabled = !busy) { Text("Отмена") }
+            }
+        )
     }
 }
 
@@ -3715,9 +4100,9 @@ private fun WireGuardExitVpsDialog(
     privateKeyConfigured: Boolean,
     hasSshAuthentication: Boolean,
     wgPortInput: String,
-    dnsInput: String,
     disableEnabled: Boolean,
     checkEnabled: Boolean,
+    deleteEnabled: Boolean,
     onHostChanged: (String) -> Unit,
     onSshPortChanged: (String) -> Unit,
     onUserChanged: (String) -> Unit,
@@ -3726,13 +4111,14 @@ private fun WireGuardExitVpsDialog(
     onEditSshKey: () -> Unit,
     onSshHelp: () -> Unit,
     onWgPortChanged: (String) -> Unit,
-    onDnsChanged: (String) -> Unit,
     onDismiss: () -> Unit,
-    onInstall: (String, Int, String, String, Int, String) -> Unit,
+    onInstall: (String, Int, String, String, Int) -> Unit,
     onCheck: () -> Unit,
-    onDisable: () -> Unit
+    onDisable: () -> Unit,
+    onDelete: () -> Unit
 ) {
     var passwordFocused by rememberSaveable { mutableStateOf(false) }
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
     val hostValid = hostInput.isValidPublicHost()
     val sshPort = sshPortInput.toIntOrNull()?.takeIf { it in 1..65535 }
     val wgPort = wgPortInput.toIntOrNull()?.takeIf { it in 1..65535 }
@@ -3759,7 +4145,10 @@ private fun WireGuardExitVpsDialog(
                     selected = sshAuthMode == mode,
                     onClick = { onSshAuthModeChanged(mode) },
                     shape = SegmentedButtonDefaults.itemShape(index, 2),
-                    enabled = !busy
+                    enabled = !busy,
+                    icon = {
+                        StableSegmentedButtonIcon(selected = sshAuthMode == mode)
+                    },
                 ) { Text(label) }
             }
         }
@@ -3817,28 +4206,24 @@ private fun WireGuardExitVpsDialog(
                 Text(if (privateKeyConfigured) "Приватный SSH-ключ добавлен" else "Добавить приватный SSH-ключ")
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(
-                value = wgPortInput,
-                onValueChange = { onWgPortChanged(it.filter(Char::isDigit).take(5)) },
-                label = { Text("Порт WireGuard") },
-                singleLine = true,
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(16.dp)
-            )
-            OutlinedTextField(
-                value = dnsInput,
-                onValueChange = { onDnsChanged(it.filter { c -> !c.isWhitespace() }) },
-                label = { Text("DNS") },
-                singleLine = true,
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(16.dp)
-            )
-        }
+        OutlinedTextField(
+            value = wgPortInput,
+            onValueChange = { onWgPortChanged(it.filter(Char::isDigit).take(5)) },
+            label = { Text("UDP-порт WireGuard") },
+            supportingText = { Text("Порт будет открыт на дополнительном VPS.") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp)
+        )
         Text(
-            "Если настройка не получится, WDTT Plus попытается вернуть прямой выход через текущий сервер. Приватный SSH-ключ дополнительного VPS хранится только на этом Android-устройстве; после переустановки приложения его потребуется добавить снова.",
+            "Если настройка не получится, WDTT Plus восстановит прежние настройки на обоих VPS. DNS-параметры VPN-профиля здесь не применяются: DNS для клиентов задаётся в основных настройках WDTT. Приватный SSH-ключ дополнительного VPS хранится только на этом Android-устройстве; после переустановки приложения его потребуется добавить снова.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.error
+        )
+        Text(
+            "«Отключить» возвращает прямой выход на текущем VPS и оставляет WireGuard на дополнительном VPS готовым для повторного включения. «Удалить» очищает созданную WDTT-конфигурацию на обоих VPS.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         DialogButtons(
             busy = busy,
@@ -3847,20 +4232,62 @@ private fun WireGuardExitVpsDialog(
             primaryText = "Настроить выход",
             primaryBusyText = "Настройка...",
             primaryEnabled = hostValid && sshPort != null && wgPort != null && userInput.isNotBlank() && hasSshAuthentication,
-            onPrimary = { onInstall(hostInput.trim(), sshPort ?: 22, userInput, passwordInput, wgPort ?: 51820, dnsInput) },
+            onPrimary = { onInstall(hostInput.trim(), sshPort ?: 22, userInput, passwordInput, wgPort ?: 51820) },
             secondaryText = "Проверить",
             secondaryBusyText = "Проверка...",
             secondaryEnabled = checkEnabled,
             onSecondary = onCheck
         )
-        OutlinedButton(onClick = onDisable, enabled = !busy && disableEnabled, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-            val disabling = actionTitle.contains("Возвращаю", ignoreCase = true)
-            if (disabling) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.width(6.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = onDisable,
+                enabled = !busy && disableEnabled,
+                modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                val disabling = actionTitle.contains("Возвращаю", ignoreCase = true)
+                if (disabling) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(if (disabling) "Отключение..." else "Отключить")
             }
-            Text(if (disabling) "Отключение..." else "Отключить")
+            OutlinedButton(
+                onClick = { confirmDelete = true },
+                enabled = !busy && deleteEnabled && hostValid && sshPort != null &&
+                    userInput.isNotBlank() && hasSshAuthentication,
+                modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text("Удалить")
+            }
         }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { if (!busy) confirmDelete = false },
+            title = { Text("Удалить выход через другой сервер?") },
+            text = {
+                Text(
+                    "Текущий VPS сначала вернётся на прямой выход. Затем на дополнительном VPS будут удалены созданные WDTT WireGuard-служба, конфигурация, ключи и правила firewall. Потребуется рабочий SSH-доступ к обоим серверам."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirmDelete = false
+                        onDelete()
+                    },
+                    enabled = !busy
+                ) { Text("Удалить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }, enabled = !busy) { Text("Отмена") }
+            }
+        )
     }
 }
 
@@ -4126,6 +4553,7 @@ private fun ImportedWireGuardDialog(
     onDelete: () -> Unit
 ) {
     var configText by rememberSaveable(initialConfig) { mutableStateOf(initialConfig) }
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
     val valid = configText.isNotBlank() && validateWireGuardConfigText(configText).isSuccess
     OutboundDialogFrame("VPN/WireGuard-файл", status, progressTitle, progress, onDismiss) {
         OutboundDialogStateBanner(indicator)
@@ -4208,7 +4636,7 @@ private fun ImportedWireGuardDialog(
                 Text(if (disabling) "Отключение..." else "Отключить", textAlign = TextAlign.Center)
             }
             OutlinedButton(
-                onClick = onDelete,
+                onClick = { confirmDelete = true },
                 enabled = !busy && deleteEnabled,
                 modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(16.dp),
@@ -4222,6 +4650,29 @@ private fun ImportedWireGuardDialog(
                 Text(if (deleting) "Удаление..." else "Удалить", textAlign = TextAlign.Center)
             }
         }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { if (!busy) confirmDelete = false },
+            title = { Text("Удалить VPN/WireGuard-файл?") },
+            text = {
+                Text(
+                    "Рабочий файл и его сохранённая копия на текущем сервере будут удалены, а выход WDTT вернётся на прямой. Для повторного включения потребуется выбрать файл заново."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirmDelete = false
+                        onDelete()
+                    },
+                    enabled = !busy
+                ) { Text("Удалить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }, enabled = !busy) { Text("Отмена") }
+            }
+        )
     }
 }
 
@@ -4263,6 +4714,13 @@ private fun OutboundDiagnosticsDialog(
 private fun InlineActionMessage(status: String, modifier: Modifier = Modifier) {
     val isError = status.startsWith("Ошибка", true) ||
         status.startsWith("Укажите", true) ||
+        status.startsWith("В логине", true) ||
+        status.startsWith("В пароле", true) ||
+        status.startsWith("Пароль должен", true) ||
+        status.startsWith("Для указанного", true) ||
+        status.startsWith("Для пароля", true) ||
+        status.startsWith("Логин внешнего", true) ||
+        status.startsWith("Пароль внешнего", true) ||
         status.startsWith("Выбран публичный", true) ||
         status.startsWith("Формат ключа", true) ||
         status.contains("добавьте приватный", true) ||
@@ -4672,6 +5130,39 @@ internal fun serverDiagnosticsScript(
         sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1
       fi
     }
+    wdtt_diag_wg_exit_probe() {
+      mode="${'$'}1"
+      source_ip="${'$'}(ip -4 -o addr show dev wdtt0 2>/dev/null | awk '{split(${'$'}4, addr, "/"); print addr[1]; exit}')"
+      if ! wdtt_diag_cmd curl; then
+        echo "не выполнена: curl отсутствует"
+        return 2
+      fi
+      if [ -z "${'$'}source_ip" ]; then
+        echo "не выполнена: адрес интерфейса wdtt0 не найден"
+        return 1
+      fi
+      trace="${'$'}(curl -4fsS --interface "${'$'}source_ip" --connect-timeout 8 --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+      if [ -z "${'$'}trace" ]; then
+        echo "не пройдена: HTTPS через маршрут WDTT не отвечает"
+        return 1
+      fi
+      exit_ip="${'$'}(printf '%s\n' "${'$'}trace" | sed -n 's/^ip=//p' | head -n 1)"
+      if [ "${'$'}mode" = "warp_free" ]; then
+        warp_state="${'$'}(printf '%s\n' "${'$'}trace" | sed -n 's/^warp=//p' | head -n 1)"
+        case "${'$'}warp_state" in
+          on|plus)
+            echo "пройдена: Cloudflare подтвердил warp=${'$'}warp_state, выходной IPv4 ${'$'}{exit_ip:-определён}"
+            return 0
+            ;;
+          *)
+            echo "не пройдена: маршрут отвечает, но Cloudflare сообщил warp=${'$'}{warp_state:-не определён}"
+            return 1
+            ;;
+        esac
+      fi
+      echo "пройдена: HTTPS через маршрут WDTT отвечает, выходной IPv4 ${'$'}{exit_ip:-определён}"
+      return 0
+    }
 
     OS_NAME="${'$'}(wdtt_diag_os_name)"
     OS_ID="${'$'}(wdtt_diag_os_id)"
@@ -4800,34 +5291,24 @@ internal fun serverDiagnosticsScript(
       wdtt_diag_emit "WARNING" "Сеть сервера" "публичный IPv4 не проверен" "${'$'}NET_DETAILS" "Проверьте исходящий HTTPS-доступ с сервера; он нужен для wgcf, WARP-проверок и обновлений."
     fi
 
-    VK_WARN=0
     VK_DETAILS=""
-    for host in vk.com api.vk.me calls.okcdn.ru id.vk.com static.vk.com static.vk.ru; do
+    for host in api.vk.me calls.okcdn.ru login.vk.ru api.vk.ru; do
       resolved="${'$'}(wdtt_diag_resolve_host "${'$'}host")"
       if [ -n "${'$'}resolved" ]; then
         VK_DETAILS="${'$'}VK_DETAILS ${'$'}host DNS: ${'$'}resolved;"
       else
-        VK_WARN=1
         VK_DETAILS="${'$'}VK_DETAILS ${'$'}host DNS: не разрешается;"
       fi
     done
-    VK_HTTP="${'$'}(wdtt_diag_http_probe https://vk.com/)"; VK_HTTP_CODE="${'$'}?"
-    [ "${'$'}VK_HTTP_CODE" = "0" ] || VK_WARN=1
-    VK_DETAILS="${'$'}VK_DETAILS vk.com HTTPS: ${'$'}VK_HTTP;"
-    VK_API_HTTP="${'$'}(wdtt_diag_http_probe 'https://api.vk.me/method/users.get?v=5.131')"; VK_API_HTTP_CODE="${'$'}?"
-    [ "${'$'}VK_API_HTTP_CODE" = "0" ] || VK_WARN=1
-    VK_DETAILS="${'$'}VK_DETAILS api.vk.me HTTPS: ${'$'}VK_API_HTTP;"
-    OK_HTTP="${'$'}(wdtt_diag_http_probe https://calls.okcdn.ru/fb.do)"; OK_HTTP_CODE="${'$'}?"
-    [ "${'$'}OK_HTTP_CODE" = "0" ] || VK_WARN=1
-    VK_DETAILS="${'$'}VK_DETAILS calls.okcdn.ru HTTPS: ${'$'}OK_HTTP;"
-    CAPTCHA_HTTP="${'$'}(wdtt_diag_http_probe https://id.vk.com/)"; CAPTCHA_HTTP_CODE="${'$'}?"
-    [ "${'$'}CAPTCHA_HTTP_CODE" = "0" ] || VK_WARN=1
-    VK_DETAILS="${'$'}VK_DETAILS id.vk.com HTTPS: ${'$'}CAPTCHA_HTTP."
-    if [ "${'$'}VK_WARN" = "0" ]; then
-      wdtt_diag_emit "OK" "VK / TURN-зависимости" "базовая доступность есть" "${'$'}VK_DETAILS Реальные TURN-адреса выдаются VK/OK только для конкретного живого VK-хеша, поэтому TURN Allocate без хеша здесь не выполняется." "Если туннель не стартует, дополнительно проверьте VK-хеш на телефоне: там проверяется получение TURN credentials и возможная капча."
-    else
-      wdtt_diag_emit "WARNING" "VK / TURN-зависимости" "есть риск недоступности" "${'$'}VK_DETAILS Реальные TURN-адреса выдаются VK/OK только для конкретного живого VK-хеша, поэтому TURN Allocate без хеша здесь не выполняется." "Проверьте DNS/HTTPS-доступ к VK и OK CDN с VPS, регион VPS и состояние VK-хеша на телефоне."
-    fi
+    VK_API_ME_HTTP="${'$'}(wdtt_diag_http_probe 'https://api.vk.me/method/users.get?v=5.276')"
+    VK_DETAILS="${'$'}VK_DETAILS основной api.vk.me HTTPS: ${'$'}VK_API_ME_HTTP;"
+    OK_HTTP="${'$'}(wdtt_diag_http_probe https://calls.okcdn.ru/fb.do)"
+    VK_DETAILS="${'$'}VK_DETAILS основной calls.okcdn.ru HTTPS: ${'$'}OK_HTTP;"
+    VK_LOGIN_HTTP="${'$'}(wdtt_diag_http_probe https://login.vk.ru/)"
+    VK_DETAILS="${'$'}VK_DETAILS legacy login.vk.ru HTTPS: ${'$'}VK_LOGIN_HTTP;"
+    VK_API_RU_HTTP="${'$'}(wdtt_diag_http_probe 'https://api.vk.ru/method/users.get?v=5.275')"
+    VK_DETAILS="${'$'}VK_DETAILS legacy api.vk.ru HTTPS: ${'$'}VK_API_RU_HTTP."
+    wdtt_diag_emit "INFO" "VK/OK с VPS (справочно)" "не влияет на основной VK-вход" "${'$'}VK_DETAILS Получение VK-токенов и решение капчи выполняются на телефоне, а не на VPS. Поэтому недоступность этих HTTPS-адресов именно с сервера не считается ошибкой туннеля; серверу важнее рабочая служба, UDP-порты, маршрутизация и выходной интернет." "Если туннель не стартует, запустите «Проверить устройство»: она проверяет api.vk.me, calls.okcdn.ru, DNS и резервную цепочку из реальной сети телефона."
 
     TELEGRAM_CONFIGURED=0
     if [ -r /etc/wdtt/access.json ] && grep -Eq '"bot_token"[[:space:]]*:[[:space:]]*"[^"]{10,}"' /etc/wdtt/access.json 2>/dev/null; then
@@ -4882,12 +5363,27 @@ internal fun serverDiagnosticsScript(
       wdtt_diag_emit "WARNING" "Бесплатный WARP" "есть риск, что не заработает" "${'$'}WARP_DETAILS" "Проверьте исходящий HTTPS к Cloudflare/GitHub, UDP к WARP endpoint, WireGuard-стек ядра и попробуйте другой MTU/endpoint или регион VPS."
     fi
 
+    OUT_MODE="${'$'}(wdtt_diag_outbound_mode)"
+    WDTT_SERVICE_FOR_ROUTING="${'$'}(wdtt_diag_service_state wdtt.service)"
     FIREWALL_DETAILS=""
+    NAT_RULES=0
+    DIRECT_NAT_ACTIVE=0
+    WG_NAT_ACTIVE=0
+    WG_POLICY_RULE_ACTIVE=0
+    WG_DEFAULT_ROUTE_ACTIVE=0
+    WG_INTERFACE_ACTIVE=0
+    WG_SERVICE_ACTIVE=0
     if wdtt_diag_cmd iptables; then
       NAT_RULES="${'$'}(iptables -t nat -S 2>/dev/null | grep -c 'WDTT\\|wdtt\\|MASQUERADE' 2>/dev/null)"
       FIREWALL_DETAILS="iptables найден; NAT-правил WDTT/MASQUERADE: ${'$'}NAT_RULES."
       FIREWALL_SEVERITY="OK"
       FIREWALL_STATUS="iptables доступен"
+      iptables -t nat -S POSTROUTING 2>/dev/null |
+        grep -q -- '--comment WDTT_MANAGED .*MASQUERADE' &&
+        DIRECT_NAT_ACTIVE=1
+      iptables -t nat -S POSTROUTING 2>/dev/null |
+        grep -q -- "-o wg-wdtt-exit .*--comment WDTT_EXIT .*MASQUERADE" &&
+        WG_NAT_ACTIVE=1
     elif wdtt_diag_cmd nft; then
       FIREWALL_DETAILS="iptables не найден, nft найден. Часть скриптов WDTT Plus ожидает iptables-совместимый интерфейс."
       FIREWALL_SEVERITY="WARNING"
@@ -4901,8 +5397,47 @@ internal fun serverDiagnosticsScript(
       RULES="${'$'}(ip rule show 2>/dev/null | grep -c 'lookup 100\\|from .* table 100' 2>/dev/null)"
       ROUTE100="${'$'}(ip route show table 100 2>/dev/null | head -n 2 | tr '\n' '; ')"
       FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS Policy routing table 100 rules: ${'$'}RULES. table 100: ${'$'}{ROUTE100:-пусто}."
+      ip rule show 2>/dev/null |
+        grep -Eq 'from [^ ]+ lookup 100([[:space:]]|${'$'})|from [^ ]+ lookup wdtt-exit([[:space:]]|${'$'})|from [^ ]+ table 100([[:space:]]|${'$'})' &&
+        WG_POLICY_RULE_ACTIVE=1
+      ip route show table 100 2>/dev/null |
+        grep -Eq '^default([[:space:]].*)? dev wg-wdtt-exit([[:space:]]|${'$'})' &&
+        WG_DEFAULT_ROUTE_ACTIVE=1
+      ip link show dev wg-wdtt-exit >/dev/null 2>&1 && WG_INTERFACE_ACTIVE=1
     fi
-    wdtt_diag_emit "${'$'}FIREWALL_SEVERITY" "Маршрутизация и NAT" "${'$'}FIREWALL_STATUS" "${'$'}FIREWALL_DETAILS" "Для внешнего выхода WDTT через WARP/VPN/прокси нужны ip rule/ip route и NAT."
+    if wdtt_diag_cmd systemctl && systemctl is-active --quiet wdtt-wg-exit.service 2>/dev/null; then
+      WG_SERVICE_ACTIVE=1
+    fi
+    case "${'$'}OUT_MODE" in
+      warp_free|wireguard_vps|imported_wg)
+        FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS WireGuard-выход: интерфейс=${'$'}WG_INTERFACE_ACTIVE, служба=${'$'}WG_SERVICE_ACTIVE, правило=${'$'}WG_POLICY_RULE_ACTIVE, маршрут=${'$'}WG_DEFAULT_ROUTE_ACTIVE, NAT=${'$'}WG_NAT_ACTIVE."
+        WG_EXIT_PROBE="${'$'}(wdtt_diag_wg_exit_probe "${'$'}OUT_MODE")"
+        WG_EXIT_PROBE_CODE="${'$'}?"
+        FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS Сквозная проверка: ${'$'}WG_EXIT_PROBE."
+        if [ "${'$'}WG_INTERFACE_ACTIVE" = "1" ] &&
+           [ "${'$'}WG_SERVICE_ACTIVE" = "1" ] &&
+           [ "${'$'}WG_POLICY_RULE_ACTIVE" = "1" ] &&
+           [ "${'$'}WG_DEFAULT_ROUTE_ACTIVE" = "1" ] &&
+           [ "${'$'}WG_NAT_ACTIVE" = "1" ] &&
+           [ "${'$'}WG_EXIT_PROBE_CODE" = "0" ]; then
+          FIREWALL_SEVERITY="OK"
+          FIREWALL_STATUS="WireGuard-выход исправен"
+        else
+          FIREWALL_SEVERITY="ERROR"
+          FIREWALL_STATUS="WireGuard-выход запущен не полностью"
+        fi
+        ;;
+      direct|"")
+        if [ "${'$'}WDTT_SERVICE_FOR_ROUTING" = "active" ] && [ "${'$'}DIRECT_NAT_ACTIVE" != "1" ]; then
+          FIREWALL_SEVERITY="ERROR"
+          FIREWALL_STATUS="NAT прямого выхода отсутствует"
+        elif [ "${'$'}WDTT_SERVICE_FOR_ROUTING" = "active" ]; then
+          FIREWALL_SEVERITY="OK"
+          FIREWALL_STATUS="прямой выход настроен"
+        fi
+        ;;
+    esac
+    wdtt_diag_emit "${'$'}FIREWALL_SEVERITY" "Маршрутизация и NAT" "${'$'}FIREWALL_STATUS" "${'$'}FIREWALL_DETAILS" "Для WARP/VPN нужны одновременно активные интерфейс и служба, правило ip rule, маршрут таблицы 100, NAT WDTT_EXIT и успешный HTTPS-выход. Откройте выбранный режим в «Выходной IP и прокси» и нажмите «Установить / восстановить»."
 
     WDTT_SERVICE="${'$'}(wdtt_diag_service_state wdtt.service)"
     WDTT_BIN="${'$'}(wdtt_diag_file_state /usr/local/bin/wdtt-server)"
@@ -4969,12 +5504,15 @@ internal fun serverDiagnosticsScript(
     fi
     wdtt_diag_emit "INFO" "WireGuard" "${'$'}WG_TOOLS" "Интерфейсы wg: ${'$'}{WG_IFACES:-нет или недоступно}. /etc/wireguard/wg-wdtt-exit.conf: ${'$'}(wdtt_diag_file_state /etc/wireguard/wg-wdtt-exit.conf)." "PrivateKey и содержимое конфигов не читаются."
 
-    OUT_MODE="${'$'}(wdtt_diag_outbound_mode)"
     WG_EXIT="${'$'}(wdtt_diag_service_state wdtt-wg-exit.service)"
     WARP_TIMER="${'$'}(wdtt_diag_service_state wdtt-warp-watchdog.timer)"
     PROXY_SERVICE="${'$'}(wdtt_diag_service_state wdtt-3proxy.service)"
     REDSOCKS_SERVICE="${'$'}(wdtt_diag_service_state wdtt-redsocks.service)"
     OUT_DETAILS="mode=${'$'}{OUT_MODE:-direct/не задан}. wg-exit=${'$'}WG_EXIT. warp-watchdog=${'$'}WARP_TIMER. 3proxy=${'$'}PROXY_SERVICE. redsocks=${'$'}REDSOCKS_SERVICE."
+    if wdtt_diag_cmd journalctl && [ "${'$'}WG_EXIT" != "active" ]; then
+      WG_EXIT_LOG="${'$'}(journalctl -u wdtt-wg-exit.service -n 12 --no-pager 2>/dev/null | sed -E 's/(private[[:space:]_-]*key[[:space:]]*[:=])[[:space:]]*[^[:space:]]+/\1 (скрыт)/Ig' | tr '\n' '; ' | head -c 1200)"
+      [ -n "${'$'}WG_EXIT_LOG" ] && OUT_DETAILS="${'$'}OUT_DETAILS Последний журнал wg-exit: ${'$'}WG_EXIT_LOG"
+    fi
     if [ -r /etc/wdtt-plus/warp/selected.env ]; then
       WARP_SELECTED="${'$'}(sed -n 's/^WARP_MTU=/MTU /p;s/^WARP_ENDPOINT=/endpoint /p' /etc/wdtt-plus/warp/selected.env 2>/dev/null | tr '\n' '; ')"
       OUT_DETAILS="${'$'}OUT_DETAILS WARP подбор: ${'$'}WARP_SELECTED"
@@ -5181,8 +5719,7 @@ private class SSHClient(private val session: Session, private val pass: String) 
                         } else if (!line.contains("WDTT_PROGRESS")) {
                             val clean = line.replace(Regex("\u001B\\[[;\\d]*m"), "")
                             result.appendLine(clean)
-                            if (clean.contains("[✗]") || clean.contains("FAIL") ||
-                                (clean.contains("error", true) && !clean.contains("2>/dev/null"))) {
+                            if (shouldWriteRemoteErrorToUserLog(clean)) {
                                 DeployManager.writeError("REMOTE: $clean")
                                 TunnelManager.addDeployErrorLog("REMOTE: $clean")
                             }
@@ -5213,7 +5750,7 @@ private class SSHClient(private val session: Session, private val pass: String) 
         }
     }
 
-    fun upload(localFile: File, remotePath: String) {
+    fun upload(localFile: File, remotePath: String, permissions: Int? = null) {
         if (!session.isConnected) {
             DeployManager.writeError("SSH upload: сессия разорвана")
             throw Exception("Session is down")
@@ -5223,6 +5760,7 @@ private class SSHClient(private val session: Session, private val pass: String) 
             sftp = session.openChannel("sftp") as ChannelSftp
             sftp.connect(15000)
             sftp.put(localFile.absolutePath, remotePath)
+            permissions?.let { sftp.chmod(it, remotePath) }
         } catch (e: Exception) {
             DeployManager.writeError("SFTP upload error: ${e.message} | file: ${localFile.name}")
             throw e
@@ -5295,13 +5833,40 @@ private suspend fun runRootScript(
     }
 }
 
-private fun outboundShellPrelude(): String = """
+private suspend fun runCheckedRootScript(
+    target: OutboundSshTarget,
+    script: String,
+    timeout: Long = CMD_TIMEOUT
+): String = withContext(Dispatchers.IO) {
+    var session: Session? = null
+    try {
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
+        val output = SSHClient(session, target.pass)
+            .exec(rootCommand(script), timeout = timeout)
+            .trim()
+        markerValue(output, "WDTT_ERROR")?.let {
+            throw IllegalStateException(output.take(1200))
+        }
+        if (output.startsWith("error:", ignoreCase = true) ||
+            output.contains("\nerror:", ignoreCase = true)
+        ) {
+            throw IllegalStateException(output.take(1200))
+        }
+        output
+    } finally {
+        try { session?.disconnect() } catch (_: Exception) {}
+    }
+}
+
+internal fun outboundShellPrelude(): String = """
     set -e
     WDTT_SUBNET="${'$'}(ip -4 route show dev wdtt0 scope link 2>/dev/null | awk '{print ${'$'}1; exit}')"
     [ -n "${'$'}WDTT_SUBNET" ] || WDTT_SUBNET="10.66.66.0/24"
     WDTT_IFACE="wdtt0"
     WDTT_TABLE="100"
     WDTT_WG_IFACE="wg-wdtt-exit"
+    WDTT_WG_OWNER_FILE="/etc/wdtt-plus/wg-exit/owner"
+    WDTT_WG_CONFIG_OWNER_FILE="/etc/wdtt-plus/wg-exit/config-owner"
     mkdir -p /etc/wdtt /etc/wdtt/outbound /etc/wdtt-plus/wg-exit
     wdtt_ext_iface() {
       ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if (${'$'}i=="dev") {print ${'$'}(i+1); exit}}'
@@ -5361,20 +5926,33 @@ private fun outboundShellPrelude(): String = """
         return 1
       fi
     }
-    wdtt_clear_external_out() {
+    wdtt_clear_proxy_out() {
+      if command -v iptables >/dev/null 2>&1; then
+        while iptables -t nat -D PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; do :; done
+        iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
+        iptables -t nat -X WDTT_PROXY_OUT 2>/dev/null || true
+      fi
+      systemctl disable --now wdtt-redsocks 2>/dev/null || systemctl stop wdtt-redsocks 2>/dev/null || true
+      wdtt_kill_redsocks_listener
+      systemctl reset-failed wdtt-redsocks.service 2>/dev/null || true
+    }
+    wdtt_clear_wireguard_out() {
       systemctl disable --now wdtt-warp-watchdog.timer 2>/dev/null || true
       systemctl disable --now wdtt-wg-exit.service 2>/dev/null || true
       if command -v iptables >/dev/null 2>&1; then
-        iptables -t nat -D PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null || true
-        iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
-        iptables -t nat -X WDTT_PROXY_OUT 2>/dev/null || true
-        iptables -t nat -D POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null || true
+        while iptables -t nat -D POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null; do :; done
       fi
-      ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null || true
+      while ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null; do :; done
       ip route flush table "${'$'}WDTT_TABLE" 2>/dev/null || true
-      systemctl disable --now wdtt-redsocks 2>/dev/null || systemctl stop wdtt-redsocks 2>/dev/null || true
-      wdtt_kill_redsocks_listener
-      wg-quick down "${'$'}WDTT_WG_IFACE" 2>/dev/null || true
+      if ! wg-quick down "${'$'}WDTT_WG_IFACE" 2>/dev/null; then
+        ip link delete "${'$'}WDTT_WG_IFACE" 2>/dev/null || true
+      fi
+      rm -f "${'$'}WDTT_WG_OWNER_FILE"
+      systemctl reset-failed wdtt-wg-exit.service 2>/dev/null || true
+    }
+    wdtt_clear_external_out() {
+      wdtt_clear_proxy_out
+      wdtt_clear_wireguard_out
     }
     wdtt_kill_redsocks_listener() {
       rm -f /run/wdtt-redsocks.pid 2>/dev/null || true
@@ -5399,24 +5977,32 @@ private fun outboundShellPrelude(): String = """
       [ -n "${'$'}proxy_ip" ] && iptables -t nat -A "${'$'}chain" -d "${'$'}proxy_ip" -j RETURN 2>/dev/null || true
     }
     wdtt_cleanup_proxy_test() {
+      cleanup_test_source="${'$'}{WDTT_PROXY_TEST_SOURCE:-}"
+      [ -n "${'$'}cleanup_test_source" ] && iptables -t nat -D OUTPUT -s "${'$'}cleanup_test_source" -p tcp -j WDTT_PROXY_TEST 2>/dev/null || true
+      # Удаляем также правило старых версий, если предыдущая проверка была прервана.
       iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner 0 -j WDTT_PROXY_TEST 2>/dev/null || true
       iptables -t nat -F WDTT_PROXY_TEST 2>/dev/null || true
       iptables -t nat -X WDTT_PROXY_TEST 2>/dev/null || true
+      WDTT_PROXY_TEST_SOURCE=""
     }
     wdtt_test_redsocks_path() {
       proxy_ip="${'$'}1"
       systemctl is-active --quiet wdtt-redsocks || { echo WDTT_ERROR=external_proxy_service_inactive; return 1; }
       command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; return 1; }
+      test_source="${'$'}(wdtt_test_source)"
+      [ -n "${'$'}test_source" ] || { echo WDTT_ERROR=wdtt_iface_not_found; return 1; }
       wdtt_cleanup_proxy_test
+      WDTT_PROXY_TEST_SOURCE="${'$'}test_source"
       iptables -t nat -N WDTT_PROXY_TEST 2>/dev/null || true
       iptables -t nat -F WDTT_PROXY_TEST
       wdtt_proxy_reserved_returns WDTT_PROXY_TEST "${'$'}proxy_ip"
       iptables -t nat -A WDTT_PROXY_TEST -p tcp -j REDIRECT --to-ports 12345
-      if ! iptables -t nat -I OUTPUT -p tcp -m owner --uid-owner 0 -j WDTT_PROXY_TEST 2>/dev/null; then
+      if ! iptables -t nat -I OUTPUT -s "${'$'}test_source" -p tcp -j WDTT_PROXY_TEST 2>/dev/null; then
         wdtt_cleanup_proxy_test
-        return 0
+        echo WDTT_ERROR=external_proxy_test_rule_failed
+        return 1
       fi
-      test_ip="${'$'}(curl -4fsS --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/tmp/wdtt-redsocks-test.err || true)"
+      test_ip="${'$'}(curl --interface "${'$'}test_source" -4fsS --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/tmp/wdtt-redsocks-test.err || true)"
       wdtt_cleanup_proxy_test
       [ -n "${'$'}test_ip" ] || { echo WDTT_ERROR=external_proxy_apply_failed; tail -n 20 /var/log/wdtt-redsocks.log 2>/dev/null || true; cat /tmp/wdtt-redsocks-test.err 2>/dev/null || true; return 1; }
       echo "Проверка пути через внешний TCP-прокси успешна. IP через прокси: ${'$'}test_ip"
@@ -5440,10 +6026,14 @@ private fun outboundShellPrelude(): String = """
 
 private fun outboundReadPrelude(): String = """
     set -e
+    WDTT_IFACE="wdtt0"
+    WDTT_TABLE="100"
     WDTT_WG_IFACE="wg-wdtt-exit"
+    WDTT_WG_OWNER_FILE="/etc/wdtt-plus/wg-exit/owner"
+    WDTT_WG_CONFIG_OWNER_FILE="/etc/wdtt-plus/wg-exit/config-owner"
 """.trimIndent()
 
-private fun outboundStatusScript(): String = shellScript(
+internal fun outboundStatusScript(): String = shellScript(
     outboundShellPrelude(),
     """
     MODE="direct"
@@ -5498,8 +6088,35 @@ private fun outboundStatusScript(): String = shellScript(
         echo "Проверочный выход WDTT: режим не распознан"
         ;;
     esac
-    if systemctl is-active wdtt-3proxy >/dev/null 2>&1; then echo "Прокси VPS: служба запущена"; else echo "Прокси VPS: служба остановлена"; fi
-    if systemctl is-active wdtt-redsocks >/dev/null 2>&1; then echo "Внешний TCP-прокси для WDTT: включён"; else echo "Внешний TCP-прокси для WDTT: выключен"; fi
+    if systemctl is-active wdtt-3proxy >/dev/null 2>&1; then echo "Прокси на этом VPS: служба запущена"; else echo "Прокси на этом VPS: служба остановлена"; fi
+    if systemctl is-enabled wdtt-3proxy >/dev/null 2>&1; then echo "Автозапуск прокси на этом VPS: включён"; else echo "Автозапуск прокси на этом VPS: выключен"; fi
+    if systemctl is-active wdtt-redsocks >/dev/null 2>&1; then echo "Служба внешнего TCP-прокси для WDTT: запущена"; else echo "Служба внешнего TCP-прокси для WDTT: остановлена"; fi
+    if systemctl is-enabled wdtt-redsocks >/dev/null 2>&1; then echo "Автозапуск внешнего TCP-прокси: включён"; else echo "Автозапуск внешнего TCP-прокси: выключен"; fi
+    if command -v iptables >/dev/null 2>&1 &&
+       iptables -t nat -C PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; then
+      echo "Маршрут обычного TCP-трафика WDTT через внешний прокси: применён"
+    else
+      echo "Маршрут обычного TCP-трафика WDTT через внешний прокси: отсутствует"
+    fi
+    if systemctl is-active wdtt-wg-exit.service >/dev/null 2>&1; then echo "Служба WireGuard-выхода: запущена"; else echo "Служба WireGuard-выхода: остановлена"; fi
+    if systemctl is-enabled wdtt-wg-exit.service >/dev/null 2>&1; then echo "Автозапуск WireGuard-выхода: включён"; else echo "Автозапуск WireGuard-выхода: выключен"; fi
+    if ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup ${'$'}WDTT_TABLE([[:space:]]|${'$'})|from [^ ]+ lookup wdtt-exit([[:space:]]|${'$'})"; then
+      echo "Правило маршрутизации подсети WDTT: применено"
+    else
+      echo "Правило маршрутизации подсети WDTT: отсутствует"
+    fi
+    if ip route show table "${'$'}WDTT_TABLE" 2>/dev/null | grep -Eq "^default([[:space:]].*)? dev ${'$'}WDTT_WG_IFACE([[:space:]]|${'$'})"; then
+      echo "Маршрут по умолчанию через WireGuard: применён"
+    else
+      echo "Маршрут по умолчанию через WireGuard: отсутствует"
+    fi
+    if command -v iptables >/dev/null 2>&1 &&
+       iptables -t nat -S POSTROUTING 2>/dev/null |
+         grep -q -- "-o ${'$'}WDTT_WG_IFACE .*--comment WDTT_EXIT .*MASQUERADE"; then
+      echo "NAT WireGuard-выхода для подсети WDTT: применён"
+    else
+      echo "NAT WireGuard-выхода для подсети WDTT: отсутствует"
+    fi
     if command -v wg >/dev/null 2>&1 && wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1; then
       echo "WireGuard ${'$'}WDTT_WG_IFACE:"
       wg show "${'$'}WDTT_WG_IFACE" | sed -E 's/(private key: ).*/\1(скрыт)/'
@@ -5542,9 +6159,13 @@ private fun outboundProfileSaveScript(forms: OutboundProfileForms): String {
         b64Line("WG_VPS_HOST_B64", forms.wireGuardExitHost),
         line("WG_VPS_SSH_PORT", port(forms.wireGuardExitSshPort)),
         b64Line("WG_VPS_USER_B64", forms.wireGuardExitUser),
-        b64Line("WG_VPS_PASSWORD_B64", forms.wireGuardExitPassword),
+        // SSH-пароль второго VPS нужен только во время настройки. Не оставляем
+        // root-доступ к нему на основном сервере.
+        b64Line("WG_VPS_PASSWORD_B64", ""),
         line("WG_VPS_PORT", port(forms.wireGuardExitPort)),
-        b64Line("WG_VPS_DNS_B64", forms.wireGuardExitDns),
+        // DNS для клиентов задаётся в основных настройках WDTT, а не в
+        // policy-routed WireGuard-выходе.
+        b64Line("WG_VPS_DNS_B64", ""),
         b64Line("IMPORTED_WG_CONFIG_B64", forms.importedWireGuardConfig)
     ).joinToString("\n")
     val profileScript = """
@@ -5587,7 +6208,7 @@ private suspend fun saveOutboundProfileMessage(
     }
 )
 
-private fun outboundSnapshotScript(): String = shellScript(
+internal fun outboundSnapshotScript(): String = shellScript(
     outboundReadPrelude(),
     """
     PROFILE_FILE=/etc/wdtt/outbound-profile.env
@@ -5595,6 +6216,10 @@ private fun outboundSnapshotScript(): String = shellScript(
       key="${'$'}1"
       [ -f "${'$'}PROFILE_FILE" ] || return 0
       grep -E "^${'$'}key=" "${'$'}PROFILE_FILE" 2>/dev/null | tail -n 1 | sed 's/^[^=]*=//'
+    }
+    wdtt_profile_has_key() {
+      key="${'$'}1"
+      [ -f "${'$'}PROFILE_FILE" ] && grep -q -E "^${'$'}key=" "${'$'}PROFILE_FILE" 2>/dev/null
     }
     wdtt_b64() {
       command -v base64 >/dev/null 2>&1 || return 0
@@ -5650,22 +6275,43 @@ private fun outboundSnapshotScript(): String = shellScript(
       LOCAL_PRESENT=1
     fi
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wdtt-3proxy 2>/dev/null; then
-      LOCAL_ACTIVE=1
+      LOCAL_SERVICE_ACTIVE=1
       LOCAL_PRESENT=1
     else
-      LOCAL_ACTIVE=0
+      LOCAL_SERVICE_ACTIVE=0
     fi
-    LOCAL_PORT="${'$'}(wdtt_profile_value LOCAL_PROXY_PORT)"
-    [ -n "${'$'}LOCAL_PORT" ] || LOCAL_PORT="${'$'}(wdtt_json_number /etc/wdtt/local-proxy.json socks5Port)"
-    [ -n "${'$'}LOCAL_PORT" ] || LOCAL_PORT="${'$'}(wdtt_3proxy_port)"
-    LOCAL_LOGIN_B64="${'$'}(wdtt_profile_value LOCAL_PROXY_LOGIN_B64)"
-    if [ -z "${'$'}LOCAL_LOGIN_B64" ]; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet wdtt-3proxy 2>/dev/null; then
+      LOCAL_SERVICE_ENABLED=1
+    else
+      LOCAL_SERVICE_ENABLED=0
+    fi
+    if wdtt_profile_has_key LOCAL_PROXY_PORT; then
+      LOCAL_PORT="${'$'}(wdtt_profile_value LOCAL_PROXY_PORT)"
+    else
+      LOCAL_PORT="${'$'}(wdtt_json_number /etc/wdtt/local-proxy.json socks5Port)"
+      [ -n "${'$'}LOCAL_PORT" ] || LOCAL_PORT="${'$'}(wdtt_3proxy_port)"
+    fi
+    LOCAL_ACTIVE="${'$'}LOCAL_SERVICE_ACTIVE"
+    case "${'$'}LOCAL_PORT" in
+      ''|*[!0-9]*) LOCAL_ACTIVE=0;;
+      *)
+        if [ "${'$'}LOCAL_SERVICE_ACTIVE" = 1 ] &&
+           command -v ss >/dev/null 2>&1 &&
+           ! ss -ltn 2>/dev/null | awk '{print ${'$'}4}' | grep -Eq ":${'$'}LOCAL_PORT${'$'}"; then
+          LOCAL_ACTIVE=0
+        fi
+        ;;
+    esac
+    if wdtt_profile_has_key LOCAL_PROXY_LOGIN_B64; then
+      LOCAL_LOGIN_B64="${'$'}(wdtt_profile_value LOCAL_PROXY_LOGIN_B64)"
+    else
       LOCAL_LOGIN="${'$'}(wdtt_json_string /etc/wdtt/local-proxy.json login)"
       [ -n "${'$'}LOCAL_LOGIN" ] || LOCAL_LOGIN="${'$'}(wdtt_3proxy_login)"
       LOCAL_LOGIN_B64="${'$'}(wdtt_b64 "${'$'}LOCAL_LOGIN")"
     fi
-    LOCAL_PASSWORD_B64="${'$'}(wdtt_profile_value LOCAL_PROXY_PASSWORD_B64)"
-    if [ -z "${'$'}LOCAL_PASSWORD_B64" ]; then
+    if wdtt_profile_has_key LOCAL_PROXY_PASSWORD_B64; then
+      LOCAL_PASSWORD_B64="${'$'}(wdtt_profile_value LOCAL_PROXY_PASSWORD_B64)"
+    else
       LOCAL_PASSWORD="${'$'}(wdtt_json_string /etc/wdtt/local-proxy.json password)"
       [ -n "${'$'}LOCAL_PASSWORD" ] || LOCAL_PASSWORD="${'$'}(wdtt_3proxy_password)"
       LOCAL_PASSWORD_B64="${'$'}(wdtt_b64 "${'$'}LOCAL_PASSWORD")"
@@ -5688,36 +6334,66 @@ private fun outboundSnapshotScript(): String = shellScript(
       socks5) REDSOCKS_KIND="Socks5";;
       http|http-connect) REDSOCKS_KIND="Http";;
     esac
-    EXTERNAL_KIND="${'$'}(wdtt_profile_value EXTERNAL_PROXY_KIND)"
-    if [ -z "${'$'}EXTERNAL_KIND" ]; then
+    if wdtt_profile_has_key EXTERNAL_PROXY_KIND; then
+      EXTERNAL_KIND="${'$'}(wdtt_profile_value EXTERNAL_PROXY_KIND)"
+    else
       case "${'$'}DETAIL_KIND" in
         socks5) EXTERNAL_KIND="Socks5";;
         http) EXTERNAL_KIND="Http";;
         *) EXTERNAL_KIND="${'$'}REDSOCKS_KIND";;
       esac
     fi
-    EXTERNAL_HOST_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_HOST_B64)"
-    if [ -z "${'$'}EXTERNAL_HOST_B64" ]; then
+    if wdtt_profile_has_key EXTERNAL_PROXY_HOST_B64; then
+      EXTERNAL_HOST_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_HOST_B64)"
+    else
       EXTERNAL_HOST="${'$'}DETAIL_HOST"
       [ -n "${'$'}EXTERNAL_HOST" ] || EXTERNAL_HOST="${'$'}(wdtt_redsocks_value ip)"
       EXTERNAL_HOST_B64="${'$'}(wdtt_b64 "${'$'}EXTERNAL_HOST")"
     fi
-    EXTERNAL_PORT="${'$'}(wdtt_profile_value EXTERNAL_PROXY_PORT)"
-    [ -n "${'$'}EXTERNAL_PORT" ] || EXTERNAL_PORT="${'$'}DETAIL_PORT"
-    [ -n "${'$'}EXTERNAL_PORT" ] || EXTERNAL_PORT="${'$'}(wdtt_redsocks_value port)"
-    EXTERNAL_LOGIN_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_LOGIN_B64)"
-    [ -n "${'$'}EXTERNAL_LOGIN_B64" ] || EXTERNAL_LOGIN_B64="${'$'}(wdtt_b64 "$(wdtt_redsocks_value login)")"
-    EXTERNAL_PASSWORD_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_PASSWORD_B64)"
-    [ -n "${'$'}EXTERNAL_PASSWORD_B64" ] || EXTERNAL_PASSWORD_B64="${'$'}(wdtt_b64 "$(wdtt_redsocks_value password)")"
+    if wdtt_profile_has_key EXTERNAL_PROXY_PORT; then
+      EXTERNAL_PORT="${'$'}(wdtt_profile_value EXTERNAL_PROXY_PORT)"
+    else
+      EXTERNAL_PORT="${'$'}DETAIL_PORT"
+      [ -n "${'$'}EXTERNAL_PORT" ] || EXTERNAL_PORT="${'$'}(wdtt_redsocks_value port)"
+    fi
+    if wdtt_profile_has_key EXTERNAL_PROXY_LOGIN_B64; then
+      EXTERNAL_LOGIN_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_LOGIN_B64)"
+    else
+      EXTERNAL_LOGIN_B64="${'$'}(wdtt_b64 "$(wdtt_redsocks_value login)")"
+    fi
+    if wdtt_profile_has_key EXTERNAL_PROXY_PASSWORD_B64; then
+      EXTERNAL_PASSWORD_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_PASSWORD_B64)"
+    else
+      EXTERNAL_PASSWORD_B64="${'$'}(wdtt_b64 "$(wdtt_redsocks_value password)")"
+    fi
     EXTERNAL_PRESENT=0
-    if [ -f /etc/wdtt/redsocks.conf ] || [ "${'$'}MODE" = "external_proxy" ] || [ -n "${'$'}EXTERNAL_HOST_B64" ] || [ -n "${'$'}EXTERNAL_PORT" ]; then
+    if [ -f /etc/wdtt/redsocks.conf ] || [ "${'$'}MODE" = "external_proxy" ] || [ -n "${'$'}EXTERNAL_HOST_B64" ]; then
       EXTERNAL_PRESENT=1
     fi
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wdtt-redsocks 2>/dev/null; then
-      EXTERNAL_ACTIVE=1
+      EXTERNAL_SERVICE_ACTIVE=1
       EXTERNAL_PRESENT=1
+      if command -v ss >/dev/null 2>&1 &&
+         ! ss -ltn 2>/dev/null | awk '{print ${'$'}4}' | grep -Eq ':12345${'$'}'; then
+        EXTERNAL_SERVICE_ACTIVE=0
+      fi
     else
-      EXTERNAL_ACTIVE=0
+      EXTERNAL_SERVICE_ACTIVE=0
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet wdtt-redsocks 2>/dev/null; then
+      EXTERNAL_SERVICE_ENABLED=1
+    else
+      EXTERNAL_SERVICE_ENABLED=0
+    fi
+    EXTERNAL_ROUTE_ACTIVE=0
+    if command -v iptables >/dev/null 2>&1 &&
+       iptables -t nat -C PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null &&
+       iptables -t nat -S WDTT_PROXY_OUT 2>/dev/null | grep -q -- '--to-ports 12345'; then
+      EXTERNAL_ROUTE_ACTIVE=1
+    fi
+    EXTERNAL_ACTIVE=0
+    if [ "${'$'}EXTERNAL_SERVICE_ACTIVE" = 1 ] && [ "${'$'}EXTERNAL_ROUTE_ACTIVE" = 1 ]; then
+      EXTERNAL_ACTIVE=1
     fi
 
     WG_CONF=""
@@ -5726,11 +6402,52 @@ private fun outboundSnapshotScript(): String = shellScript(
     WG_PRESENT=0
     [ -n "${'$'}WG_CONF" ] && WG_PRESENT=1
     if command -v wg >/dev/null 2>&1 && wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1; then
-      WG_ACTIVE=1
+      WG_INTERFACE_ACTIVE=1
       WG_PRESENT=1
     else
-      WG_ACTIVE=0
+      WG_INTERFACE_ACTIVE=0
     fi
+    if command -v systemctl >/dev/null 2>&1 &&
+       systemctl is-active --quiet wdtt-wg-exit.service 2>/dev/null; then
+      WG_SERVICE_ACTIVE=1
+    else
+      WG_SERVICE_ACTIVE=0
+    fi
+    if command -v systemctl >/dev/null 2>&1 &&
+       systemctl is-enabled --quiet wdtt-wg-exit.service 2>/dev/null; then
+      WG_SERVICE_ENABLED=1
+    else
+      WG_SERVICE_ENABLED=0
+    fi
+    WG_POLICY_RULE_ACTIVE=0
+    ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup ${'$'}WDTT_TABLE([[:space:]]|${'$'})|from [^ ]+ lookup wdtt-exit([[:space:]]|${'$'})" &&
+      WG_POLICY_RULE_ACTIVE=1
+    WG_DEFAULT_ROUTE_ACTIVE=0
+    ip route show table "${'$'}WDTT_TABLE" 2>/dev/null | grep -Eq "^default([[:space:]].*)? dev ${'$'}WDTT_WG_IFACE([[:space:]]|${'$'})" &&
+      WG_DEFAULT_ROUTE_ACTIVE=1
+    WG_NAT_ACTIVE=0
+    if command -v iptables >/dev/null 2>&1 &&
+       iptables -t nat -S POSTROUTING 2>/dev/null |
+         grep -q -- "-o ${'$'}WDTT_WG_IFACE .*--comment WDTT_EXIT .*MASQUERADE"; then
+      WG_NAT_ACTIVE=1
+    fi
+    WG_ACTIVE=0
+    if [ "${'$'}WG_INTERFACE_ACTIVE" = 1 ] &&
+       [ "${'$'}WG_POLICY_RULE_ACTIVE" = 1 ] &&
+       [ "${'$'}WG_DEFAULT_ROUTE_ACTIVE" = 1 ] &&
+       [ "${'$'}WG_NAT_ACTIVE" = 1 ]; then
+      WG_ACTIVE=1
+    fi
+    WG_OWNER_MODE="${'$'}(cat "${'$'}WDTT_WG_OWNER_FILE" 2>/dev/null | head -n 1)"
+    case "${'$'}WG_OWNER_MODE" in
+      wireguard_vps|warp_free|imported_wg) ;;
+      *) WG_OWNER_MODE="";;
+    esac
+    WG_CONFIG_OWNER_MODE="${'$'}(cat "${'$'}WDTT_WG_CONFIG_OWNER_FILE" 2>/dev/null | head -n 1)"
+    case "${'$'}WG_CONFIG_OWNER_MODE" in
+      wireguard_vps|warp_free|imported_wg) ;;
+      *) WG_CONFIG_OWNER_MODE="";;
+    esac
     WG_ENDPOINT=""
     WG_DNS=""
     WG_MTU=""
@@ -5747,26 +6464,51 @@ private fun outboundSnapshotScript(): String = shellScript(
       WG_ENDPOINT_HOST="${'$'}{WG_ENDPOINT_HOST#[}"
       WG_ENDPOINT_HOST="${'$'}{WG_ENDPOINT_HOST%]}"
     fi
-    WG_VPS_HOST_B64="${'$'}(wdtt_profile_value WG_VPS_HOST_B64)"
-    [ -n "${'$'}WG_VPS_HOST_B64" ] || WG_VPS_HOST_B64="${'$'}(wdtt_b64 "${'$'}WG_ENDPOINT_HOST")"
+    if wdtt_profile_has_key WG_VPS_HOST_B64; then
+      WG_VPS_HOST_B64="${'$'}(wdtt_profile_value WG_VPS_HOST_B64)"
+    elif [ "${'$'}MODE" = "wireguard_vps" ]; then
+      WG_VPS_HOST_B64="${'$'}(wdtt_b64 "${'$'}WG_ENDPOINT_HOST")"
+    else
+      WG_VPS_HOST_B64=""
+    fi
     WG_VPS_SSH_PORT="${'$'}(wdtt_profile_value WG_VPS_SSH_PORT)"
     WG_VPS_USER_B64="${'$'}(wdtt_profile_value WG_VPS_USER_B64)"
     WG_VPS_PASSWORD_B64="${'$'}(wdtt_profile_value WG_VPS_PASSWORD_B64)"
-    WG_VPS_PORT="${'$'}(wdtt_profile_value WG_VPS_PORT)"
-    [ -n "${'$'}WG_VPS_PORT" ] || WG_VPS_PORT="${'$'}WG_ENDPOINT_PORT"
-    WG_VPS_DNS_B64="${'$'}(wdtt_profile_value WG_VPS_DNS_B64)"
-    [ -n "${'$'}WG_VPS_DNS_B64" ] || WG_VPS_DNS_B64="${'$'}(wdtt_b64 "${'$'}WG_DNS")"
-    if [ -n "${'$'}WG_VPS_HOST_B64" ] || [ -n "${'$'}WG_VPS_PORT" ]; then
+    if wdtt_profile_has_key WG_VPS_PORT; then
+      WG_VPS_PORT="${'$'}(wdtt_profile_value WG_VPS_PORT)"
+    elif [ "${'$'}MODE" = "wireguard_vps" ]; then
+      WG_VPS_PORT="${'$'}WG_ENDPOINT_PORT"
+    else
+      WG_VPS_PORT=""
+    fi
+    if wdtt_profile_has_key WG_VPS_DNS_B64; then
+      WG_VPS_DNS_B64="${'$'}(wdtt_profile_value WG_VPS_DNS_B64)"
+    elif [ "${'$'}MODE" = "wireguard_vps" ]; then
+      WG_VPS_DNS_B64="${'$'}(wdtt_b64 "${'$'}WG_DNS")"
+    else
+      WG_VPS_DNS_B64=""
+    fi
+    if [ -n "${'$'}WG_VPS_HOST_B64" ]; then
       WG_PRESENT=1
     fi
     IMPORTED_WG_CONFIG_B64="${'$'}(wdtt_profile_value IMPORTED_WG_CONFIG_B64)"
-    if [ "${'$'}MODE" = "imported_wg" ] && [ -z "${'$'}IMPORTED_WG_CONFIG_B64" ] && [ -n "${'$'}WG_CONF" ]; then
+    if [ "${'$'}MODE" = "imported_wg" ] && ! wdtt_profile_has_key IMPORTED_WG_CONFIG_B64 && [ -n "${'$'}WG_CONF" ]; then
       IMPORTED_WG_CONFIG_B64="${'$'}(wdtt_file_b64 "${'$'}WG_CONF")"
     fi
     [ -n "${'$'}IMPORTED_WG_CONFIG_B64" ] && WG_PRESENT=1
     WARP_PRESENT=0
-    if [ -f /etc/wdtt-plus/warp/wgcf-account.toml ] || [ -f /etc/wdtt-plus/warp/wgcf-profile.conf ]; then
+    if [ -d /etc/wdtt-plus/warp ] ||
+       [ -f /usr/local/bin/wgcf ] ||
+       [ -f /usr/local/lib/wdtt/warp-watchdog ] ||
+       [ -f /etc/systemd/system/wdtt-warp-watchdog.service ] ||
+       [ -f /etc/systemd/system/wdtt-warp-watchdog.timer ]; then
       WARP_PRESENT=1
+    fi
+    WG_MATCHES_WARP=0
+    if [ -n "${'$'}WG_CONF" ] &&
+       [ -f /etc/wdtt-plus/warp/wgcf-profile.conf ] &&
+       cmp -s "${'$'}WG_CONF" /etc/wdtt-plus/warp/wgcf-profile.conf; then
+      WG_MATCHES_WARP=1
     fi
 
     printf 'WDTT_OUTBOUND_MODE=%s\n' "${'$'}MODE"
@@ -5775,11 +6517,15 @@ private fun outboundSnapshotScript(): String = shellScript(
     printf 'WDTT_HAS_PROFILE=%s\n' "${'$'}HAS_PROFILE"
     printf 'WDTT_LOCAL_PROXY_PRESENT=%s\n' "${'$'}LOCAL_PRESENT"
     printf 'WDTT_LOCAL_PROXY_ACTIVE=%s\n' "${'$'}LOCAL_ACTIVE"
+    printf 'WDTT_LOCAL_PROXY_SERVICE_ENABLED=%s\n' "${'$'}LOCAL_SERVICE_ENABLED"
     printf 'WDTT_LOCAL_PROXY_PORT=%s\n' "${'$'}LOCAL_PORT"
     printf 'WDTT_LOCAL_PROXY_LOGIN_B64=%s\n' "${'$'}LOCAL_LOGIN_B64"
     printf 'WDTT_LOCAL_PROXY_PASSWORD_B64=%s\n' "${'$'}LOCAL_PASSWORD_B64"
     printf 'WDTT_EXTERNAL_PROXY_PRESENT=%s\n' "${'$'}EXTERNAL_PRESENT"
     printf 'WDTT_EXTERNAL_PROXY_ACTIVE=%s\n' "${'$'}EXTERNAL_ACTIVE"
+    printf 'WDTT_EXTERNAL_PROXY_SERVICE_ACTIVE=%s\n' "${'$'}EXTERNAL_SERVICE_ACTIVE"
+    printf 'WDTT_EXTERNAL_PROXY_SERVICE_ENABLED=%s\n' "${'$'}EXTERNAL_SERVICE_ENABLED"
+    printf 'WDTT_EXTERNAL_PROXY_ROUTE_ACTIVE=%s\n' "${'$'}EXTERNAL_ROUTE_ACTIVE"
     printf 'WDTT_EXTERNAL_PROXY_KIND_NAME=%s\n' "${'$'}EXTERNAL_KIND"
     printf 'WDTT_EXTERNAL_PROXY_HOST_B64=%s\n' "${'$'}EXTERNAL_HOST_B64"
     printf 'WDTT_EXTERNAL_PROXY_PORT=%s\n' "${'$'}EXTERNAL_PORT"
@@ -5787,6 +6533,15 @@ private fun outboundSnapshotScript(): String = shellScript(
     printf 'WDTT_EXTERNAL_PROXY_PASSWORD_B64=%s\n' "${'$'}EXTERNAL_PASSWORD_B64"
     printf 'WDTT_WG_PRESENT=%s\n' "${'$'}WG_PRESENT"
     printf 'WDTT_WG_ACTIVE=%s\n' "${'$'}WG_ACTIVE"
+    printf 'WDTT_WG_INTERFACE_ACTIVE=%s\n' "${'$'}WG_INTERFACE_ACTIVE"
+    printf 'WDTT_WG_SERVICE_ACTIVE=%s\n' "${'$'}WG_SERVICE_ACTIVE"
+    printf 'WDTT_WG_SERVICE_ENABLED=%s\n' "${'$'}WG_SERVICE_ENABLED"
+    printf 'WDTT_WG_POLICY_RULE_ACTIVE=%s\n' "${'$'}WG_POLICY_RULE_ACTIVE"
+    printf 'WDTT_WG_DEFAULT_ROUTE_ACTIVE=%s\n' "${'$'}WG_DEFAULT_ROUTE_ACTIVE"
+    printf 'WDTT_WG_NAT_ACTIVE=%s\n' "${'$'}WG_NAT_ACTIVE"
+    printf 'WDTT_WG_OWNER_MODE=%s\n' "${'$'}WG_OWNER_MODE"
+    printf 'WDTT_WG_CONFIG_OWNER_MODE=%s\n' "${'$'}WG_CONFIG_OWNER_MODE"
+    printf 'WDTT_WG_MATCHES_WARP=%s\n' "${'$'}WG_MATCHES_WARP"
     printf 'WDTT_WG_VPS_HOST_B64=%s\n' "${'$'}WG_VPS_HOST_B64"
     printf 'WDTT_WG_VPS_SSH_PORT=%s\n' "${'$'}WG_VPS_SSH_PORT"
     printf 'WDTT_WG_VPS_USER_B64=%s\n' "${'$'}WG_VPS_USER_B64"
@@ -5849,7 +6604,20 @@ private fun parseOutboundServerSnapshot(output: String): OutboundServerSnapshot 
         wireGuardExitDns = decoded("WDTT_WG_VPS_DNS_B64"),
         warpPresent = flag("WDTT_WARP_PRESENT"),
         warpMtu = value("WDTT_WARP_MTU"),
-        importedWireGuardConfig = decoded("WDTT_IMPORTED_WG_CONFIG_B64")
+        importedWireGuardConfig = decoded("WDTT_IMPORTED_WG_CONFIG_B64"),
+        externalProxyServiceActive = flag("WDTT_EXTERNAL_PROXY_SERVICE_ACTIVE"),
+        externalProxyRouteActive = flag("WDTT_EXTERNAL_PROXY_ROUTE_ACTIVE"),
+        wireGuardInterfaceActive = flag("WDTT_WG_INTERFACE_ACTIVE"),
+        wireGuardServiceActive = flag("WDTT_WG_SERVICE_ACTIVE"),
+        wireGuardPolicyRuleActive = flag("WDTT_WG_POLICY_RULE_ACTIVE"),
+        wireGuardDefaultRouteActive = flag("WDTT_WG_DEFAULT_ROUTE_ACTIVE"),
+        wireGuardNatActive = flag("WDTT_WG_NAT_ACTIVE"),
+        wireGuardOwnerMode = value("WDTT_WG_OWNER_MODE"),
+        wireGuardConfigOwnerMode = value("WDTT_WG_CONFIG_OWNER_MODE"),
+        wireGuardMatchesWarp = flag("WDTT_WG_MATCHES_WARP"),
+        localProxyServiceEnabled = flag("WDTT_LOCAL_PROXY_SERVICE_ENABLED"),
+        externalProxyServiceEnabled = flag("WDTT_EXTERNAL_PROXY_SERVICE_ENABLED"),
+        wireGuardServiceEnabled = flag("WDTT_WG_SERVICE_ENABLED")
     )
 }
 
@@ -5859,7 +6627,7 @@ private fun outboundRestoreSummary(snapshot: OutboundServerSnapshot): String {
     parts += "Активный режим: ${snapshot.modeLabel}."
     if (snapshot.hasProfile) parts += "Сохранённый профиль найден."
     if (snapshot.localProxyPresent) {
-        parts += if (snapshot.localProxyActive) "Прокси VPS найден и запущен." else "Прокси VPS найден, служба не запущена."
+        parts += if (snapshot.localProxyActive) "Прокси на этом VPS найден и запущен." else "Прокси на этом VPS найден, служба не запущена."
     }
     if (snapshot.externalProxyPresent) {
         parts += if (snapshot.externalProxyActive) "Внешний TCP-прокси включён." else "Поля внешнего TCP-прокси заполнены."
@@ -6006,26 +6774,43 @@ private suspend fun readOutboundDiagnostics(target: OutboundSshTarget): String =
     }
 }
 
+internal fun disableOutboundExitScript(): String = shellScript(
+    outboundShellPrelude(),
+    """
+    echo "WDTT_PROGRESS|0.25|Останавливаю внешний TCP-прокси и WireGuard-выход, если они включены..."
+    wdtt_clear_external_out
+    if command -v wg >/dev/null 2>&1 && wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1; then
+      ip link delete "${'$'}WDTT_WG_IFACE" 2>/dev/null || true
+    fi
+    while ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null; do :; done
+    ip route flush table "${'$'}WDTT_TABLE" 2>/dev/null || true
+    CLEANUP_LEFT=0
+    (command -v wg >/dev/null 2>&1 && wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1) && CLEANUP_LEFT=1
+    systemctl is-active --quiet wdtt-wg-exit.service 2>/dev/null && CLEANUP_LEFT=1
+    systemctl is-active --quiet wdtt-redsocks.service 2>/dev/null && CLEANUP_LEFT=1
+    ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup ${'$'}WDTT_TABLE([[:space:]]|${'$'})|from [^ ]+ lookup wdtt-exit([[:space:]]|${'$'})" &&
+      CLEANUP_LEFT=1
+    ip route show table "${'$'}WDTT_TABLE" 2>/dev/null | grep -Eq "^default([[:space:]].*)? dev ${'$'}WDTT_WG_IFACE([[:space:]]|${'$'})" &&
+      CLEANUP_LEFT=1
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "-i ${'$'}WDTT_IFACE .* -j WDTT_PROXY_OUT" &&
+        CLEANUP_LEFT=1
+      iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- "-o ${'$'}WDTT_WG_IFACE .*--comment WDTT_EXIT .*MASQUERADE" &&
+        CLEANUP_LEFT=1
+    fi
+    if [ "${'$'}CLEANUP_LEFT" != 0 ]; then
+      echo WDTT_ERROR=direct_cleanup_failed
+      exit 3
+    fi
+    echo "WDTT_PROGRESS|0.75|Сохраняю режим прямого выхода через текущий сервер..."
+    wdtt_write_mode "direct" "прямой выход"
+    echo "WDTT_PROGRESS|1.0|Прямой выход включён."
+    echo "Внешний TCP-прокси или WireGuard-выход отключён. WDTT-пользователи снова идут напрямую через текущий сервер."
+    """
+)
+
 private suspend fun disableOutboundExit(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
-    var session: Session? = null
-    try {
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
-        val ssh = SSHClient(session, target.pass)
-        val script = shellScript(
-            outboundShellPrelude(),
-            """
-            echo "WDTT_PROGRESS|0.25|Останавливаю внешний TCP-прокси и WireGuard-выход, если они включены..."
-            wdtt_clear_external_out
-            echo "WDTT_PROGRESS|0.75|Сохраняю режим прямого выхода через текущий сервер..."
-            wdtt_write_mode "direct" "прямой выход"
-            echo "WDTT_PROGRESS|1.0|Прямой выход включён."
-            echo "Внешний TCP-прокси или WireGuard-выход отключён. WDTT-пользователи снова идут напрямую через текущий сервер."
-            """
-        )
-        ssh.exec(rootCommand(script), timeout = 30000L).trim()
-    } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
-    }
+    runCheckedRootScript(target, disableOutboundExitScript(), timeout = 30000L)
 }
 
 private suspend fun installLocalProxy(
@@ -6035,6 +6820,10 @@ private suspend fun installLocalProxy(
     login: String,
     proxyPassword: String
 ): String {
+    require(port in 1..65533) { "порт SOCKS5 должен быть от 1 до 65533" }
+    require(localProxyCredentialsIssue(login, proxyPassword) == null) {
+        localProxyCredentialsIssue(login, proxyPassword).orEmpty()
+    }
     val httpPort = (port + 1).coerceAtMost(65535)
     val script = shellScript(
         outboundShellPrelude(),
@@ -6044,6 +6833,9 @@ private suspend fun installLocalProxy(
         ADMIN_PORT=${httpPort + 1}
         PROXY_LOGIN=${shellQuote(login)}
         PROXY_PASSWORD=${shellQuote(proxyPassword)}
+        THREEPROXY_VERSION=${shellQuote(THREEPROXY_VERSION)}
+        THREEPROXY_SOURCE_URL=${shellQuote(THREEPROXY_SOURCE_URL)}
+        THREEPROXY_SOURCE_SHA256=${shellQuote(THREEPROXY_SOURCE_SHA256)}
         wdtt_progress() { echo "WDTT_PROGRESS|${'$'}1|${'$'}2"; }
         install_pkg() {
           if command -v apt-get >/dev/null 2>&1; then
@@ -6065,17 +6857,17 @@ private suspend fun installLocalProxy(
         }
         install_3proxy_build_deps() {
           if command -v apt-get >/dev/null 2>&1; then
-            install_pkg curl ca-certificates tar gzip make gcc libc6-dev libssl-dev
+            install_pkg curl ca-certificates tar gzip make gcc coreutils libc6-dev libssl-dev libpcre2-dev
           elif command -v dnf >/dev/null 2>&1; then
-            install_pkg curl ca-certificates tar gzip make gcc glibc-devel openssl-devel
+            install_pkg curl ca-certificates tar gzip make gcc coreutils glibc-devel openssl-devel pcre2-devel
           elif command -v yum >/dev/null 2>&1; then
-            install_pkg curl ca-certificates tar gzip make gcc glibc-devel openssl-devel
+            install_pkg curl ca-certificates tar gzip make gcc coreutils glibc-devel openssl-devel pcre2-devel
           elif command -v zypper >/dev/null 2>&1; then
-            install_pkg curl ca-certificates tar gzip make gcc glibc-devel libopenssl-devel
+            install_pkg curl ca-certificates tar gzip make gcc coreutils glibc-devel libopenssl-devel pcre2-devel
           elif command -v apk >/dev/null 2>&1; then
-            install_pkg curl ca-certificates tar gzip make gcc musl-dev linux-headers openssl-dev
+            install_pkg curl ca-certificates tar gzip make gcc coreutils musl-dev linux-headers openssl-dev pcre2-dev
           elif command -v pacman >/dev/null 2>&1; then
-            install_pkg curl ca-certificates tar gzip make gcc glibc openssl
+            install_pkg curl ca-certificates tar gzip make gcc coreutils glibc openssl pcre2
           else
             return 1
           fi
@@ -6084,36 +6876,47 @@ private suspend fun installLocalProxy(
           TMP_DIR="${'$'}(mktemp -d)"
           cleanup() { rm -rf "${'$'}TMP_DIR"; }
           trap cleanup EXIT
-          wdtt_progress 0.50 "Пакета 3proxy нет, готовлю сборку из исходников..."
+          wdtt_progress 0.50 "Готовлю проверенную сборку 3proxy из исходников..."
           install_3proxy_build_deps || true
           command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=3proxy_source_no_curl; exit 2; }
           command -v tar >/dev/null 2>&1 || { echo WDTT_ERROR=3proxy_source_no_tar; exit 2; }
           command -v gzip >/dev/null 2>&1 || { echo WDTT_ERROR=3proxy_source_no_gzip; exit 2; }
           command -v make >/dev/null 2>&1 || { echo WDTT_ERROR=3proxy_source_no_make; exit 2; }
+          command -v sha256sum >/dev/null 2>&1 || { echo WDTT_ERROR=3proxy_source_no_sha256sum; exit 2; }
           (command -v gcc >/dev/null 2>&1 || command -v cc >/dev/null 2>&1) || { echo WDTT_ERROR=3proxy_source_no_compiler; exit 2; }
           [ -f /usr/include/openssl/evp.h ] || [ -f /usr/local/include/openssl/evp.h ] || { echo WDTT_ERROR=3proxy_source_no_openssl_headers; exit 2; }
+          [ -f /usr/include/pcre2.h ] || [ -f /usr/local/include/pcre2.h ] || { echo WDTT_ERROR=3proxy_source_no_pcre2_headers; exit 2; }
           cd "${'$'}TMP_DIR"
-          wdtt_progress 0.58 "Скачиваю исходники 3proxy..."
-          curl -fsSL -o 3proxy.tar.gz https://github.com/3proxy/3proxy/archive/refs/heads/master.tar.gz || { echo WDTT_ERROR=3proxy_source_download_failed; exit 2; }
+          wdtt_progress 0.58 "Скачиваю закреплённый выпуск 3proxy ${'$'}THREEPROXY_VERSION..."
+          curl -fsSL --retry 2 --connect-timeout 12 --max-time 180 \
+            -o 3proxy.tar.gz "${'$'}THREEPROXY_SOURCE_URL" ||
+            { echo WDTT_ERROR=3proxy_source_download_failed; exit 2; }
+          ACTUAL_SOURCE_SHA256="${'$'}(sha256sum 3proxy.tar.gz | awk '{print ${'$'}1}')"
+          [ "${'$'}ACTUAL_SOURCE_SHA256" = "${'$'}THREEPROXY_SOURCE_SHA256" ] ||
+            { echo WDTT_ERROR=3proxy_source_checksum_failed; exit 2; }
           tar -xzf 3proxy.tar.gz || { echo WDTT_ERROR=3proxy_source_unpack_failed; exit 2; }
-          cd 3proxy-*
+          cd "3proxy-${'$'}THREEPROXY_VERSION"
           wdtt_progress 0.68 "Собираю 3proxy на сервере..."
           ln -sf Makefile.Linux Makefile
           make >/tmp/wdtt-3proxy-build.log 2>&1 || { echo WDTT_ERROR=3proxy_source_build_failed; tail -n 20 /tmp/wdtt-3proxy-build.log; exit 2; }
           BUILT_BIN="${'$'}(find . -type f -name 3proxy -perm -111 | head -n1)"
           [ -n "${'$'}BUILT_BIN" ] || { echo WDTT_ERROR=3proxy_source_binary_missing; exit 2; }
           install -m 755 "${'$'}BUILT_BIN" /usr/local/bin/3proxy || { echo WDTT_ERROR=3proxy_source_install_failed; exit 2; }
+          printf '%s\n' "${'$'}THREEPROXY_VERSION" >/etc/wdtt/3proxy-version
+          chmod 600 /etc/wdtt/3proxy-version
         }
         wdtt_progress 0.08 "Определяю систему и права..."
         command -v systemctl >/dev/null 2>&1 || { echo WDTT_ERROR=systemd_required; exit 2; }
         wdtt_progress 0.18 "Готовлю пакетный менеджер..."
         install_pkg curl ca-certificates || true
-        wdtt_progress 0.32 "Пробую установить 3proxy из репозитория..."
-        install_pkg 3proxy || true
         THREEPROXY_BIN="${'$'}(command -v 3proxy || true)"
-        if [ -z "${'$'}THREEPROXY_BIN" ]; then
-          install_3proxy_from_source || true
+        INSTALLED_THREEPROXY_VERSION="${'$'}(cat /etc/wdtt/3proxy-version 2>/dev/null || true)"
+        if [ -z "${'$'}THREEPROXY_BIN" ] || [ "${'$'}INSTALLED_THREEPROXY_VERSION" != "${'$'}THREEPROXY_VERSION" ]; then
+          wdtt_progress 0.32 "Устанавливаю закреплённый выпуск 3proxy ${'$'}THREEPROXY_VERSION..."
+          install_3proxy_from_source
           THREEPROXY_BIN="${'$'}(command -v 3proxy || true)"
+        else
+          wdtt_progress 0.50 "Закреплённый выпуск 3proxy ${'$'}THREEPROXY_VERSION уже установлен."
         fi
         [ -n "${'$'}THREEPROXY_BIN" ] || { echo WDTT_ERROR=3proxy_install_failed; exit 2; }
         wdtt_progress 0.76 "Пишу настройки SOCKS5 и HTTP..."
@@ -6131,6 +6934,29 @@ private suspend fun installLocalProxy(
         admin -p${'$'}ADMIN_PORT -i0.0.0.0
         EOF
         chmod 600 /etc/wdtt/3proxy.cfg
+        mkdir -p /usr/local/lib/wdtt
+        cat >/usr/local/lib/wdtt/local-proxy-firewall <<EOF
+        #!/bin/sh
+        set -eu
+        action="${'$'}{1:-}"
+        cleanup() {
+          if command -v iptables >/dev/null 2>&1; then
+            iptables -S INPUT 2>/dev/null | grep 'WDTT_LOCAL_PROXY' | sed 's/^-A /iptables -D /' |
+              while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+          fi
+        }
+        if [ "${'$'}{action}" = down ]; then
+          cleanup
+          exit 0
+        fi
+        [ "${'$'}{action}" = up ] || exit 2
+        command -v iptables >/dev/null 2>&1 || exit 0
+        cleanup
+        iptables -I INPUT -p tcp --dport $port -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+        iptables -I INPUT -p tcp --dport $httpPort -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+        iptables -I INPUT -p tcp --dport ${httpPort + 1} -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+        EOF
+        chmod 700 /usr/local/lib/wdtt/local-proxy-firewall
         wdtt_progress 0.82 "Настраиваю службу wdtt-3proxy..."
         cat >/etc/systemd/system/wdtt-3proxy.service <<EOF
         [Unit]
@@ -6141,6 +6967,8 @@ private suspend fun installLocalProxy(
         [Service]
         Type=forking
         ExecStart=${'$'}THREEPROXY_BIN /etc/wdtt/3proxy.cfg
+        ExecStartPost=/usr/local/lib/wdtt/local-proxy-firewall up
+        ExecStopPost=/usr/local/lib/wdtt/local-proxy-firewall down
         ExecReload=/bin/kill -HUP ${'$'}MAINPID
         Restart=on-failure
 
@@ -6149,17 +6977,20 @@ private suspend fun installLocalProxy(
         EOF
         systemctl daemon-reload
         wdtt_progress 0.88 "Запускаю прокси-службу..."
-        systemctl enable --now wdtt-3proxy >/dev/null
-        systemctl is-active --quiet wdtt-3proxy || { echo WDTT_ERROR=local_proxy_service_inactive; exit 3; }
-        wdtt_progress 0.92 "Открываю порты в firewall, если он есть..."
-        if command -v iptables >/dev/null 2>&1; then
-          iptables -C INPUT -p tcp --dport "${'$'}PROXY_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "${'$'}PROXY_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
-          iptables -C INPUT -p tcp --dport "${'$'}HTTP_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "${'$'}HTTP_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
-          iptables -C INPUT -p tcp --dport "${'$'}ADMIN_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "${'$'}ADMIN_PORT" -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+        if ! systemctl enable wdtt-3proxy >/dev/null ||
+           ! systemctl restart wdtt-3proxy >/dev/null ||
+           ! systemctl is-active --quiet wdtt-3proxy; then
+          systemctl disable --now wdtt-3proxy 2>/dev/null || true
+          echo WDTT_ERROR=local_proxy_service_inactive
+          exit 3
         fi
+        wdtt_progress 0.92 "Открываю порты в firewall, если он есть..."
+        /usr/local/lib/wdtt/local-proxy-firewall up ||
+          { echo WDTT_ERROR=local_proxy_firewall_failed; systemctl disable --now wdtt-3proxy 2>/dev/null || true; exit 3; }
         wdtt_progress 0.96 "Проверяю подключение через установленный SOCKS5..."
-        TEST_IP="${'$'}(curl --socks5-hostname "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD@127.0.0.1:${'$'}PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null || true)"
-        [ -n "${'$'}TEST_IP" ] || { echo WDTT_ERROR=local_proxy_check_failed; exit 3; }
+        TEST_IP="${'$'}(curl --proxy-user "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD" --socks5-hostname "127.0.0.1:${'$'}PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+        [ -n "${'$'}TEST_IP" ] ||
+          { systemctl disable --now wdtt-3proxy 2>/dev/null || true; echo WDTT_ERROR=local_proxy_check_failed; exit 3; }
         SERVER_IP="${'$'}(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print ${'$'}1}')"
         cat >/etc/wdtt/local-proxy.json <<EOF
         {
@@ -6175,7 +7006,7 @@ private suspend fun installLocalProxy(
         EOF
         chmod 600 /etc/wdtt/local-proxy.json
         wdtt_progress 1.0 "Прокси установлен и проверен."
-        echo "Прокси VPS включён."
+        echo "Прокси на этом VPS включён."
         echo "SOCKS5-прокси: socks5://${'$'}PROXY_LOGIN:********@${'$'}SERVER_IP:${'$'}PROXY_PORT"
         echo "HTTP-прокси: http://${'$'}PROXY_LOGIN:********@${'$'}SERVER_IP:${'$'}HTTP_PORT"
         echo "Веб-страница 3proxy: http://${'$'}SERVER_IP:${'$'}ADMIN_PORT/"
@@ -6191,6 +7022,10 @@ private suspend fun checkLocalProxy(
     login: String,
     proxyPassword: String
 ): String {
+    require(port in 1..65533) { "порт SOCKS5 должен быть от 1 до 65533" }
+    require(localProxyCredentialsIssue(login, proxyPassword) == null) {
+        localProxyCredentialsIssue(login, proxyPassword).orEmpty()
+    }
     val script = """
         PROXY_PORT=$port
         PROXY_LOGIN=${shellQuote(login)}
@@ -6202,7 +7037,7 @@ private suspend fun checkLocalProxy(
         echo "WDTT_PROGRESS|0.45|Проверяю curl на сервере..."
         command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; exit 2; }
         echo "WDTT_PROGRESS|0.70|Подключаюсь через SOCKS5 127.0.0.1:${'$'}PROXY_PORT..."
-        IP="${'$'}(curl --socks5-hostname "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD@127.0.0.1:${'$'}PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+        IP="${'$'}(curl --proxy-user "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD" --socks5-hostname "127.0.0.1:${'$'}PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null || true)"
         [ -n "${'$'}IP" ] || { echo WDTT_ERROR=local_proxy_check_failed; exit 3; }
         echo "WDTT_PROGRESS|1.0|Прокси отвечает."
         echo "Проверка успешна: SOCKS5 на 127.0.0.1:${'$'}PROXY_PORT отвечает с указанными логином и паролем. Выходной IP: ${'$'}IP"
@@ -6210,53 +7045,65 @@ private suspend fun checkLocalProxy(
     return runRootScript(context, target, script, timeout = 30000L)
 }
 
-private suspend fun stopLocalProxy(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
-    var session: Session? = null
-    try {
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
-        val ssh = SSHClient(session, target.pass)
-        val script = """
-            echo "WDTT_PROGRESS|0.35|Останавливаю службу прокси на этом сервере..."
-            systemctl stop wdtt-3proxy 2>/dev/null || true
-            echo "WDTT_PROGRESS|0.85|Проверяю, что прокси больше не запущен..."
-            if systemctl is-active --quiet wdtt-3proxy 2>/dev/null; then
-              echo WDTT_ERROR=local_proxy_service_still_active
-              exit 3
-            fi
-            echo "WDTT_PROGRESS|1.0|Прокси остановлен."
-            echo "Прокси VPS остановлен. Настройки сохранены, его можно снова включить кнопкой «Установить»."
-        """.trimIndent()
-        ssh.exec(rootCommand(script), timeout = 20000L).trim()
-    } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
-    }
-}
+internal fun stopLocalProxyScript(): String = """
+    set -e
+    echo "WDTT_PROGRESS|0.35|Останавливаю службу прокси на этом сервере..."
+    systemctl disable --now wdtt-3proxy 2>/dev/null || systemctl stop wdtt-3proxy 2>/dev/null || true
+    echo "WDTT_PROGRESS|0.85|Проверяю, что прокси больше не запущен..."
+    if systemctl is-active --quiet wdtt-3proxy 2>/dev/null ||
+       systemctl is-enabled --quiet wdtt-3proxy 2>/dev/null; then
+      echo WDTT_ERROR=local_proxy_service_still_active
+      exit 3
+    fi
+    echo "WDTT_PROGRESS|1.0|Прокси остановлен."
+    echo "Прокси на этом VPS остановлен и убран из автозапуска. Настройки сохранены, его можно снова включить кнопкой «Установить»."
+""".trimIndent()
 
-private suspend fun removeLocalProxy(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
-    var session: Session? = null
-    try {
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
-        val ssh = SSHClient(session, target.pass)
-        val script = shellScript(
-            """
-            echo "WDTT_PROGRESS|0.25|Останавливаю службу прокси..."
-            systemctl disable --now wdtt-3proxy 2>/dev/null || true
-            echo "WDTT_PROGRESS|0.55|Удаляю файлы настроек прокси..."
-            rm -f /etc/systemd/system/wdtt-3proxy.service /etc/wdtt/3proxy.cfg /etc/wdtt/local-proxy.json
-            systemctl daemon-reload 2>/dev/null || true
-            echo "WDTT_PROGRESS|0.80|Удаляю правила доступа к портам прокси..."
-            if command -v iptables >/dev/null 2>&1; then
-              iptables -S INPUT 2>/dev/null | grep WDTT_LOCAL_PROXY | sed 's/^-A /iptables -D /' | while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
-            fi
-            echo "WDTT_PROGRESS|1.0|Прокси удалён."
-            echo "Прокси VPS удалён: служба, настройки и правила доступа к портам очищены."
-            """
-        )
-        ssh.exec(rootCommand(script), timeout = 30000L).trim()
-    } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
-    }
-}
+private suspend fun stopLocalProxy(target: OutboundSshTarget): String =
+    runCheckedRootScript(target, stopLocalProxyScript(), timeout = 20000L)
+
+internal fun removeLocalProxyScript(): String = shellScript(
+    outboundShellPrelude(),
+    """
+    echo "WDTT_PROGRESS|0.25|Останавливаю службу прокси..."
+    systemctl disable --now wdtt-3proxy 2>/dev/null || true
+    echo "WDTT_PROGRESS|0.55|Удаляю файлы настроек прокси..."
+    rm -f /etc/systemd/system/wdtt-3proxy.service /etc/wdtt/3proxy.cfg /etc/wdtt/local-proxy.json \
+      /usr/local/lib/wdtt/local-proxy-firewall
+    systemctl daemon-reload 2>/dev/null || true
+    echo "WDTT_PROGRESS|0.80|Удаляю правила доступа к портам прокси..."
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -S INPUT 2>/dev/null | grep WDTT_LOCAL_PROXY | sed 's/^-A /iptables -D /' | while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+    fi
+    if [ -f /etc/wdtt/outbound-profile.env ]; then
+      tmp_profile=/etc/wdtt/outbound-profile.env.tmp
+      grep -Ev '^(LOCAL_PROXY_PORT|LOCAL_PROXY_LOGIN_B64|LOCAL_PROXY_PASSWORD_B64)=' \
+        /etc/wdtt/outbound-profile.env >"${'$'}tmp_profile" 2>/dev/null || true
+      chmod 600 "${'$'}tmp_profile"
+      mv "${'$'}tmp_profile" /etc/wdtt/outbound-profile.env
+    fi
+    LOCAL_REMOVE_LEFT=0
+    systemctl is-active --quiet wdtt-3proxy 2>/dev/null && LOCAL_REMOVE_LEFT=1
+    systemctl is-enabled --quiet wdtt-3proxy 2>/dev/null && LOCAL_REMOVE_LEFT=1
+    [ -e /etc/systemd/system/wdtt-3proxy.service ] && LOCAL_REMOVE_LEFT=1
+    [ -e /etc/wdtt/3proxy.cfg ] && LOCAL_REMOVE_LEFT=1
+    [ -e /etc/wdtt/local-proxy.json ] && LOCAL_REMOVE_LEFT=1
+    [ -e /usr/local/lib/wdtt/local-proxy-firewall ] && LOCAL_REMOVE_LEFT=1
+    if command -v iptables >/dev/null 2>&1 &&
+       iptables -S INPUT 2>/dev/null | grep -q WDTT_LOCAL_PROXY; then
+      LOCAL_REMOVE_LEFT=1
+    fi
+    if [ "${'$'}LOCAL_REMOVE_LEFT" != 0 ]; then
+      echo WDTT_ERROR=local_proxy_remove_failed
+      exit 3
+    fi
+    echo "WDTT_PROGRESS|1.0|Прокси удалён."
+    echo "Прокси на этом VPS удалён: служба, настройки, сохранённые реквизиты и правила доступа к портам очищены."
+    """
+)
+
+private suspend fun removeLocalProxy(target: OutboundSshTarget): String =
+    runCheckedRootScript(target, removeLocalProxyScript(), timeout = 30000L)
 
 private suspend fun checkExternalProxy(
     context: Context,
@@ -6267,15 +7114,25 @@ private suspend fun checkExternalProxy(
     login: String,
     proxyPassword: String
 ): String {
+    require(host.isValidPublicHost()) { "укажите домен или IPv4 внешнего прокси без схемы и порта" }
+    require(port in 1..65535) { "порт внешнего прокси должен быть от 1 до 65535" }
+    require(externalProxyCredentialsIssue(login, proxyPassword) == null) {
+        externalProxyCredentialsIssue(login, proxyPassword).orEmpty()
+    }
     val scheme = if (kind == ProxyKind.Socks5) "socks5h" else "http"
-    val auth = if (login.isNotBlank()) "${login}:${proxyPassword}@" else ""
-    val proxyUri = "$scheme://$auth$host:$port"
+    val proxyUri = "$scheme://$host:$port"
     val script = """
         echo "WDTT_PROGRESS|0.25|Проверяю curl на сервере..."
         command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; exit 2; }
         echo "WDTT_PROGRESS|0.55|Пробую выйти в интернет через указанный ${kind.label}..."
         PROXY_URI=${shellQuote(proxyUri)}
-        IP="${'$'}(curl --proxy "${'$'}PROXY_URI" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
+        PROXY_LOGIN=${shellQuote(login)}
+        PROXY_PASSWORD=${shellQuote(proxyPassword)}
+        if [ -n "${'$'}PROXY_LOGIN" ]; then
+          IP="${'$'}(curl --proxy "${'$'}PROXY_URI" --proxy-user "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
+        else
+          IP="${'$'}(curl --proxy "${'$'}PROXY_URI" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
+        fi
         [ -n "${'$'}IP" ] || { echo WDTT_ERROR=external_proxy_check_failed; exit 3; }
         echo "WDTT_PROGRESS|1.0|Внешний TCP-прокси отвечает."
         echo "Проверка успешна: ${kind.label} отвечает, сервер смог открыть проверочный сайт через него. IP через прокси: ${'$'}IP"
@@ -6292,6 +7149,11 @@ private suspend fun enableExternalProxy(
     login: String,
     proxyPassword: String
 ): String {
+    require(host.isValidPublicHost()) { "укажите домен или IPv4 внешнего прокси без схемы и порта" }
+    require(port in 1..65535) { "порт внешнего прокси должен быть от 1 до 65535" }
+    require(externalProxyCredentialsIssue(login, proxyPassword) == null) {
+        externalProxyCredentialsIssue(login, proxyPassword).orEmpty()
+    }
     val redsocksType = if (kind == ProxyKind.Socks5) "socks5" else "http-connect"
     val script = shellScript(
         outboundShellPrelude(),
@@ -6302,6 +7164,8 @@ private suspend fun enableExternalProxy(
         PROXY_PORT=$port
         PROXY_LOGIN=${shellQuote(login)}
         PROXY_PASSWORD=${shellQuote(proxyPassword)}
+        PROXY_LOGIN_CONFIG=${shellQuote(escapeRedsocksQuotedValue(login))}
+        PROXY_PASSWORD_CONFIG=${shellQuote(escapeRedsocksQuotedValue(proxyPassword))}
         wdtt_progress() { echo "WDTT_PROGRESS|${'$'}1|${'$'}2"; }
         wdtt_progress 0.12 "Готовлю компонент перенаправления через внешний TCP-прокси..."
         wdtt_install_redsocks_tools || true
@@ -6332,23 +7196,52 @@ private suspend fun enableExternalProxy(
           type = ${'$'}REDSOCKS_TYPE;
         EOF
         if [ -n "${'$'}PROXY_LOGIN" ]; then
-          printf '  login = "%s";\n' "${'$'}PROXY_LOGIN" >>/etc/wdtt/redsocks.conf
-          printf '  password = "%s";\n' "${'$'}PROXY_PASSWORD" >>/etc/wdtt/redsocks.conf
+          printf '  login = "%s";\n' "${'$'}PROXY_LOGIN_CONFIG" >>/etc/wdtt/redsocks.conf
+          printf '  password = "%s";\n' "${'$'}PROXY_PASSWORD_CONFIG" >>/etc/wdtt/redsocks.conf
         fi
         cat >>/etc/wdtt/redsocks.conf <<EOF
         }
         EOF
         chmod 600 /etc/wdtt/redsocks.conf
+        mkdir -p /usr/local/lib/wdtt
+        cat >/usr/local/lib/wdtt/redsocks-routes <<EOF
+        #!/bin/sh
+        set -eu
+        action="${'$'}{1:-}"
+        WDTT_IFACE=wdtt0
+        PROXY_IP=${'$'}PROXY_IP
+        cleanup() {
+          while iptables -t nat -D PREROUTING -i "${'$'}{WDTT_IFACE}" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; do :; done
+          iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
+          iptables -t nat -X WDTT_PROXY_OUT 2>/dev/null || true
+        }
+        if [ "${'$'}{action}" = down ]; then
+          cleanup
+          exit 0
+        fi
+        [ "${'$'}{action}" = up ] || exit 2
+        cleanup
+        iptables -t nat -N WDTT_PROXY_OUT
+        for net in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+          iptables -t nat -A WDTT_PROXY_OUT -d "${'$'}{net}" -j RETURN
+        done
+        [ -n "${'$'}{PROXY_IP}" ] && iptables -t nat -A WDTT_PROXY_OUT -d "${'$'}{PROXY_IP}" -j RETURN
+        iptables -t nat -A WDTT_PROXY_OUT -p tcp -j REDIRECT --to-ports 12345
+        iptables -t nat -A PREROUTING -i "${'$'}{WDTT_IFACE}" -p tcp -j WDTT_PROXY_OUT
+        EOF
+        chmod 700 /usr/local/lib/wdtt/redsocks-routes
         wdtt_progress 0.76 "Настраиваю службу перенаправления WDTT..."
         cat >/etc/systemd/system/wdtt-redsocks.service <<EOF
         [Unit]
         Description=WDTT Plus external proxy redirector
-        After=network-online.target
+        After=network-online.target wdtt.service
         Wants=network-online.target
 
         [Service]
         Type=forking
         ExecStart=${'$'}REDSOCKS_BIN -c /etc/wdtt/redsocks.conf -p /run/wdtt-redsocks.pid
+        ExecStartPost=/usr/local/lib/wdtt/redsocks-routes up
+        ExecStopPost=/usr/local/lib/wdtt/redsocks-routes down
         PIDFile=/run/wdtt-redsocks.pid
         Restart=on-failure
 
@@ -6357,14 +7250,18 @@ private suspend fun enableExternalProxy(
         EOF
         systemctl daemon-reload
         wdtt_progress 0.84 "Запускаю службу внешнего TCP-прокси..."
-        systemctl enable --now wdtt-redsocks >/dev/null
-        systemctl is-active --quiet wdtt-redsocks || { echo WDTT_ERROR=external_proxy_service_inactive; journalctl -u wdtt-redsocks -n 30 --no-pager 2>/dev/null || true; exit 3; }
+        if ! systemctl enable wdtt-redsocks >/dev/null ||
+           ! systemctl restart wdtt-redsocks >/dev/null ||
+           ! systemctl is-active --quiet wdtt-redsocks; then
+          journalctl -u wdtt-redsocks -n 30 --no-pager 2>/dev/null || true
+          wdtt_clear_external_out
+          wdtt_write_mode "direct" "rollback after external proxy service error"
+          echo WDTT_ERROR=external_proxy_service_inactive
+          exit 3
+        fi
         wdtt_progress 0.92 "Направляю обычные TCP-подключения WDTT через внешний TCP-прокси..."
-        iptables -t nat -N WDTT_PROXY_OUT 2>/dev/null || true
-        iptables -t nat -F WDTT_PROXY_OUT
-        wdtt_proxy_reserved_returns WDTT_PROXY_OUT "${'$'}PROXY_IP"
-        iptables -t nat -A WDTT_PROXY_OUT -p tcp -j REDIRECT --to-ports 12345
-        iptables -t nat -C PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null || iptables -t nat -A PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT
+        /usr/local/lib/wdtt/redsocks-routes up ||
+          { echo WDTT_ERROR=external_proxy_route_install_failed; wdtt_clear_external_out; wdtt_write_mode "direct" "rollback after external proxy route error"; exit 3; }
         wdtt_progress 0.96 "Проверяю путь WDTT через внешний TCP-прокси..."
         if ! wdtt_test_redsocks_path "${'$'}PROXY_IP"; then
           wdtt_clear_external_out
@@ -6380,6 +7277,52 @@ private suspend fun enableExternalProxy(
     )
     return runRootScript(context, target, script, timeout = CMD_TIMEOUT)
 }
+
+internal fun deleteExternalProxyScript(): String = shellScript(
+    outboundShellPrelude(),
+    """
+    MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+    echo "WDTT_PROGRESS|0.25|Останавливаю внешний TCP-прокси..."
+    wdtt_clear_proxy_out
+    echo "WDTT_PROGRESS|0.55|Удаляю службу и настройки внешнего прокси..."
+    rm -f /etc/systemd/system/wdtt-redsocks.service \
+      /etc/wdtt/redsocks.conf \
+      /usr/local/lib/wdtt/redsocks-routes \
+      /var/log/wdtt-redsocks.log \
+      /run/wdtt-redsocks.pid
+    systemctl daemon-reload 2>/dev/null || true
+    if [ -f /etc/wdtt/outbound-profile.env ]; then
+      tmp_profile=/etc/wdtt/outbound-profile.env.tmp
+      grep -Ev '^(EXTERNAL_PROXY_KIND|EXTERNAL_PROXY_HOST_B64|EXTERNAL_PROXY_PORT|EXTERNAL_PROXY_LOGIN_B64|EXTERNAL_PROXY_PASSWORD_B64)=' \
+        /etc/wdtt/outbound-profile.env >"${'$'}tmp_profile" 2>/dev/null || true
+      chmod 600 "${'$'}tmp_profile"
+      mv "${'$'}tmp_profile" /etc/wdtt/outbound-profile.env
+    fi
+    if [ "${'$'}MODE" = "external_proxy" ]; then
+      wdtt_write_mode "direct" "прямой выход"
+    fi
+    EXTERNAL_REMOVE_LEFT=0
+    systemctl is-active --quiet wdtt-redsocks 2>/dev/null && EXTERNAL_REMOVE_LEFT=1
+    systemctl is-enabled --quiet wdtt-redsocks 2>/dev/null && EXTERNAL_REMOVE_LEFT=1
+    [ -e /etc/systemd/system/wdtt-redsocks.service ] && EXTERNAL_REMOVE_LEFT=1
+    [ -e /etc/wdtt/redsocks.conf ] && EXTERNAL_REMOVE_LEFT=1
+    [ -e /usr/local/lib/wdtt/redsocks-routes ] && EXTERNAL_REMOVE_LEFT=1
+    if command -v iptables >/dev/null 2>&1 &&
+       { iptables -t nat -S WDTT_PROXY_OUT >/dev/null 2>&1 ||
+         iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "-i ${'$'}WDTT_IFACE .* -j WDTT_PROXY_OUT"; }; then
+      EXTERNAL_REMOVE_LEFT=1
+    fi
+    if [ "${'$'}EXTERNAL_REMOVE_LEFT" != 0 ]; then
+      echo WDTT_ERROR=external_proxy_remove_failed
+      exit 3
+    fi
+    echo "WDTT_PROGRESS|1.0|Настройки внешнего TCP-прокси удалены."
+    echo "Служба, конфигурация, сохранённые реквизиты и правила внешнего TCP-прокси удалены."
+    """
+)
+
+private suspend fun deleteExternalProxy(target: OutboundSshTarget): String =
+    runCheckedRootScript(target, deleteExternalProxyScript(), timeout = 30000L)
 
 internal fun validateWireGuardConfigText(config: String): Result<Unit> = runCatching {
     val raw = config.trim()
@@ -6487,7 +7430,11 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
     echo "WDTT_PROGRESS|0.72|Отключаю прежний внешний выход WDTT..."
     wdtt_clear_external_out
     echo "WDTT_PROGRESS|0.78|Создаю постоянную службу WireGuard-выхода..."
-    mkdir -p /usr/local/lib/wdtt
+    mkdir -p /usr/local/lib/wdtt /etc/wdtt-plus/wg-exit
+    printf '%s\n' ${shellQuote(mode)} >"${'$'}WDTT_WG_OWNER_FILE"
+    printf '%s\n' ${shellQuote(mode)} >"${'$'}WDTT_WG_CONFIG_OWNER_FILE"
+    chmod 600 "${'$'}WDTT_WG_OWNER_FILE"
+    chmod 600 "${'$'}WDTT_WG_CONFIG_OWNER_FILE"
     cat >/usr/local/lib/wdtt/wg-exit-up <<'WDTT_WG_UP'
     #!/bin/sh
     set -eu
@@ -6496,6 +7443,19 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
     WDTT_TABLE=100
     WDTT_SUBNET="${'$'}(ip -4 route show dev "${'$'}WDTT_IFACE" scope link 2>/dev/null | awk '{print ${'$'}1; exit}')"
     [ -n "${'$'}WDTT_SUBNET" ] || WDTT_SUBNET=10.66.66.0/24
+    wdtt_wg_up_cleanup() {
+      status="${'$'}?"
+      trap - 0
+      if [ "${'$'}status" -ne 0 ]; then
+        set +e
+        iptables -t nat -D POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null
+        while ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null; do :; done
+        ip route flush table "${'$'}WDTT_TABLE" 2>/dev/null
+        wg-quick down "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1 || ip link delete "${'$'}WDTT_WG_IFACE" 2>/dev/null
+      fi
+      exit "${'$'}status"
+    }
+    trap wdtt_wg_up_cleanup 0
     wg-quick down "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1 || true
     wg-quick up "${'$'}WDTT_WG_IFACE"
     ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null || true
@@ -6503,6 +7463,7 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
     ip route replace default dev "${'$'}WDTT_WG_IFACE" table "${'$'}WDTT_TABLE"
     iptables -t nat -C POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null || \
       iptables -t nat -A POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE
+    trap - 0
     WDTT_WG_UP
     cat >/usr/local/lib/wdtt/wg-exit-down <<'WDTT_WG_DOWN'
     #!/bin/sh
@@ -6534,8 +7495,21 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
     WDTT_WG_SERVICE
     systemctl daemon-reload
     echo "WDTT_PROGRESS|0.84|Поднимаю WireGuard-интерфейс и маршруты WDTT..."
-    systemctl enable --now wdtt-wg-exit.service >/dev/null
-    systemctl is-active --quiet wdtt-wg-exit.service || { echo WDTT_ERROR=wireguard_exit_service_inactive; exit 3; }
+    if ! systemctl enable --now wdtt-wg-exit.service >/tmp/wdtt-wg-exit-start.log 2>&1 ||
+       ! systemctl is-active --quiet wdtt-wg-exit.service; then
+      echo "WireGuard-служба не запустилась; очищаю частично созданный интерфейс и маршруты."
+      tail -n 12 /tmp/wdtt-wg-exit-start.log 2>/dev/null || true
+      systemctl disable --now wdtt-wg-exit.service 2>/dev/null || true
+      /usr/local/lib/wdtt/wg-exit-down >/dev/null 2>&1 || true
+      ip link delete "${'$'}WDTT_WG_IFACE" 2>/dev/null || true
+      systemctl reset-failed wdtt-wg-exit.service 2>/dev/null || true
+      wdtt_write_mode "direct" "rollback after WireGuard service start error"
+      rm -f "${'$'}WDTT_WG_OWNER_FILE"
+      rm -f /tmp/wdtt-wg-exit-start.log
+      echo WDTT_ERROR=wireguard_exit_service_inactive
+      exit 3
+    fi
+    rm -f /tmp/wdtt-wg-exit-start.log
     echo "WDTT_PROGRESS|0.95|Сохраняю новый режим выхода WDTT..."
     wdtt_write_mode ${shellQuote(mode)} ${shellQuote(detail)}
     sleep 1
@@ -7137,13 +8111,36 @@ private suspend fun resetFreeWarpRegistration(target: OutboundSshTarget): String
             """
             WARP_DIR=/etc/wdtt-plus/warp
             MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+            OWNER="${'$'}(cat "${'$'}WDTT_WG_OWNER_FILE" 2>/dev/null | head -n 1)"
+            CONFIG_OWNER="${'$'}(cat "${'$'}WDTT_WG_CONFIG_OWNER_FILE" 2>/dev/null | head -n 1)"
+            WARP_CONFIG_MATCH=0
+            if [ -f /etc/wireguard/wg-wdtt-exit.conf ] &&
+               [ -f "${'$'}WARP_DIR/wgcf-profile.conf" ] &&
+               cmp -s /etc/wireguard/wg-wdtt-exit.conf "${'$'}WARP_DIR/wgcf-profile.conf"; then
+              WARP_CONFIG_MATCH=1
+            fi
+            WARP_OWNS_CONFIG=0
+            if [ "${'$'}CONFIG_OWNER" = "warp_free" ] ||
+               { [ -z "${'$'}CONFIG_OWNER" ] && [ "${'$'}WARP_CONFIG_MATCH" = 1 ]; }; then
+              WARP_OWNS_CONFIG=1
+            fi
+            WARP_OWNS_ACTIVE_WG=0
+            if [ "${'$'}MODE" = "warp_free" ] ||
+               { [ "${'$'}MODE" = "direct" ] && [ "${'$'}OWNER" = "warp_free" ]; } ||
+               { [ "${'$'}MODE" = "direct" ] && [ -z "${'$'}OWNER" ] && [ "${'$'}WARP_CONFIG_MATCH" = 1 ]; }; then
+              WARP_OWNS_ACTIVE_WG=1
+            fi
             echo "WDTT_PROGRESS|0.20|Останавливаю WARP и автопроверку..."
             systemctl disable --now wdtt-warp-watchdog.timer wdtt-warp-watchdog.service 2>/dev/null || true
-            if [ "${'$'}MODE" = "warp_free" ]; then
+            if [ "${'$'}MODE" = "warp_free" ] || [ "${'$'}WARP_OWNS_ACTIVE_WG" = 1 ]; then
               echo "WDTT_PROGRESS|0.45|Возвращаю прямой выход WDTT..."
-              wdtt_clear_external_out
-              rm -f /etc/wireguard/wg-wdtt-exit.conf /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+              wdtt_clear_wireguard_out
               wdtt_write_mode "direct" "WARP registration reset"
+            fi
+            if [ "${'$'}WARP_OWNS_CONFIG" = 1 ]; then
+              rm -f /etc/wireguard/wg-wdtt-exit.conf \
+                /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf \
+                "${'$'}WDTT_WG_CONFIG_OWNER_FILE"
             fi
             echo "WDTT_PROGRESS|0.75|Удаляю текущую регистрацию и профиль WARP..."
             mkdir -p "${'$'}WARP_DIR"
@@ -7152,9 +8149,14 @@ private suspend fun resetFreeWarpRegistration(target: OutboundSshTarget): String
               "${'$'}WARP_DIR"/selected.env "${'$'}WARP_DIR"/health.env
             chmod 700 "${'$'}WARP_DIR" 2>/dev/null || true
             systemctl reset-failed wdtt-warp-watchdog.service wdtt-wg-exit.service 2>/dev/null || true
+            if [ -e "${'$'}WARP_DIR/wgcf-account.toml" ] ||
+               [ -e "${'$'}WARP_DIR/wgcf-profile.conf" ]; then
+              echo WDTT_ERROR=warp_registration_reset_failed
+              exit 3
+            fi
             echo "WDTT_PROGRESS|1.0|Регистрация WARP сброшена."
             echo "Текущая регистрация, ключи и профиль WARP удалены. Проверенный wgcf оставлен на сервере."
-            if [ "${'$'}MODE" = "warp_free" ]; then
+            if [ "${'$'}MODE" = "warp_free" ] || [ "${'$'}WARP_OWNS_ACTIVE_WG" = 1 ]; then
               echo "WDTT-пользователи снова выходят напрямую через текущий VPS. Для новой регистрации нажмите «Установить / восстановить»."
             else
               echo "Активный режим выхода WDTT не был WARP; он не изменён."
@@ -7177,24 +8179,60 @@ private suspend fun deleteFreeWarp(target: OutboundSshTarget): String = withCont
         val script = shellScript(
             outboundShellPrelude(),
             """
+            WARP_DIR=/etc/wdtt-plus/warp
             MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+            OWNER="${'$'}(cat "${'$'}WDTT_WG_OWNER_FILE" 2>/dev/null | head -n 1)"
+            CONFIG_OWNER="${'$'}(cat "${'$'}WDTT_WG_CONFIG_OWNER_FILE" 2>/dev/null | head -n 1)"
+            WARP_CONFIG_MATCH=0
+            if [ -f /etc/wireguard/wg-wdtt-exit.conf ] &&
+               [ -f "${'$'}WARP_DIR/wgcf-profile.conf" ] &&
+               cmp -s /etc/wireguard/wg-wdtt-exit.conf "${'$'}WARP_DIR/wgcf-profile.conf"; then
+              WARP_CONFIG_MATCH=1
+            fi
+            WARP_OWNS_CONFIG=0
+            if [ "${'$'}CONFIG_OWNER" = "warp_free" ] ||
+               { [ -z "${'$'}CONFIG_OWNER" ] && [ "${'$'}WARP_CONFIG_MATCH" = 1 ]; }; then
+              WARP_OWNS_CONFIG=1
+            fi
+            WARP_OWNS_ACTIVE_WG=0
+            if [ "${'$'}MODE" = "warp_free" ] ||
+               { [ "${'$'}MODE" = "direct" ] && [ "${'$'}OWNER" = "warp_free" ]; } ||
+               { [ "${'$'}MODE" = "direct" ] && [ -z "${'$'}OWNER" ] && [ "${'$'}WARP_CONFIG_MATCH" = 1 ]; }; then
+              WARP_OWNS_ACTIVE_WG=1
+            fi
             echo "WDTT_PROGRESS|0.20|Останавливаю автоматическую проверку WARP..."
             systemctl disable --now wdtt-warp-watchdog.timer wdtt-warp-watchdog.service 2>/dev/null || true
-            if [ "${'$'}MODE" = "warp_free" ]; then
+            if [ "${'$'}MODE" = "warp_free" ] || [ "${'$'}WARP_OWNS_ACTIVE_WG" = 1 ]; then
               echo "WDTT_PROGRESS|0.45|Возвращаю прямой выход WDTT..."
-              wdtt_clear_external_out
-              rm -f /etc/wireguard/wg-wdtt-exit.conf /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+              wdtt_clear_wireguard_out
               wdtt_write_mode "direct" "прямой выход"
             fi
+            if [ "${'$'}WARP_OWNS_CONFIG" = 1 ]; then
+              rm -f /etc/wireguard/wg-wdtt-exit.conf \
+                /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf \
+                "${'$'}WDTT_WG_CONFIG_OWNER_FILE"
+            fi
             echo "WDTT_PROGRESS|0.70|Удаляю регистрацию, ключи и профиль WARP..."
-            rm -rf /etc/wdtt-plus/warp
+            rm -rf "${'$'}WARP_DIR"
             rm -f /usr/local/bin/wgcf /usr/local/bin/wgcf.previous /usr/local/lib/wdtt/warp-watchdog
             rm -f /etc/systemd/system/wdtt-warp-watchdog.service /etc/systemd/system/wdtt-warp-watchdog.timer
             systemctl daemon-reload 2>/dev/null || true
             systemctl reset-failed wdtt-warp-watchdog.service 2>/dev/null || true
+            WARP_REMOVE_LEFT=0
+            [ -e "${'$'}WARP_DIR" ] && WARP_REMOVE_LEFT=1
+            [ -e /usr/local/bin/wgcf ] && WARP_REMOVE_LEFT=1
+            [ -e /usr/local/lib/wdtt/warp-watchdog ] && WARP_REMOVE_LEFT=1
+            [ -e /etc/systemd/system/wdtt-warp-watchdog.service ] && WARP_REMOVE_LEFT=1
+            [ -e /etc/systemd/system/wdtt-warp-watchdog.timer ] && WARP_REMOVE_LEFT=1
+            systemctl is-active --quiet wdtt-warp-watchdog.timer 2>/dev/null && WARP_REMOVE_LEFT=1
+            systemctl is-enabled --quiet wdtt-warp-watchdog.timer 2>/dev/null && WARP_REMOVE_LEFT=1
+            if [ "${'$'}WARP_REMOVE_LEFT" != 0 ]; then
+              echo WDTT_ERROR=warp_remove_failed
+              exit 3
+            fi
             echo "WDTT_PROGRESS|1.0|Бесплатный WARP удалён."
             echo "Регистрация, ключи, профиль и автоматическая проверка WARP удалены с сервера."
-            if [ "${'$'}MODE" = "warp_free" ]; then
+            if [ "${'$'}MODE" = "warp_free" ] || [ "${'$'}WARP_OWNS_ACTIVE_WG" = 1 ]; then
               echo "WDTT-пользователи снова выходят напрямую через текущий VPS."
             else
               echo "Другой активный режим выхода не изменён."
@@ -7244,33 +8282,237 @@ private suspend fun enableImportedWireGuardExit(
     }
 }
 
-private suspend fun deleteImportedWireGuardExit(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
-    var session: Session? = null
+internal fun deleteImportedWireGuardExitScript(): String = shellScript(
+    outboundShellPrelude(),
+    """
+    MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+    OWNER="${'$'}(cat "${'$'}WDTT_WG_OWNER_FILE" 2>/dev/null | head -n 1)"
+    CONFIG_OWNER="${'$'}(cat "${'$'}WDTT_WG_CONFIG_OWNER_FILE" 2>/dev/null | head -n 1)"
+    OWNS_ACTIVE=0
+    OWNS_CONFIG=0
+    if [ "${'$'}MODE" = "imported_wg" ] ||
+       { [ "${'$'}MODE" = "direct" ] && [ "${'$'}OWNER" = "imported_wg" ]; }; then
+      OWNS_ACTIVE=1
+      OWNS_CONFIG=1
+    fi
+    if [ "${'$'}CONFIG_OWNER" = "imported_wg" ] ||
+       { [ -z "${'$'}CONFIG_OWNER" ] &&
+         grep -q '^IMPORTED_WG_CONFIG_B64=.' /etc/wdtt/outbound-profile.env 2>/dev/null &&
+         [ "${'$'}MODE" != "warp_free" ] &&
+         [ "${'$'}MODE" != "wireguard_vps" ]; }; then
+      OWNS_CONFIG=1
+    fi
+    echo "WDTT_PROGRESS|0.25|Отключаю импортированный WireGuard-выход, если он запущен..."
+    if [ "${'$'}OWNS_ACTIVE" = 1 ]; then
+      wdtt_clear_wireguard_out
+      wdtt_write_mode "direct" "прямой выход"
+    fi
+    if [ "${'$'}OWNS_CONFIG" = 1 ]; then
+      rm -f /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf \
+        /etc/wireguard/wg-wdtt-exit.conf \
+        "${'$'}WDTT_WG_CONFIG_OWNER_FILE"
+    fi
+    echo "WDTT_PROGRESS|0.60|Удаляю сохранённую копию VPN/WireGuard-файла..."
+    if [ -f /etc/wdtt/outbound-profile.env ]; then
+      tmp_profile=/etc/wdtt/outbound-profile.env.tmp
+      grep -v '^IMPORTED_WG_CONFIG_B64=' /etc/wdtt/outbound-profile.env >"${'$'}tmp_profile" 2>/dev/null || true
+      chmod 600 "${'$'}tmp_profile"
+      mv "${'$'}tmp_profile" /etc/wdtt/outbound-profile.env
+    fi
+    IMPORTED_REMOVE_LEFT=0
+    grep -q '^IMPORTED_WG_CONFIG_B64=' /etc/wdtt/outbound-profile.env 2>/dev/null &&
+      IMPORTED_REMOVE_LEFT=1
+    if [ "${'$'}OWNS_CONFIG" = 1 ]; then
+      if [ "${'$'}OWNS_ACTIVE" = 1 ] &&
+         command -v wg >/dev/null 2>&1 &&
+         wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1; then
+        IMPORTED_REMOVE_LEFT=1
+      fi
+      [ -e /etc/wireguard/wg-wdtt-exit.conf ] && IMPORTED_REMOVE_LEFT=1
+      [ -e /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf ] && IMPORTED_REMOVE_LEFT=1
+    fi
+    if [ "${'$'}IMPORTED_REMOVE_LEFT" != 0 ]; then
+      echo WDTT_ERROR=imported_wireguard_remove_failed
+      exit 3
+    fi
+    echo "WDTT_PROGRESS|1.0|VPN/WireGuard-файл удалён."
+    if [ "${'$'}OWNS_ACTIVE" = 1 ]; then
+      echo "VPN/WireGuard-файл удалён, выход WDTT возвращён напрямую через текущий сервер."
+    else
+      echo "Сохранённая копия VPN/WireGuard-файла удалена. Другой активный режим выхода не изменён."
+    fi
+    """
+)
+
+private suspend fun deleteImportedWireGuardExit(target: OutboundSshTarget): String =
+    runCheckedRootScript(target, deleteImportedWireGuardExitScript(), timeout = 30000L)
+
+internal fun deleteWireGuardVpsCurrentScript(): String = shellScript(
+    outboundShellPrelude(),
+    """
+    MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+    OWNER="${'$'}(cat "${'$'}WDTT_WG_OWNER_FILE" 2>/dev/null | head -n 1)"
+    CONFIG_OWNER="${'$'}(cat "${'$'}WDTT_WG_CONFIG_OWNER_FILE" 2>/dev/null | head -n 1)"
+    OWNS_ACTIVE=0
+    OWNS_CONFIG=0
+    if [ "${'$'}MODE" = "wireguard_vps" ] ||
+       { [ "${'$'}MODE" = "direct" ] && [ "${'$'}OWNER" = "wireguard_vps" ]; }; then
+      OWNS_ACTIVE=1
+      OWNS_CONFIG=1
+    fi
+    if [ "${'$'}CONFIG_OWNER" = "wireguard_vps" ] ||
+       { [ -z "${'$'}CONFIG_OWNER" ] &&
+         [ -f /etc/wireguard/wg-wdtt-exit.conf ] &&
+         grep -Eq 'Address[[:space:]]*=[[:space:]]*10\\.77\\.77\\.2/30' /etc/wireguard/wg-wdtt-exit.conf 2>/dev/null &&
+         grep -Eq 'AllowedIPs[[:space:]]*=[[:space:]]*0\\.0\\.0\\.0/0' /etc/wireguard/wg-wdtt-exit.conf 2>/dev/null; }; then
+      OWNS_CONFIG=1
+    fi
+    echo "WDTT_PROGRESS|0.25|Возвращаю прямой выход на текущем VPS..."
+    if [ "${'$'}OWNS_ACTIVE" = 1 ]; then
+      wdtt_clear_wireguard_out
+      wdtt_write_mode "direct" "прямой выход"
+    fi
+    if [ "${'$'}OWNS_CONFIG" = 1 ]; then
+      rm -f /etc/wireguard/wg-wdtt-exit.conf \
+        /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf \
+        "${'$'}WDTT_WG_CONFIG_OWNER_FILE" \
+        /etc/wdtt-plus/wg-exit/private.key \
+        /etc/wdtt-plus/wg-exit/public.key \
+        /etc/systemd/system/wdtt-wg-exit.service \
+        /usr/local/lib/wdtt/wg-exit-up \
+        /usr/local/lib/wdtt/wg-exit-down
+      rm -rf /etc/wdtt-plus/wg-exit/transactions
+      rmdir /etc/wdtt-plus/wg-exit 2>/dev/null || true
+      systemctl daemon-reload 2>/dev/null || true
+    fi
+    echo "WDTT_PROGRESS|0.55|Удаляю сохранённые поля дополнительного VPS..."
+    if [ -f /etc/wdtt/outbound-profile.env ]; then
+      tmp_profile=/etc/wdtt/outbound-profile.env.tmp
+      grep -Ev '^(WG_VPS_HOST_B64|WG_VPS_SSH_PORT|WG_VPS_USER_B64|WG_VPS_PASSWORD_B64|WG_VPS_PORT|WG_VPS_DNS_B64)=' \
+        /etc/wdtt/outbound-profile.env >"${'$'}tmp_profile" 2>/dev/null || true
+      chmod 600 "${'$'}tmp_profile"
+      mv "${'$'}tmp_profile" /etc/wdtt/outbound-profile.env
+    fi
+    CURRENT_REMOVE_LEFT=0
+    if [ "${'$'}OWNS_CONFIG" = 1 ]; then
+      systemctl is-active --quiet wdtt-wg-exit.service 2>/dev/null && CURRENT_REMOVE_LEFT=1
+      systemctl is-enabled --quiet wdtt-wg-exit.service 2>/dev/null && CURRENT_REMOVE_LEFT=1
+      if [ "${'$'}OWNS_ACTIVE" = 1 ]; then
+        (command -v wg >/dev/null 2>&1 && wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1) &&
+          CURRENT_REMOVE_LEFT=1
+        ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup ${'$'}WDTT_TABLE([[:space:]]|${'$'})|from [^ ]+ lookup wdtt-exit([[:space:]]|${'$'})" &&
+          CURRENT_REMOVE_LEFT=1
+      fi
+      [ -e /etc/wireguard/wg-wdtt-exit.conf ] && CURRENT_REMOVE_LEFT=1
+      [ -e /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf ] && CURRENT_REMOVE_LEFT=1
+      [ -e /etc/wdtt-plus/wg-exit/private.key ] && CURRENT_REMOVE_LEFT=1
+      [ -e /etc/wdtt-plus/wg-exit/public.key ] && CURRENT_REMOVE_LEFT=1
+    fi
+    if [ "${'$'}CURRENT_REMOVE_LEFT" != 0 ]; then
+      echo WDTT_ERROR=wireguard_vps_current_remove_failed
+      exit 3
+    fi
+    echo WDTT_CURRENT_WG_REMOVED=1
+    """
+)
+
+internal fun deleteWireGuardVpsForeignScript(): String = """
+    set -e
+    WG_IFACE=wg-wdtt-exit
+    WG_CONF=/etc/wireguard/wg-wdtt-exit.conf
+    OWNED=0
+    if [ -f "${'$'}WG_CONF" ]; then
+      if grep -q 'WDTT_EXIT_FOREIGN' "${'$'}WG_CONF" 2>/dev/null &&
+         grep -Eq 'Address[[:space:]]*=[[:space:]]*10\\.77\\.77\\.1/30' "${'$'}WG_CONF" 2>/dev/null; then
+        OWNED=1
+      else
+        echo WDTT_ERROR=foreign_wireguard_not_owned
+        exit 3
+      fi
+    fi
+    if command -v iptables >/dev/null 2>&1 &&
+       { iptables -S INPUT 2>/dev/null | grep -q WDTT_EXIT_FOREIGN ||
+         iptables -t nat -S POSTROUTING 2>/dev/null | grep -q WDTT_EXIT_FOREIGN; }; then
+      OWNED=1
+    fi
+    if [ "${'$'}OWNED" != 1 ]; then
+      echo WDTT_FOREIGN_WG_REMOVED=1
+      echo "На дополнительном VPS созданная WDTT конфигурация WireGuard уже отсутствует."
+      exit 0
+    fi
+    echo "WDTT_PROGRESS|0.72|Останавливаю WireGuard на дополнительном VPS..."
+    systemctl disable --now wg-quick@wg-wdtt-exit 2>/dev/null || true
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
+        while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+      iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -t nat -D /' |
+        while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+    fi
+    echo "WDTT_PROGRESS|0.86|Удаляю конфигурацию и ключи с дополнительного VPS..."
+    rm -f "${'$'}WG_CONF" \
+      /etc/sysctl.d/99-wdtt-exit-forward.conf \
+      /etc/wdtt-plus/wg-exit/private.key \
+      /etc/wdtt-plus/wg-exit/public.key \
+      /etc/wdtt-plus/wg-exit/owner \
+      /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+    rm -rf /etc/wdtt-plus/wg-exit/transactions
+    rmdir /etc/wdtt-plus/wg-exit 2>/dev/null || true
+    FOREIGN_REMOVE_LEFT=0
+    systemctl is-active --quiet wg-quick@wg-wdtt-exit 2>/dev/null && FOREIGN_REMOVE_LEFT=1
+    systemctl is-enabled --quiet wg-quick@wg-wdtt-exit 2>/dev/null && FOREIGN_REMOVE_LEFT=1
+    [ -e "${'$'}WG_CONF" ] && FOREIGN_REMOVE_LEFT=1
+    [ -e /etc/wdtt-plus/wg-exit/private.key ] && FOREIGN_REMOVE_LEFT=1
+    [ -e /etc/wdtt-plus/wg-exit/public.key ] && FOREIGN_REMOVE_LEFT=1
+    if command -v iptables >/dev/null 2>&1 &&
+       { iptables -S INPUT 2>/dev/null | grep -q WDTT_EXIT_FOREIGN ||
+         iptables -t nat -S POSTROUTING 2>/dev/null | grep -q WDTT_EXIT_FOREIGN; }; then
+      FOREIGN_REMOVE_LEFT=1
+    fi
+    if [ "${'$'}FOREIGN_REMOVE_LEFT" != 0 ]; then
+      echo WDTT_ERROR=foreign_wireguard_remove_failed
+      exit 3
+    fi
+    echo WDTT_FOREIGN_WG_REMOVED=1
+    echo "WDTT_PROGRESS|1.0|Выход через другой сервер удалён с обоих VPS."
+""".trimIndent()
+
+private suspend fun deleteWireGuardExitVps(
+    current: OutboundSshTarget,
+    foreignHost: String,
+    foreignPort: Int,
+    foreignUser: String,
+    foreignCredentials: SshCredentials
+): String = withContext(Dispatchers.IO) {
+    require(foreignHost.isValidPublicHost()) { "укажите адрес дополнительного VPS" }
+    require(foreignPort in 1..65535) { "укажите корректный SSH-порт дополнительного VPS" }
+    require(foreignUser.isNotBlank()) { "укажите SSH-логин дополнительного VPS" }
+    require(foreignCredentials.hasAuthentication) { "добавьте пароль или SSH-ключ дополнительного VPS" }
+    var currentSession: Session? = null
+    var foreignSession: Session? = null
     try {
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
-        val ssh = SSHClient(session, target.pass)
-        val script = shellScript(
-            outboundShellPrelude(),
-            """
-            echo "WDTT_PROGRESS|0.25|Отключаю WireGuard-выход, если он запущен..."
-            wdtt_clear_external_out
-            echo "WDTT_PROGRESS|0.60|Удаляю сохранённый VPN/WireGuard-файл..."
-            rm -f /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf /etc/wireguard/wg-wdtt-exit.conf
-            if [ -f /etc/wdtt/outbound-profile.env ]; then
-              tmp_profile=/etc/wdtt/outbound-profile.env.tmp
-              grep -v '^IMPORTED_WG_CONFIG_B64=' /etc/wdtt/outbound-profile.env >"${'$'}tmp_profile" 2>/dev/null || true
-              chmod 600 "${'$'}tmp_profile"
-              mv "${'$'}tmp_profile" /etc/wdtt/outbound-profile.env
-            fi
-            echo "WDTT_PROGRESS|0.85|Возвращаю прямой выход через текущий сервер..."
-            wdtt_write_mode "direct" "прямой выход"
-            echo "WDTT_PROGRESS|1.0|VPN/WireGuard-файл удалён."
-            echo "VPN/WireGuard-файл удалён, выход WDTT возвращён напрямую через текущий сервер."
-            """
-        )
-        ssh.exec(rootCommand(script), timeout = 30000L).trim()
+        DeployManager.updateProgress(0.08f, "Проверяю SSH-доступ к обоим VPS...")
+        currentSession = createSshSession(current.host, current.user, current.credentials, current.port)
+        foreignSession = createSshSession(foreignHost, foreignUser, foreignCredentials, foreignPort)
+        val currentOutput = SSHClient(currentSession, current.pass)
+            .exec(rootCommand(deleteWireGuardVpsCurrentScript()), timeout = 30000L)
+        markerValue(currentOutput, "WDTT_ERROR")?.let {
+            throw IllegalStateException(currentOutput.take(1200))
+        }
+        require(markerValue(currentOutput, "WDTT_CURRENT_WG_REMOVED") == "1") {
+            "текущий VPS не подтвердил удаление WireGuard-выхода"
+        }
+        val foreignOutput = SSHClient(foreignSession, foreignCredentials.password)
+            .exec(rootCommand(deleteWireGuardVpsForeignScript()), timeout = 30000L)
+        markerValue(foreignOutput, "WDTT_ERROR")?.let {
+            throw IllegalStateException(foreignOutput.take(1200))
+        }
+        require(markerValue(foreignOutput, "WDTT_FOREIGN_WG_REMOVED") == "1") {
+            "дополнительный VPS не подтвердил удаление WireGuard"
+        }
+        "Выход через другой сервер удалён: текущий VPS использует прямой выход, созданные WDTT настройки дополнительного VPS очищены."
     } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
+        try { currentSession?.disconnect() } catch (_: Exception) {}
+        try { foreignSession?.disconnect() } catch (_: Exception) {}
     }
 }
 
@@ -7281,11 +8523,20 @@ private suspend fun installWireGuardExitVps(
     foreignPort: Int,
     foreignUser: String,
     foreignCredentials: SshCredentials,
-    wgPort: Int,
-    dns: String
+    wgPort: Int
 ): String = withContext(Dispatchers.IO) {
+    require(foreignHost.isValidPublicHost()) { "укажите домен или IPv4 дополнительного VPS без схемы и порта" }
+    require(foreignPort in 1..65535) { "SSH-порт дополнительного VPS должен быть от 1 до 65535" }
+    require(foreignUser.isNotBlank()) { "укажите SSH-логин дополнительного VPS" }
+    require(foreignCredentials.hasAuthentication) { "добавьте пароль или SSH-ключ дополнительного VPS" }
+    require(wgPort in 1..65535) { "порт WireGuard должен быть от 1 до 65535" }
     var currentSession: Session? = null
     var foreignSession: Session? = null
+    val transactionId = randomToken(12).lowercase()
+    val foreignBackupDir = "/etc/wdtt-plus/wg-exit/transactions/$transactionId/foreign"
+    val currentBackupDir = "/etc/wdtt-plus/wg-exit/transactions/$transactionId/current"
+    var foreignTouched = false
+    var currentTouched = false
     try {
         DeployManager.updateProgress(0.10f, "Подключаюсь к текущему серверу WDTT...")
         currentSession = createSshSession(current.host, current.user, current.credentials, current.port)
@@ -7298,6 +8549,27 @@ private suspend fun installWireGuardExitVps(
         )
         val currentSsh = SSHClient(currentSession, current.pass)
         val foreignSsh = SSHClient(foreignSession, foreignCredentials.password)
+        val previousHostOutput = currentSsh.exec(
+            rootCommand(
+                """
+                SAVED_B64="${'$'}(grep '^WG_VPS_HOST_B64=' /etc/wdtt/outbound-profile.env 2>/dev/null | tail -n 1 | sed 's/^[^=]*=//')"
+                SAVED_HOST=""
+                [ -z "${'$'}SAVED_B64" ] || SAVED_HOST="${'$'}(printf '%s' "${'$'}SAVED_B64" | base64 -d 2>/dev/null || true)"
+                if [ -z "${'$'}SAVED_HOST" ] && [ -f /etc/wireguard/wg-wdtt-exit.conf ]; then
+                  ENDPOINT="${'$'}(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//Ip' /etc/wireguard/wg-wdtt-exit.conf | head -n 1 | tr -d ' ')"
+                  SAVED_HOST="${'$'}{ENDPOINT%:*}"
+                  SAVED_HOST="${'$'}{SAVED_HOST#[}"
+                  SAVED_HOST="${'$'}{SAVED_HOST%]}"
+                fi
+                printf 'WDTT_PREVIOUS_WG_VPS_HOST=%s\n' "${'$'}SAVED_HOST"
+                """.trimIndent()
+            ),
+            timeout = 15000L
+        )
+        val previousHost = markerValue(previousHostOutput, "WDTT_PREVIOUS_WG_VPS_HOST").orEmpty()
+        if (previousHost.isNotBlank() && !previousHost.equals(foreignHost, ignoreCase = true)) {
+            throw IllegalStateException("WDTT_ERROR=wireguard_vps_previous_server_requires_removal")
+        }
 
         val prepareKeys = """
             echo "WDTT_PROGRESS|0.26|Готовлю WireGuard-инструменты и ключи..."
@@ -7320,14 +8592,37 @@ private suspend fun installWireGuardExitVps(
             """
             CURRENT_PUB=${shellQuote(currentPub)}
             WG_PORT=$wgPort
+            BACKUP_DIR=${shellQuote(foreignBackupDir)}
             """,
             outboundShellPrelude(),
             """
+            command -v systemctl >/dev/null 2>&1 || { echo WDTT_ERROR=systemd_required; exit 2; }
+            command -v iptables >/dev/null 2>&1 || { echo WDTT_ERROR=iptables_required; exit 2; }
             echo "WDTT_PROGRESS|0.50|Определяю внешний интерфейс другого сервера..."
             EXT_IFACE="${'$'}(wdtt_ext_iface)"
             [ -n "${'$'}EXT_IFACE" ] || { echo WDTT_ERROR=foreign_ext_iface_not_found; exit 2; }
+            echo "WDTT_PROGRESS|0.53|Сохраняю прежнее состояние другого сервера для отката..."
+            rm -rf "${'$'}BACKUP_DIR"
+            mkdir -p "${'$'}BACKUP_DIR"
+            chmod 700 "${'$'}BACKUP_DIR"
+            [ ! -f /etc/wireguard/wg-wdtt-exit.conf ] ||
+              { cp -a /etc/wireguard/wg-wdtt-exit.conf "${'$'}BACKUP_DIR/wg.conf"; touch "${'$'}BACKUP_DIR/had_wg_conf"; }
+            [ ! -f /etc/sysctl.d/99-wdtt-exit-forward.conf ] ||
+              { cp -a /etc/sysctl.d/99-wdtt-exit-forward.conf "${'$'}BACKUP_DIR/sysctl.conf"; touch "${'$'}BACKUP_DIR/had_sysctl_conf"; }
+            sysctl -n net.ipv4.ip_forward >"${'$'}BACKUP_DIR/ip_forward" 2>/dev/null || printf '0\n' >"${'$'}BACKUP_DIR/ip_forward"
+            systemctl is-active --quiet wg-quick@wg-wdtt-exit 2>/dev/null && touch "${'$'}BACKUP_DIR/was_active" || true
+            systemctl is-enabled --quiet wg-quick@wg-wdtt-exit 2>/dev/null && touch "${'$'}BACKUP_DIR/was_enabled" || true
+            iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' >"${'$'}BACKUP_DIR/input.rules" || true
+            iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' >"${'$'}BACKUP_DIR/nat.rules" || true
+            chmod 600 "${'$'}BACKUP_DIR"/*
+            systemctl stop wg-quick@wg-wdtt-exit 2>/dev/null || true
+            iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
+              while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+            iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -t nat -D /' |
+              while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
             echo "WDTT_PROGRESS|0.56|Включаю пересылку трафика на другом сервере..."
-            sysctl -w net.ipv4.ip_forward=1 >/dev/null
+            sysctl -w net.ipv4.ip_forward=1 >/dev/null ||
+              { echo WDTT_ERROR=foreign_ip_forward_failed; exit 3; }
             mkdir -p /etc/sysctl.d /etc/wireguard
             printf 'net.ipv4.ip_forward=1\n' >/etc/sysctl.d/99-wdtt-exit-forward.conf
             PRIV="${'$'}(cat /etc/wdtt-plus/wg-exit/private.key)"
@@ -7337,6 +8632,10 @@ private suspend fun installWireGuardExitVps(
             Address = 10.77.77.1/30
             ListenPort = ${'$'}WG_PORT
             PrivateKey = ${'$'}PRIV
+            PostUp = iptables -C INPUT -p udp --dport ${'$'}WG_PORT -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${'$'}WG_PORT -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT
+            PostUp = iptables -t nat -C POSTROUTING -s 10.77.77.0/30 -o ${'$'}EXT_IFACE -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.77.77.0/30 -o ${'$'}EXT_IFACE -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE
+            PostDown = iptables -D INPUT -p udp --dport ${'$'}WG_PORT -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null || true
+            PostDown = iptables -t nat -D POSTROUTING -s 10.77.77.0/30 -o ${'$'}EXT_IFACE -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE 2>/dev/null || true
 
             [Peer]
             PublicKey = ${'$'}CURRENT_PUB
@@ -7344,25 +8643,58 @@ private suspend fun installWireGuardExitVps(
             EOF
             chmod 600 /etc/wireguard/wg-wdtt-exit.conf
             echo "WDTT_PROGRESS|0.68|Запускаю WireGuard на другом сервере..."
-            systemctl enable --now wg-quick@wg-wdtt-exit >/dev/null
-            echo "WDTT_PROGRESS|0.70|Открываю порт WireGuard и добавляю NAT на другом сервере..."
-            iptables -C INPUT -p udp --dport "${'$'}WG_PORT" -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "${'$'}WG_PORT" -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT
-            iptables -t nat -C POSTROUTING -s 10.77.77.0/30 -o "${'$'}EXT_IFACE" -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.77.77.0/30 -o "${'$'}EXT_IFACE" -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE
+            systemctl enable wg-quick@wg-wdtt-exit >/dev/null ||
+              { echo WDTT_ERROR=foreign_wireguard_enable_failed; exit 3; }
+            systemctl restart wg-quick@wg-wdtt-exit >/dev/null ||
+              { echo WDTT_ERROR=foreign_wireguard_start_failed; exit 3; }
+            systemctl is-active --quiet wg-quick@wg-wdtt-exit ||
+              { echo WDTT_ERROR=foreign_wireguard_start_failed; exit 3; }
+            iptables -C INPUT -p udp --dport "${'$'}WG_PORT" -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null &&
+              iptables -t nat -C POSTROUTING -s 10.77.77.0/30 -o "${'$'}EXT_IFACE" -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE 2>/dev/null ||
+              { echo WDTT_ERROR=foreign_firewall_failed; exit 3; }
+            echo WDTT_FOREIGN_READY=1
             echo "WireGuard на другом сервере запущен: ${'$'}EXT_IFACE"
             """
         )
         DeployManager.updateProgress(0.48f, "Настраиваю WireGuard на другом сервере...")
-        foreignSsh.exec(rootCommand(foreignConfigScript), timeout = CMD_TIMEOUT)
+        foreignTouched = true
+        val foreignOutput = foreignSsh.exec(rootCommand(foreignConfigScript), timeout = CMD_TIMEOUT)
+        markerValue(foreignOutput, "WDTT_ERROR")?.let { throw IllegalStateException(foreignOutput.trim().take(1200)) }
+        require(markerValue(foreignOutput, "WDTT_FOREIGN_READY") == "1") {
+            "другой сервер не подтвердил запуск WireGuard"
+        }
 
         val currentConfigScript = shellScript(
             """
             FOREIGN_PUB=${shellQuote(foreignPub)}
             FOREIGN_HOST=${shellQuote(foreignHost)}
             WG_PORT=$wgPort
-            DNS_VALUE=${shellQuote(dns.ifBlank { "1.1.1.1,8.8.8.8" })}
+            CURRENT_BACKUP_DIR=${shellQuote(currentBackupDir)}
             """,
             outboundShellPrelude(),
             """
+            echo "WDTT_PROGRESS|0.70|Сохраняю прежний режим выхода текущего сервера..."
+            rm -rf "${'$'}CURRENT_BACKUP_DIR"
+            mkdir -p "${'$'}CURRENT_BACKUP_DIR"
+            chmod 700 "${'$'}CURRENT_BACKUP_DIR"
+            touch "${'$'}CURRENT_BACKUP_DIR/created"
+            [ ! -f /etc/wireguard/wg-wdtt-exit.conf ] ||
+              { cp -a /etc/wireguard/wg-wdtt-exit.conf "${'$'}CURRENT_BACKUP_DIR/wg.conf"; touch "${'$'}CURRENT_BACKUP_DIR/had_wg_conf"; }
+            [ ! -f /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf ] ||
+              { cp -a /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf "${'$'}CURRENT_BACKUP_DIR/saved_wg.conf"; touch "${'$'}CURRENT_BACKUP_DIR/had_saved_wg_conf"; }
+            [ ! -f /etc/wdtt/outbound.json ] ||
+              { cp -a /etc/wdtt/outbound.json "${'$'}CURRENT_BACKUP_DIR/outbound.json"; touch "${'$'}CURRENT_BACKUP_DIR/had_outbound_json"; }
+            [ ! -f "${'$'}WDTT_WG_OWNER_FILE" ] ||
+              { cp -a "${'$'}WDTT_WG_OWNER_FILE" "${'$'}CURRENT_BACKUP_DIR/owner"; touch "${'$'}CURRENT_BACKUP_DIR/had_owner"; }
+            [ ! -f "${'$'}WDTT_WG_CONFIG_OWNER_FILE" ] ||
+              { cp -a "${'$'}WDTT_WG_CONFIG_OWNER_FILE" "${'$'}CURRENT_BACKUP_DIR/config-owner"; touch "${'$'}CURRENT_BACKUP_DIR/had_config_owner"; }
+            systemctl is-active --quiet wdtt-wg-exit.service 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/wg_was_active" || true
+            systemctl is-enabled --quiet wdtt-wg-exit.service 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/wg_was_enabled" || true
+            systemctl is-active --quiet wdtt-redsocks.service 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/proxy_was_active" || true
+            systemctl is-enabled --quiet wdtt-redsocks.service 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/proxy_was_enabled" || true
+            systemctl is-active --quiet wdtt-warp-watchdog.timer 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/warp_timer_was_active" || true
+            systemctl is-enabled --quiet wdtt-warp-watchdog.timer 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/warp_timer_was_enabled" || true
+            chmod 600 "${'$'}CURRENT_BACKUP_DIR"/*
             echo "WDTT_PROGRESS|0.72|Записываю WireGuard-настройки текущего сервера..."
             mkdir -p /etc/wireguard /etc/wdtt-plus/wg-exit
             PRIV="${'$'}(cat /etc/wdtt-plus/wg-exit/private.key)"
@@ -7370,7 +8702,6 @@ private suspend fun installWireGuardExitVps(
             [Interface]
             Address = 10.77.77.2/30
             PrivateKey = ${'$'}PRIV
-            DNS = ${'$'}DNS_VALUE
             Table = off
 
             [Peer]
@@ -7385,12 +8716,168 @@ private suspend fun installWireGuardExitVps(
             wireGuardPolicyScript("wireguard_vps", "другой сервер ${foreignHost}:${wgPort}")
         )
         DeployManager.updateProgress(0.72f, "Применяю WireGuard-выход на текущем сервере...")
+        currentTouched = true
         val output = currentSsh.exec(rootCommand(currentConfigScript), timeout = CMD_TIMEOUT)
         if (output.contains("WDTT_ERROR=")) throw IllegalStateException(output.trim().take(400))
+        currentSsh.exec(rootCommand("rm -rf ${shellQuote("/etc/wdtt-plus/wg-exit/transactions/$transactionId")}"), timeout = 15000L)
+        foreignSsh.exec(rootCommand("rm -rf ${shellQuote("/etc/wdtt-plus/wg-exit/transactions/$transactionId")}"), timeout = 15000L)
+        currentTouched = false
+        foreignTouched = false
         DeployManager.updateProgress(1f, "WireGuard-выход через другой сервер включён.")
         output.trim().ifBlank { "Выход через WireGuard включён для WDTT-пользователей." }
     } catch (e: Exception) {
-        try { currentSession?.let { SSHClient(it, current.pass).exec(rootCommand("${outboundShellPrelude()}\nwdtt_clear_external_out\nwdtt_write_mode \"direct\" \"rollback\""), timeout = 30000L) } } catch (_: Exception) {}
+        var rollbackIncomplete = false
+        if (foreignTouched) {
+            val rollbackScript = shellScript(
+                "BACKUP_DIR=${shellQuote(foreignBackupDir)}",
+                """
+                [ -d "${'$'}BACKUP_DIR" ] || { echo WDTT_ROLLBACK_OK=1; exit 0; }
+                systemctl disable --now wg-quick@wg-wdtt-exit 2>/dev/null || true
+                if command -v iptables >/dev/null 2>&1; then
+                  iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
+                    while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+                  iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -t nat -D /' |
+                    while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+                fi
+                if [ -f "${'$'}BACKUP_DIR/had_wg_conf" ]; then
+                  install -m 600 "${'$'}BACKUP_DIR/wg.conf" /etc/wireguard/wg-wdtt-exit.conf
+                else
+                  rm -f /etc/wireguard/wg-wdtt-exit.conf
+                fi
+                if [ -f "${'$'}BACKUP_DIR/had_sysctl_conf" ]; then
+                  install -m 644 "${'$'}BACKUP_DIR/sysctl.conf" /etc/sysctl.d/99-wdtt-exit-forward.conf
+                else
+                  rm -f /etc/sysctl.d/99-wdtt-exit-forward.conf
+                fi
+                PREVIOUS_FORWARD="${'$'}(cat "${'$'}BACKUP_DIR/ip_forward" 2>/dev/null || echo 0)"
+                sysctl -w "net.ipv4.ip_forward=${'$'}PREVIOUS_FORWARD" >/dev/null 2>&1 || true
+                if [ -f "${'$'}BACKUP_DIR/was_enabled" ]; then
+                  systemctl enable wg-quick@wg-wdtt-exit >/dev/null 2>&1 || true
+                else
+                  systemctl disable wg-quick@wg-wdtt-exit >/dev/null 2>&1 || true
+                fi
+                if [ -f "${'$'}BACKUP_DIR/was_active" ]; then
+                  systemctl start wg-quick@wg-wdtt-exit >/dev/null 2>&1 || true
+                else
+                  systemctl stop wg-quick@wg-wdtt-exit >/dev/null 2>&1 || true
+                fi
+                if command -v iptables >/dev/null 2>&1; then
+                  iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
+                    while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+                  iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -t nat -D /' |
+                    while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+                  while IFS= read -r rule; do [ -z "${'$'}rule" ] || iptables ${'$'}rule 2>/dev/null || true; done <"${'$'}BACKUP_DIR/input.rules"
+                  while IFS= read -r rule; do [ -z "${'$'}rule" ] || iptables -t nat ${'$'}rule 2>/dev/null || true; done <"${'$'}BACKUP_DIR/nat.rules"
+                fi
+                if [ -f "${'$'}BACKUP_DIR/was_active" ] &&
+                   ! systemctl is-active --quiet wg-quick@wg-wdtt-exit 2>/dev/null; then
+                  exit 3
+                fi
+                rm -rf "${'$'}BACKUP_DIR"
+                echo WDTT_ROLLBACK_OK=1
+                """
+            )
+            suspend fun rollbackForeign(session: Session): Boolean = runCatching {
+                val rollbackOutput = SSHClient(session, foreignCredentials.password)
+                    .exec(rootCommand(rollbackScript), timeout = 45000L)
+                markerValue(rollbackOutput, "WDTT_ROLLBACK_OK") == "1"
+            }.getOrDefault(false)
+            val rolledBack = foreignSession?.let { rollbackForeign(it) } ?: false
+            if (!rolledBack) {
+                try { foreignSession?.disconnect() } catch (_: Exception) {}
+                foreignSession = runCatching {
+                    createSshSession(foreignHost, foreignUser, foreignCredentials, foreignPort)
+                }.getOrNull()
+                if (foreignSession?.let { rollbackForeign(it) } != true) rollbackIncomplete = true
+            }
+        }
+        if (currentTouched) {
+            val rollbackCurrentScript = shellScript(
+                "BACKUP_DIR=${shellQuote(currentBackupDir)}",
+                outboundShellPrelude(),
+                """
+                [ -d "${'$'}BACKUP_DIR" ] || { echo WDTT_ROLLBACK_OK=1; exit 0; }
+                wdtt_clear_external_out
+                if [ -f "${'$'}BACKUP_DIR/had_wg_conf" ]; then
+                  install -m 600 "${'$'}BACKUP_DIR/wg.conf" /etc/wireguard/wg-wdtt-exit.conf
+                else
+                  rm -f /etc/wireguard/wg-wdtt-exit.conf
+                fi
+                if [ -f "${'$'}BACKUP_DIR/had_saved_wg_conf" ]; then
+                  install -m 600 "${'$'}BACKUP_DIR/saved_wg.conf" /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+                else
+                  rm -f /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+                fi
+                if [ -f "${'$'}BACKUP_DIR/had_outbound_json" ]; then
+                  install -m 600 "${'$'}BACKUP_DIR/outbound.json" /etc/wdtt/outbound.json
+                else
+                  rm -f /etc/wdtt/outbound.json
+                fi
+                if [ -f "${'$'}BACKUP_DIR/had_owner" ]; then
+                  install -m 600 "${'$'}BACKUP_DIR/owner" "${'$'}WDTT_WG_OWNER_FILE"
+                else
+                  rm -f "${'$'}WDTT_WG_OWNER_FILE"
+                fi
+                if [ -f "${'$'}BACKUP_DIR/had_config_owner" ]; then
+                  install -m 600 "${'$'}BACKUP_DIR/config-owner" "${'$'}WDTT_WG_CONFIG_OWNER_FILE"
+                else
+                  rm -f "${'$'}WDTT_WG_CONFIG_OWNER_FILE"
+                fi
+                if [ -f "${'$'}BACKUP_DIR/wg_was_enabled" ]; then
+                  systemctl enable wdtt-wg-exit.service >/dev/null 2>&1 || true
+                fi
+                if [ -f "${'$'}BACKUP_DIR/proxy_was_enabled" ]; then
+                  systemctl enable wdtt-redsocks.service >/dev/null 2>&1 || true
+                fi
+                if [ -f "${'$'}BACKUP_DIR/wg_was_active" ]; then
+                  systemctl restart wdtt-wg-exit.service >/dev/null 2>&1 || true
+                fi
+                if [ -f "${'$'}BACKUP_DIR/proxy_was_active" ]; then
+                  systemctl restart wdtt-redsocks.service >/dev/null 2>&1 || true
+                fi
+                if [ -f "${'$'}BACKUP_DIR/warp_timer_was_enabled" ]; then
+                  systemctl enable wdtt-warp-watchdog.timer >/dev/null 2>&1 || true
+                fi
+                if [ -f "${'$'}BACKUP_DIR/warp_timer_was_active" ]; then
+                  systemctl start wdtt-warp-watchdog.timer >/dev/null 2>&1 || true
+                fi
+                if [ -f "${'$'}BACKUP_DIR/wg_was_active" ] &&
+                   ! systemctl is-active --quiet wdtt-wg-exit.service 2>/dev/null; then
+                  exit 3
+                fi
+                if [ -f "${'$'}BACKUP_DIR/proxy_was_active" ] &&
+                   ! systemctl is-active --quiet wdtt-redsocks.service 2>/dev/null; then
+                  exit 3
+                fi
+                if [ -f "${'$'}BACKUP_DIR/warp_timer_was_active" ] &&
+                   ! systemctl is-active --quiet wdtt-warp-watchdog.timer 2>/dev/null; then
+                  exit 3
+                fi
+                rm -rf ${shellQuote("/etc/wdtt-plus/wg-exit/transactions/$transactionId")}
+                echo WDTT_ROLLBACK_OK=1
+                """
+            )
+            suspend fun rollbackCurrent(session: Session): Boolean = runCatching {
+                val rollbackOutput = SSHClient(session, current.pass)
+                    .exec(rootCommand(rollbackCurrentScript), timeout = 45000L)
+                markerValue(rollbackOutput, "WDTT_ROLLBACK_OK") == "1"
+            }.getOrDefault(false)
+            var currentRollbackOk = currentSession?.let { rollbackCurrent(it) } ?: false
+            if (!currentRollbackOk) {
+                try { currentSession?.disconnect() } catch (_: Exception) {}
+                currentSession = runCatching {
+                    createSshSession(current.host, current.user, current.credentials, current.port)
+                }.getOrNull()
+                currentRollbackOk = currentSession?.let { rollbackCurrent(it) } ?: false
+            }
+            if (!currentRollbackOk) rollbackIncomplete = true
+        }
+        if (rollbackIncomplete) {
+            throw IllegalStateException(
+                "${e.message.orEmpty()}\nWDTT_ERROR=outbound_rollback_incomplete",
+                e
+            )
+        }
         throw e
     } finally {
         try { currentSession?.disconnect() } catch (_: Exception) {}
@@ -7464,6 +8951,14 @@ private suspend fun checkExistingInstall(
 private fun markerValue(output: String, name: String): String? =
     Regex("^$name=(.*)$", setOf(RegexOption.MULTILINE)).find(output)?.groupValues?.getOrNull(1)?.trim()
 
+internal fun shouldWriteRemoteErrorToUserLog(line: String): Boolean =
+    !line.startsWith("WDTT_ERROR=") &&
+        (
+            line.contains("[✗]") ||
+                line.contains("FAIL") ||
+                (line.contains("error", true) && !line.contains("2>/dev/null"))
+            )
+
 private fun compactRemoteTail(raw: String): String {
     val lines = raw.lineSequence()
         .map { it.trim() }
@@ -7495,12 +8990,18 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "не удалось распаковать исходники 3proxy: на сервере нет gzip, и пакетный менеджер не смог его поставить."
         "3proxy_source_no_make" in lower ->
             "не удалось собрать 3proxy: на сервере нет make, и пакетный менеджер не смог его поставить."
+        "3proxy_source_no_sha256sum" in lower ->
+            "не удалось безопасно проверить архив 3proxy: на сервере нет sha256sum."
         "3proxy_source_no_compiler" in lower ->
             "не удалось собрать 3proxy: на сервере нет компилятора gcc/cc, и пакетный менеджер не смог его поставить."
         "3proxy_source_no_openssl_headers" in lower ->
             "не удалось собрать 3proxy: на сервере нет OpenSSL-заголовков. Нужен пакет libssl-dev, openssl-devel, libopenssl-devel или openssl-dev в зависимости от Linux-дистрибутива."
+        "3proxy_source_no_pcre2_headers" in lower ->
+            "не удалось собрать актуальный 3proxy: на сервере нет заголовков PCRE2. Нужен пакет libpcre2-dev или pcre2-devel в зависимости от Linux-дистрибутива."
         "3proxy_source_download_failed" in lower ->
-            "не удалось скачать исходники 3proxy с GitHub. Проверьте, открывается ли github.com с сервера и не блокирует ли сеть исходящие HTTPS-подключения."
+            "не удалось скачать закреплённый выпуск 3proxy с GitHub. Проверьте, открывается ли github.com с сервера и не блокирует ли сеть исходящие HTTPS-подключения."
+        "3proxy_source_checksum_failed" in lower ->
+            "контрольная сумма архива 3proxy не совпала с закреплённым выпуском. Архив не был распакован или запущен."
         "3proxy_source_unpack_failed" in lower ->
             "архив 3proxy скачался, но сервер не смог его распаковать. Возможен битый архив, нехватка места или проблема с tar/gzip."
         "3proxy_source_build_failed" in lower ->
@@ -7510,7 +9011,7 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
         "3proxy_source_install_failed" in lower ->
             "3proxy собрался, но сервер не дал записать файл в /usr/local/bin. Проверьте root-права SSH-пользователя и sudo."
         "3proxy_install_failed" in lower || "3proxy_not_installed" in lower ->
-            "не удалось установить 3proxy: пакет не найден в репозиториях сервера, а сборка из исходников не дала готовый файл. Повторите установку: теперь приложение покажет конкретный шаг, на котором она сорвалась."
+            "не удалось установить закреплённый выпуск 3proxy из проверенных исходников. Повторите установку: приложение покажет конкретный шаг, на котором она сорвалась."
         "systemd_required" in lower ->
             "для прокси на этом сервере нужна systemd-служба. На сервере не найден systemctl, поэтому приложение не может безопасно запустить 3proxy как сервис."
         "curl_not_installed" in lower ->
@@ -7520,13 +9021,23 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
         "local_proxy_service_inactive" in lower ->
             "служба wdtt-3proxy не запущена. Нажмите «Установить», чтобы создать или обновить прокси на сервере."
         "local_proxy_service_still_active" in lower ->
-            "приложение отправило команду остановки, но служба wdtt-3proxy всё ещё запущена. Проверьте права пользователя SSH или остановите службу вручную."
+            "приложение отправило команду остановки, но служба wdtt-3proxy всё ещё запущена или осталась в автозапуске. Проверьте права пользователя SSH."
+        "local_proxy_remove_failed" in lower ->
+            "сервер не подтвердил полное удаление локального прокси. Служба, конфигурация или правило firewall ещё остались; повторите удаление и откройте диагностику сервера."
+        "local_proxy_firewall_failed" in lower ->
+            "прокси запустился, но сервер не смог открыть его порты в firewall. Служба остановлена, чтобы интерфейс не показывал неработающий режим."
         "external_proxy_check_failed" in lower ->
             "внешний TCP-прокси не ответил на проверку. Проверьте адрес, порт, логин и пароль."
         "external_proxy_service_inactive" in lower ->
             "служба перенаправления через внешний TCP-прокси не запустилась. Приложение откатило правила и вернуло прямой выход, чтобы интернет через VPN не остался сломанным."
+        "external_proxy_route_install_failed" in lower ->
+            "служба внешнего прокси запустилась, но сервер не применил постоянное правило маршрутизации WDTT. Режим отключён и прямой выход сохранён."
         "external_proxy_apply_failed" in lower ->
             withTail("внешний TCP-прокси отвечает напрямую, но путь WDTT через redsocks не заработал. Приложение откатило правила и вернуло прямой выход, чтобы VPN-интернет не пропал.")
+        "external_proxy_test_rule_failed" in lower ->
+            "сервер не разрешил создать временное правило для проверки пути WDTT через внешний прокси. Режим не считается проверенным и был отключён."
+        "external_proxy_remove_failed" in lower ->
+            "сервер не подтвердил полное удаление внешнего TCP-прокси. Служба, конфигурация или правило перенаправления ещё остались."
         "redsocks_not_installed" in lower ->
             "не удалось установить компонент перенаправления через внешний TCP-прокси. Проверьте пакетный менеджер и доступ сервера к интернету."
         "iptables_required" in lower ->
@@ -7538,11 +9049,27 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
         "wireguard_tools_required" in lower ->
             "на сервере не найдены инструменты WireGuard, без них этот режим не включить."
         "wireguard_exit_service_inactive" in lower ->
-            "служба WireGuard-выхода не запустилась. Приложение не будет оставлять неполные маршруты; проверьте конфигурацию и журнал systemd."
+            withTail("служба WireGuard-выхода не запустилась. Приложение удалило частично созданный интерфейс и маршруты и сохранило прямой выход. Откройте диагностику, чтобы увидеть причину запуска systemd.")
+        "direct_cleanup_failed" in lower ->
+            "сервер не подтвердил полную остановку прежнего WireGuard/прокси-выхода. Запустите «Диагностику» и не включайте другой режим, пока оставшийся маршрут не будет устранён."
         "wireguard_not_active" in lower ->
             "WireGuard-выход WDTT сейчас не запущен. Включите «Бесплатный WARP», «Другой сервер» или «VPN/WireGuard-файл», затем повторите проверку."
         "wireguard_exit_check_failed" in lower ->
             "WireGuard-интерфейс запущен, но проверочный сайт через него не открылся. Проверьте конфиг, endpoint, NAT и доступ второго сервера/VPN к интернету."
+        "wireguard_vps_current_remove_failed" in lower ->
+            "текущий VPS не подтвердил полное удаление WireGuard-выхода. Прямой маршрут, служба или рабочий конфиг ещё остались."
+        "wireguard_vps_previous_server_requires_removal" in lower ->
+            "на текущем VPS сохранён другой дополнительный сервер. Сначала откройте прежний адрес и нажмите «Удалить», чтобы не оставить на нём работающую WireGuard-службу, затем настройте новый."
+        "foreign_wireguard_not_owned" in lower ->
+            "на дополнительном VPS найден интерфейс wg-wdtt-exit, но приложение не подтвердило, что конфигурация была создана WDTT Plus. Файл не удалён, чтобы не повредить чужую настройку."
+        "foreign_wireguard_remove_failed" in lower ->
+            "дополнительный VPS не подтвердил полное удаление созданной WDTT конфигурации WireGuard или её правил firewall."
+        "imported_wireguard_remove_failed" in lower ->
+            "сервер не подтвердил удаление импортированного VPN/WireGuard-файла. Другие активные режимы выхода не очищались."
+        "warp_registration_reset_failed" in lower ->
+            "сервер не подтвердил удаление текущей регистрации и профиля WARP."
+        "warp_remove_failed" in lower ->
+            "сервер не подтвердил полное удаление WARP: остался профиль, инструмент или служба автоматической проверки."
         "warp_unsupported_arch" in lower ->
             "автоматический WARP поддерживает Linux amd64 — ту же архитектуру, для которой собирается сервер WDTT Plus. На этом сервере определена другая архитектура."
         "warp_download_tools_missing" in lower ->
@@ -7569,8 +9096,18 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "на сервере не найдена регистрация бесплатного WARP. Нажмите «Установить / восстановить» и подтвердите условия Cloudflare."
         "warp_profile_missing" in lower ->
             "регистрация WARP есть, но WireGuard-профиль отсутствует. Нажмите «Установить / восстановить»."
+        "outbound_rollback_incomplete" in lower ->
+            "настройка не завершилась, и один из серверов не подтвердил автоматическое восстановление прежнего состояния. Проверьте оба VPS вручную перед повторной попыткой."
         "foreign_ext_iface_not_found" in lower ->
             "на другом сервере не удалось определить основной сетевой интерфейс."
+        "foreign_ip_forward_failed" in lower ->
+            "на другом сервере не удалось включить пересылку IPv4. Приложение попыталось восстановить его прежние настройки."
+        "foreign_wireguard_enable_failed" in lower ->
+            "на другом сервере не удалось включить автозапуск WireGuard. Приложение попыталось восстановить его прежние настройки."
+        "foreign_wireguard_start_failed" in lower ->
+            "WireGuard на другом сервере не запустился. Приложение попыталось восстановить прежний конфиг, службу и сетевые правила."
+        "foreign_firewall_failed" in lower ->
+            "WireGuard на другом сервере запустился, но правила порта или NAT не применились. Приложение попыталось восстановить прежнее состояние."
         "ssh-сервер отклонил приватный ключ" in lower ||
             "ssh-сервер отклонил пароль" in lower ||
             "не удалось расшифровать приватный ssh-ключ" in lower ||
@@ -7608,6 +9145,8 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
         "это не файл бэкапа" in lower ||
             "format" in lower && "wdtt-server-backup" in lower ->
             "выбран файл не того формата. Нужен JSON-экспорт WDTT Plus."
+        "контрольн" in lower && ("не совпала" in lower || "нет" in lower) ->
+            "файл импорта повреждён или изменён: проверка целостности не пройдена."
         "passwords должен быть объектом" in lower ||
             "devices должен быть объектом" in lower ||
             "некоррект" in lower ||
@@ -7626,6 +9165,11 @@ private fun decodeBase64Text(value: String): String =
 
 private fun encodeBase64Text(value: String): String =
     Base64.getEncoder().encodeToString(value.toByteArray(Charsets.UTF_8))
+
+private fun sha256Text(value: String): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
 
 private fun JSONObject.childObject(name: String): JSONObject {
     val current = optJSONObject(name)
@@ -7694,7 +9238,16 @@ private fun validatePasswordEntry(pass: String, entry: JSONObject) {
     entry.optStringLength("device_id", 256, "пароля $pass")
     entry.optStringLength("label", 120, "пароля $pass")
     entry.optStringLength("vk_hash", 512, "пароля $pass")
-    require(entry.optLong("expires_at", 0) >= 0) { "expires_at у пароля $pass должен быть >= 0" }
+    val expiresAt = entry.optLong("expires_at", 0)
+    val purgeAfter = entry.optLong("purge_after", 0)
+    require(expiresAt >= 0) { "expires_at у пароля $pass должен быть >= 0" }
+    require(purgeAfter >= 0) { "purge_after у пароля $pass должен быть >= 0" }
+    require(expiresAt != 0L || purgeAfter == 0L) {
+        "purge_after у бессрочного пароля $pass должен быть 0"
+    }
+    require(purgeAfter == 0L || purgeAfter >= expiresAt) {
+        "purge_after у пароля $pass не может быть раньше expires_at"
+    }
     require(entry.optLong("down_bytes", 0) >= 0) { "down_bytes у пароля $pass должен быть >= 0" }
     require(entry.optLong("up_bytes", 0) >= 0) { "up_bytes у пароля $pass должен быть >= 0" }
     val ports = entry.optString("ports", "")
@@ -7715,6 +9268,31 @@ private fun validatePasswordEntry(pass: String, entry: JSONObject) {
             val bucket = traffic.optJSONObject(i)
                 ?: throw IllegalArgumentException("traffic у пароля $pass должен содержать объекты")
             validateTrafficBucket("пароля $pass", i, bucket)
+        }
+    }
+    val trafficImports = if (entry.has("traffic_imports")) {
+        entry.optJSONObject("traffic_imports")
+            ?: throw IllegalArgumentException("traffic_imports у пароля $pass должен быть объектом")
+    } else {
+        null
+    }
+    if (trafficImports != null) {
+        require(trafficImports.length() <= 1_000) { "traffic_imports у пароля $pass слишком большой" }
+        trafficImports.keys().forEach { operationId ->
+            require(operationId.isNotBlank() && operationId.length <= 160) {
+                "некорректный operation-id в traffic_imports у пароля $pass"
+            }
+            val imported = trafficImports.optJSONObject(operationId)
+                ?: throw IllegalArgumentException("traffic_imports у пароля $pass должен содержать объекты")
+            require(imported.optLong("down_bytes", 0) >= 0) {
+                "down_bytes в traffic_imports у пароля $pass должен быть >= 0"
+            }
+            require(imported.optLong("up_bytes", 0) >= 0) {
+                "up_bytes в traffic_imports у пароля $pass должен быть >= 0"
+            }
+            require(imported.optLong("applied_at", 0) >= 0) {
+                "applied_at в traffic_imports у пароля $pass должен быть >= 0"
+            }
         }
     }
 }
@@ -7761,7 +9339,7 @@ private fun validateAdminProfile(profile: JSONObject?) {
     require(ports.isBlank() || ports.isValidPortsSpec()) { "ports в admin_profile некорректны" }
     require(profile.optLong("updated_at", 0L) >= 0L) { "updated_at в admin_profile должен быть >= 0" }
     profile.optJSONArray("device_ids")?.let { ids ->
-        require(ids.length() <= 500) { "слишком много device_ids в admin_profile" }
+        require(ids.length() <= 64) { "слишком много device_ids в admin_profile" }
         for (index in 0 until ids.length()) {
             require(ids.optString(index).length <= 256) { "device_id в admin_profile слишком длинный" }
         }
@@ -7813,6 +9391,25 @@ internal fun validatePasswordsDbStructure(db: JSONObject) {
     }
 }
 
+internal fun validatePasswordsDbForPreserving(
+    db: JSONObject,
+    replacementMainPassword: String
+): Boolean {
+    val mainPasswordNeedsRecovery =
+        !db.has("main_password") || db.optString("main_password").isBlank()
+    if (!mainPasswordNeedsRecovery) {
+        validatePasswordsDbStructure(db)
+        return false
+    }
+    require(replacementMainPassword.isNotBlank()) {
+        "main_password пустой; укажите главный пароль в «Секретах»"
+    }
+    val validatedCopy = JSONObject(db.toString())
+        .put("main_password", replacementMainPassword)
+    validatePasswordsDbStructure(validatedCopy)
+    return true
+}
+
 private fun validateWgKeysDat(value: String) {
     val lines = value.trim().lines().map { it.trim() }.filter { it.isNotBlank() }
     require(lines.size >= 4) { "wg-keys.dat должен содержать 4 ключа" }
@@ -7821,7 +9418,20 @@ private fun validateWgKeysDat(value: String) {
     }
 }
 
-private fun parseBackup(passwordsJson: String, wgKeysDat: String?, createdAt: String, sourceHost: String): ServerBackup {
+internal fun parseBackup(
+    passwordsJson: String,
+    wgKeysDat: String?,
+    createdAt: String,
+    sourceHost: String,
+    formatVersion: Int = SERVER_BACKUP_FORMAT_VERSION,
+    integrityVerified: Boolean = true
+): ServerBackup {
+    require(passwordsJson.length <= MAX_SERVER_DATABASE_CHARS) { "база в бэкапе слишком большая" }
+    require(wgKeysDat == null || wgKeysDat.length <= MAX_SERVER_WG_KEYS_CHARS) {
+        "wg-keys.dat в бэкапе слишком большой"
+    }
+    require(createdAt.length <= 64) { "дата создания бэкапа слишком длинная" }
+    require(sourceHost.length <= 253) { "адрес исходного сервера слишком длинный" }
     val db = dbSummary(passwordsJson)
     validatePasswordsDbStructure(db)
     if (!wgKeysDat.isNullOrBlank()) {
@@ -7839,46 +9449,86 @@ private fun parseBackup(passwordsJson: String, wgKeysDat: String?, createdAt: St
         mainPassword = db.optString("main_password"),
         adminId = db.optString("admin_id"),
         botToken = db.optString("bot_token"),
-        dns = db.optString("dns")
+        dns = db.optString("dns"),
+        formatVersion = formatVersion,
+        integrityVerified = integrityVerified
     )
 }
 
-private fun backupToJson(backup: ServerBackup): String {
+internal fun backupToJson(backup: ServerBackup): String {
     val obj = JSONObject()
         .put("format", "wdtt-server-backup")
-        .put("version", 1)
+        .put("version", SERVER_BACKUP_FORMAT_VERSION)
         .put("created_at", backup.createdAt)
         .put("source_host", backup.sourceHost)
         .put("passwords_json_b64", encodeBase64Text(backup.passwordsJson))
+        .put("passwords_json_sha256", sha256Text(backup.passwordsJson))
         .put("password_count", backup.passwordCount)
         .put("device_count", backup.deviceCount)
     if (!backup.wgKeysDat.isNullOrBlank()) {
-        obj.put("wg_keys_dat_b64", encodeBase64Text(backup.wgKeysDat))
+        obj
+            .put("wg_keys_dat_b64", encodeBase64Text(backup.wgKeysDat))
+            .put("wg_keys_dat_sha256", sha256Text(backup.wgKeysDat))
     }
     return obj.toString(2)
 }
 
-private fun parseBackupFile(raw: String): ServerBackup {
+internal fun parseBackupFile(raw: String): ServerBackup {
+    require(raw.length <= MAX_SERVER_BACKUP_FILE_CHARS) { "файл бэкапа слишком большой" }
     val obj = JSONObject(raw)
     require(obj.optString("format") == "wdtt-server-backup") { "это не файл бэкапа WDTT Plus" }
-    require(obj.optInt("version", 0) == 1) { "неподдерживаемая версия бэкапа" }
+    val version = obj.optInt("version", 0)
+    require(version in 1..SERVER_BACKUP_FORMAT_VERSION) { "неподдерживаемая версия бэкапа" }
     val passwordsB64 = obj.optString("passwords_json_b64")
     require(passwordsB64.isNotBlank()) { "в бэкапе нет базы passwords.json" }
+    require(passwordsB64.length <= 6_700_000) { "база в бэкапе слишком большая" }
     val passwordsJson = decodeBase64Text(passwordsB64)
-    require(passwordsJson.length <= 5_000_000) { "база в бэкапе слишком большая" }
+    require(passwordsJson.length <= MAX_SERVER_DATABASE_CHARS) { "база в бэкапе слишком большая" }
     val wgKeysB64 = obj.optString("wg_keys_dat_b64")
+    require(wgKeysB64.length <= 5_500) { "wg-keys.dat в бэкапе слишком большой" }
     val wgKeys = if (wgKeysB64.isNotBlank()) decodeBase64Text(wgKeysB64) else null
+    if (version >= 2) {
+        val passwordsSha256 = obj.optString("passwords_json_sha256").lowercase()
+        require(Regex("^[0-9a-f]{64}$").matches(passwordsSha256)) {
+            "в бэкапе нет контрольной суммы базы"
+        }
+        require(sha256Text(passwordsJson) == passwordsSha256) {
+            "контрольная сумма базы не совпала"
+        }
+        if (wgKeys != null) {
+            val wgKeysSha256 = obj.optString("wg_keys_dat_sha256").lowercase()
+            require(Regex("^[0-9a-f]{64}$").matches(wgKeysSha256)) {
+                "в бэкапе нет контрольной суммы WireGuard-ключей"
+            }
+            require(sha256Text(wgKeys) == wgKeysSha256) {
+                "контрольная сумма WireGuard-ключей не совпала"
+            }
+        }
+    }
     return parseBackup(
         passwordsJson = passwordsJson,
         wgKeysDat = wgKeys,
         createdAt = obj.optString("created_at", "неизвестно"),
-        sourceHost = obj.optString("source_host", "неизвестно")
+        sourceHost = obj.optString("source_host", "неизвестно"),
+        formatVersion = version,
+        integrityVerified = version >= 2
     )
 }
 
 private suspend fun loadServerBackupFromUri(context: Context, uri: Uri): ServerBackup = withContext(Dispatchers.IO) {
-    val raw = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-        ?: throw IllegalArgumentException("не удалось открыть файл")
+    val raw = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { reader ->
+        val result = StringBuilder()
+        val buffer = CharArray(16 * 1024)
+        while (true) {
+            val read = reader.read(buffer)
+            if (read < 0) break
+            require(result.length + read <= MAX_SERVER_BACKUP_FILE_CHARS) {
+                "файл бэкапа слишком большой"
+            }
+            result.append(buffer, 0, read)
+        }
+        result.toString()
+    } ?: throw IllegalArgumentException("не удалось открыть файл")
     parseBackupFile(raw)
 }
 
@@ -7996,7 +9646,7 @@ private fun parseOwnerProfileFromDb(json: JSONObject?, defaultPorts: String): Se
         vkHashes = json?.optString("vk_hashes", "").orEmpty().trim(),
         secondaryVkHash = json?.optString("secondary_vk_hash", "").orEmpty().trim(),
         profileName = vpnProfileRestorableName(json?.optString("profile_name", "").orEmpty()),
-        workersPerHash = (json?.optInt("workers_per_hash", 16) ?: 16).coerceIn(1, 128),
+        workersPerHash = (json?.optInt("workers_per_hash", 18) ?: 18).coerceIn(1, 128),
         protocol = json?.optString("protocol", "udp").orEmpty().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
         listenPort = listenPort,
         sni = json?.optString("sni", "").orEmpty().trim(),
@@ -8098,7 +9748,7 @@ private fun ownerProfileInstallDiffLines(
         if (localComparable.profileName.isNotBlank() && serverComparable.profileName != localComparable.profileName) {
             add("Название профиля: сервер — ${serverComparable.profileName.ifBlank { "стандартное" }}, приложение — ${localComparable.profileName}")
         }
-        if (localComparable.workersPerHash != 16 && serverComparable.workersPerHash != localComparable.workersPerHash) {
+        if (localComparable.workersPerHash != 18 && serverComparable.workersPerHash != localComparable.workersPerHash) {
             add("Потоки на хеш: сервер — ${serverComparable.workersPerHash}, приложение — ${localComparable.workersPerHash}")
         }
         if (localComparable.protocol != "udp" && serverComparable.protocol != localComparable.protocol) {
@@ -8156,43 +9806,49 @@ private fun normalizeDnsValues(first: String, second: String = ""): String =
         .filter { it.isNotBlank() }
         .joinToString(",")
 
-private fun outboundProfilesDiffer(server: OutboundServerSnapshot, local: OutboundProfileForms): Boolean {
-    fun value(raw: String): String = raw.trim().replace("\r\n", "\n")
-    val serverValues = listOf(
-        server.localProxyPort,
-        server.localProxyLogin,
-        server.localProxyPassword,
-        server.externalProxyKindName,
-        server.externalProxyHost,
-        server.externalProxyPort,
-        server.externalProxyLogin,
-        server.externalProxyPassword,
-        server.wireGuardExitHost,
-        server.wireGuardExitSshPort,
-        server.wireGuardExitUser,
-        server.wireGuardExitPassword,
-        server.wireGuardExitPort,
-        server.wireGuardExitDns,
-        server.importedWireGuardConfig
-    ).map(::value)
-    val localValues = listOf(
-        local.localProxyPort,
-        local.localProxyLogin,
-        local.localProxyPassword,
-        local.externalProxyKindName,
-        local.externalProxyHost,
-        local.externalProxyPort,
-        local.externalProxyLogin,
-        local.externalProxyPassword,
-        local.wireGuardExitHost,
-        local.wireGuardExitSshPort,
-        local.wireGuardExitUser,
-        local.wireGuardExitPassword,
-        local.wireGuardExitPort,
-        local.wireGuardExitDns,
-        local.importedWireGuardConfig
-    ).map(::value)
-    return serverValues != localValues
+internal fun outboundProfilesDiffer(
+    server: OutboundServerSnapshot,
+    local: OutboundProfileForms
+): Boolean {
+    fun text(raw: String): String = raw.trim().replace("\r\n", "\n").replace('\r', '\n')
+    fun port(raw: String): String = raw.filter(Char::isDigit).take(5)
+    // Не сравниваем автоматически созданные заготовки для ещё не настроенных режимов.
+    // Иначе новый логин/пароль прокси или стандартные порты чистой установки выглядят
+    // как пользовательское изменение, хотя на сервер они пока ни на что не влияют.
+    val localProxyDiffers = server.localProxyPresent && listOf(
+        port(server.localProxyPort) to port(local.localProxyPort),
+        text(server.localProxyLogin) to text(local.localProxyLogin),
+        text(server.localProxyPassword) to text(local.localProxyPassword)
+    ).any { (serverValue, localValue) -> serverValue != localValue }
+
+    val externalProxyConfigured = server.externalProxyPresent ||
+        local.externalProxyHost.isNotBlank()
+    val externalProxyDiffers = externalProxyConfigured && listOf(
+        text(server.externalProxyKindName) to text(local.externalProxyKindName),
+        text(server.externalProxyHost) to text(local.externalProxyHost),
+        port(server.externalProxyPort) to port(local.externalProxyPort),
+        text(server.externalProxyLogin) to text(local.externalProxyLogin),
+        text(server.externalProxyPassword) to text(local.externalProxyPassword)
+    ).any { (serverValue, localValue) -> serverValue != localValue }
+
+    val wireGuardVpsConfigured = server.mode == "wireguard_vps" ||
+        server.wireGuardExitHost.isNotBlank() ||
+        local.wireGuardExitHost.isNotBlank()
+    val wireGuardVpsDiffers = wireGuardVpsConfigured && listOf(
+        text(server.wireGuardExitHost) to text(local.wireGuardExitHost),
+        port(server.wireGuardExitSshPort) to port(local.wireGuardExitSshPort),
+        text(server.wireGuardExitUser) to text(local.wireGuardExitUser),
+        port(server.wireGuardExitPort) to port(local.wireGuardExitPort)
+    ).any { (serverValue, localValue) -> serverValue != localValue }
+
+    val importedWireGuardConfigured = server.mode == "imported_wg" ||
+        server.importedWireGuardConfig.isNotBlank() ||
+        local.importedWireGuardConfig.isNotBlank()
+    val importedWireGuardDiffers = importedWireGuardConfigured &&
+        text(server.importedWireGuardConfig) != text(local.importedWireGuardConfig)
+
+    return localProxyDiffers || externalProxyDiffers ||
+        wireGuardVpsDiffers || importedWireGuardDiffers
 }
 
 private suspend fun compareDeployWithServer(
@@ -8226,9 +9882,12 @@ private suspend fun compareDeployWithServer(
                     val raw = readRemotePasswordsJson(ssh)
                         ?: throw IllegalStateException("на сервере не найдена база доступа")
                     val db = JSONObject(raw)
-                    validatePasswordsDbStructure(db)
+                    val mainPasswordNeedsRecovery =
+                        validatePasswordsDbForPreserving(db, request.mainPass)
 
-                    if (db.optString("main_password") != request.mainPass) {
+                    if (mainPasswordNeedsRecovery) {
+                        overwriteLines += "Главный пароль владельца (пустое поле сервера будет восстановлено)"
+                    } else if (db.optString("main_password") != request.mainPass) {
                         overwriteLines += "Главный пароль владельца"
                     }
                     if (request.adminId.isNotBlank() && db.optString("admin_id") != request.adminId) {
@@ -8406,6 +10065,63 @@ internal fun mergeServerDatabaseEntries(
     }
 }
 
+internal fun prepareServerDatabaseForTarget(
+    sourceJson: String,
+    currentDbJson: String?,
+    merge: Boolean,
+    portsSpec: String,
+    dnsValue: String,
+    publicHost: String,
+    mainPasswordOverride: String = "",
+    adminIdOverride: String = "",
+    botTokenOverride: String = ""
+): String {
+    require(portsSpec.isValidPortsSpec()) { "некорректные порты целевого сервера" }
+    require(publicHost.isValidPublicHost()) { "некорректный адрес целевого сервера" }
+    val source = JSONObject(sourceJson)
+    validatePasswordsDbStructure(source)
+    val mergeIntoExisting = merge && !currentDbJson.isNullOrBlank()
+    val target = if (mergeIntoExisting) {
+        JSONObject(currentDbJson)
+    } else {
+        JSONObject(source.toString())
+    }
+
+    if (mergeIntoExisting) {
+        if (validatePasswordsDbForPreserving(target, source.optString("main_password"))) {
+            target.put("main_password", source.optString("main_password"))
+        }
+        mergeServerDatabaseEntries(source, target, portsSpec)
+        if (!target.has("admin_id") || target.optString("admin_id").isBlank()) {
+            target.put("admin_id", source.optString("admin_id"))
+        }
+        if (!target.has("bot_token") || target.optString("bot_token").isBlank()) {
+            target.put("bot_token", source.optString("bot_token"))
+        }
+    } else {
+        val passwords = target.optJSONObject("passwords") ?: JSONObject()
+        passwords.keys().forEach { key ->
+            passwords.optJSONObject(key)?.put("ports", portsSpec)
+        }
+        target.optJSONObject("admin_profile")?.apply {
+            put("ports", portsSpec)
+            put("listen_port", portsSpec.substringAfterLast(",").toInt())
+        }
+    }
+
+    if (mainPasswordOverride.isNotBlank()) target.put("main_password", mainPasswordOverride)
+    if (adminIdOverride.isNotBlank()) target.put("admin_id", adminIdOverride)
+    if (botTokenOverride.isNotBlank()) target.put("bot_token", botTokenOverride)
+    target.put("dns", dnsValue)
+    target.put("default_ports", portsSpec)
+    target.put("public_ip", publicHost)
+    if (!target.has("passwords")) target.put("passwords", JSONObject())
+    if (!target.has("devices")) target.put("devices", JSONObject())
+    if (!target.has("max_passwords")) target.put("max_passwords", 50)
+    validatePasswordsDbStructure(target)
+    return target.toString(2)
+}
+
 private fun normalizeDbForTarget(
     backup: ServerBackup,
     currentDbJson: String?,
@@ -8413,43 +10129,21 @@ private fun normalizeDbForTarget(
     request: DeployRequest
 ): String {
     val portsSpec = "${request.dtlsPort},${request.wgPort},${request.localPort}"
-    val dnsValue = listOf(request.dns1, request.dns2).filter { it.isNotBlank() }.joinToString(",").ifBlank { backup.dns.ifBlank { "1.1.1.1,1.0.0.1" } }
-    val source = JSONObject(backup.passwordsJson)
-    val target = if (mode == ServerImportMode.Replace) {
-        JSONObject(source.toString())
-    } else {
-        currentDbJson?.takeIf { it.isNotBlank() }?.let { JSONObject(it) } ?: JSONObject()
-    }
-
-    if (mode == ServerImportMode.Merge) {
-        mergeServerDatabaseEntries(source, target, portsSpec)
-        if (!target.has("main_password") || target.optString("main_password").isBlank()) {
-            target.put("main_password", backup.mainPassword)
-        }
-        if (!target.has("admin_id") || target.optString("admin_id").isBlank()) {
-            target.put("admin_id", backup.adminId)
-        }
-        if (!target.has("bot_token") || target.optString("bot_token").isBlank()) {
-            target.put("bot_token", backup.botToken)
-        }
-    } else {
-        val passwords = target.optJSONObject("passwords") ?: JSONObject()
-        passwords.keys().forEach { key ->
-            passwords.optJSONObject(key)?.put("ports", portsSpec)
-        }
-    }
-
-    if (request.mainPass.isNotBlank()) target.put("main_password", request.mainPass)
-    if (request.adminId.isNotBlank()) target.put("admin_id", request.adminId)
-    if (request.botToken.isNotBlank()) target.put("bot_token", request.botToken)
-    target.put("dns", dnsValue)
-    target.put("default_ports", portsSpec)
-    target.put("public_ip", request.host)
-    if (!target.has("passwords")) target.put("passwords", JSONObject())
-    if (!target.has("devices")) target.put("devices", JSONObject())
-    if (!target.has("max_passwords")) target.put("max_passwords", 50)
-    validatePasswordsDbStructure(target)
-    return target.toString(2)
+    val dnsValue = listOf(request.dns1, request.dns2)
+        .filter { it.isNotBlank() }
+        .joinToString(",")
+        .ifBlank { backup.dns.ifBlank { "1.1.1.1,1.0.0.1" } }
+    return prepareServerDatabaseForTarget(
+        sourceJson = backup.passwordsJson,
+        currentDbJson = currentDbJson,
+        merge = mode == ServerImportMode.Merge,
+        portsSpec = portsSpec,
+        dnsValue = dnsValue,
+        publicHost = request.host,
+        mainPasswordOverride = request.mainPass,
+        adminIdOverride = request.adminId,
+        botTokenOverride = request.botToken
+    )
 }
 
 private fun applyServerImport(
@@ -8464,21 +10158,23 @@ private fun applyServerImport(
     val preparedDb = normalizeDbForTarget(backup, currentDb, mode, request)
     val dbFile = File(context.cacheDir, "wdtt-import-passwords.json")
     val wgFile = File(context.cacheDir, "wdtt-import-wg-keys.dat")
+    val remoteDbFile = "/tmp/wdtt-import-passwords.json"
+    val remoteWgFile = "/tmp/wdtt-import-wg-keys.dat"
     dbFile.writeText(preparedDb)
     try {
-        ssh.upload(dbFile, "/tmp/wdtt-import-passwords.json")
+        ssh.upload(dbFile, remoteDbFile, permissions = 0b110000000)
         val replaceWgKeys = mode == ServerImportMode.Replace && backup.hasWgKeys
         if (replaceWgKeys) {
             wgFile.writeText(backup.wgKeysDat.orEmpty())
-            ssh.upload(wgFile, "/tmp/wdtt-import-wg-keys.dat")
+            ssh.upload(wgFile, remoteWgFile, permissions = 0b110000000)
         }
         val command = buildString {
             append("systemctl stop wdtt 2>/dev/null || true; ")
             append("mkdir -p /etc/wdtt; ")
-            append("install -m 600 /tmp/wdtt-import-passwords.json /etc/wdtt/passwords.json; ")
-            append("rm -f /tmp/wdtt-import-passwords.json; ")
+            append("install -m 600 ${shellQuote(remoteDbFile)} /etc/wdtt/passwords.json; ")
+            append("rm -f ${shellQuote(remoteDbFile)}; ")
             if (replaceWgKeys) {
-                append("install -m 600 /tmp/wdtt-import-wg-keys.dat /etc/wdtt/wg-keys.dat; rm -f /tmp/wdtt-import-wg-keys.dat; ")
+                append("install -m 600 ${shellQuote(remoteWgFile)} /etc/wdtt/wg-keys.dat; rm -f ${shellQuote(remoteWgFile)}; ")
             }
             if (restartService) {
                 append("systemctl restart wdtt 2>/dev/null || true; ")
@@ -8490,6 +10186,12 @@ private fun applyServerImport(
             throw IllegalStateException("wdtt.service не стал active после импорта")
         }
     } finally {
+        runCatching {
+            ssh.exec(
+                rootCommand("rm -f ${shellQuote(remoteDbFile)} ${shellQuote(remoteWgFile)}"),
+                timeout = 10_000L
+            )
+        }
         dbFile.delete()
         wgFile.delete()
     }
@@ -8628,8 +10330,7 @@ private fun validatePreservedServerState(beforeJson: String, afterJson: String) 
     val safeExpiryCutoff = System.currentTimeMillis() / 1000L + 300L
     beforePasswords.keys().forEach { password ->
         val oldEntry = beforePasswords.optJSONObject(password) ?: return@forEach
-        val expiresAt = oldEntry.optLong("expires_at", 0)
-        if (expiresAt != 0L && expiresAt <= safeExpiryCutoff) return@forEach
+        if (!passwordShouldRemainAfterImport(oldEntry, safeExpiryCutoff)) return@forEach
         val newEntry = afterPasswords.optJSONObject(password)
             ?: throw IllegalStateException("после обновления пропал действующий клиент ${password.take(4)}…")
         listOf("device_id", "label", "vk_hash", "ports").forEach { field ->
@@ -8640,13 +10341,82 @@ private fun validatePreservedServerState(beforeJson: String, afterJson: String) 
         require(oldEntry.optLong("expires_at", 0) == newEntry.optLong("expires_at", 0)) {
             "после обновления изменился срок клиента ${password.take(4)}…"
         }
+        require(oldEntry.optLong("purge_after", 0) == newEntry.optLong("purge_after", 0)) {
+            "после обновления изменился срок хранения записи клиента ${password.take(4)}…"
+        }
         require(oldEntry.optBoolean("is_deactivated", false) == newEntry.optBoolean("is_deactivated", false)) {
             "после обновления изменился статус клиента ${password.take(4)}…"
+        }
+        listOf("down_bytes", "up_bytes").forEach { field ->
+            require(oldEntry.optLong(field, 0L) == newEntry.optLong(field, 0L)) {
+                "после обновления изменилось поле $field у клиента ${password.take(4)}…"
+            }
+        }
+        listOf("bind_history", "traffic").forEach { field ->
+            require(
+                oldEntry.optJSONArray(field)?.toString().orEmpty() ==
+                    newEntry.optJSONArray(field)?.toString().orEmpty()
+            ) {
+                "после обновления изменилась история $field у клиента ${password.take(4)}…"
+            }
+        }
+        require(
+            oldEntry.optJSONObject("traffic_imports")?.toString().orEmpty() ==
+                newEntry.optJSONObject("traffic_imports")?.toString().orEmpty()
+        ) {
+            "после обновления изменилась история учёта перенесённого трафика клиента ${password.take(4)}…"
         }
         val deviceId = oldEntry.optString("device_id", "")
         if (deviceId.isNotBlank()) {
             require(afterDevices.has(deviceId)) { "после обновления пропала привязка устройства клиента ${password.take(4)}…" }
         }
+    }
+}
+
+private fun passwordShouldRemainAfterImport(entry: JSONObject, safeExpiryCutoff: Long): Boolean {
+    val expiresAt = entry.optLong("expires_at", 0L)
+    if (expiresAt == 0L) return true
+    val purgeAfter = entry.optLong("purge_after", 0L)
+    return maxOf(expiresAt, purgeAfter) > safeExpiryCutoff
+}
+
+private fun validateImportedDevice(
+    deviceId: String,
+    expected: JSONObject,
+    actual: JSONObject,
+    allowIpReassignment: Boolean
+) {
+    val stringFields = listOf(
+        "device_id",
+        "priv_key",
+        "pub_key",
+        "name",
+        "manufacturer",
+        "brand",
+        "model",
+        "android_version",
+        "abi",
+        "app_version",
+        "locale",
+        "country",
+        "time_zone",
+        "remote_ip"
+    )
+    stringFields.forEach { field ->
+        require(expected.optString(field, "") == actual.optString(field, "")) {
+            "после импорта изменилось поле $field у устройства ${deviceId.take(8)}…"
+        }
+    }
+    if (!allowIpReassignment) {
+        require(expected.optString("ip", "") == actual.optString("ip", "")) {
+            "после импорта изменился внутренний IP устройства ${deviceId.take(8)}…"
+        }
+    }
+    require(expected.optInt("sdk", 0) == actual.optInt("sdk", 0)) {
+        "после импорта изменилось поле sdk у устройства ${deviceId.take(8)}…"
+    }
+    require(expected.optLong("last_seen_at", 0L) == actual.optLong("last_seen_at", 0L)) {
+        "после импорта изменилось поле last_seen_at у устройства ${deviceId.take(8)}…"
     }
 }
 
@@ -8667,14 +10437,14 @@ internal fun validateImportedServerState(
     val sourcePasswords = source.optJSONObject("passwords") ?: JSONObject()
     val beforePasswords = beforeJson?.let { JSONObject(it).optJSONObject("passwords") } ?: JSONObject()
     val afterPasswords = after.optJSONObject("passwords") ?: JSONObject()
+    val sourceDevices = source.optJSONObject("devices") ?: JSONObject()
     val afterDevices = after.optJSONObject("devices") ?: JSONObject()
     val safeExpiryCutoff = System.currentTimeMillis() / 1000L + 300L
 
     sourcePasswords.keys().forEach { password ->
         if (!replace && beforePasswords.has(password)) return@forEach
         val expected = sourcePasswords.optJSONObject(password) ?: return@forEach
-        val expiresAt = expected.optLong("expires_at", 0L)
-        if (expiresAt != 0L && expiresAt <= safeExpiryCutoff) return@forEach
+        if (!passwordShouldRemainAfterImport(expected, safeExpiryCutoff)) return@forEach
         val actual = afterPasswords.optJSONObject(password)
             ?: throw IllegalStateException("после импорта не найден клиент ${password.take(4)}…")
         listOf("device_id", "label", "vk_hash").forEach { field ->
@@ -8682,7 +10452,7 @@ internal fun validateImportedServerState(
                 "после импорта изменилось поле $field у клиента ${password.take(4)}…"
             }
         }
-        listOf("expires_at", "down_bytes", "up_bytes").forEach { field ->
+        listOf("expires_at", "purge_after", "down_bytes", "up_bytes").forEach { field ->
             require(expected.optLong(field, 0L) == actual.optLong(field, 0L)) {
                 "после импорта изменилось поле $field у клиента ${password.take(4)}…"
             }
@@ -8695,11 +10465,104 @@ internal fun validateImportedServerState(
                 "после импорта изменилась история $field у клиента ${password.take(4)}…"
             }
         }
+        require(
+            expected.optJSONObject("traffic_imports")?.toString().orEmpty() ==
+                actual.optJSONObject("traffic_imports")?.toString().orEmpty()
+        ) {
+            "после импорта изменилась история учёта перенесённого трафика у клиента ${password.take(4)}…"
+        }
         val deviceId = expected.optString("device_id", "")
         if (deviceId.isNotBlank()) {
-            require(afterDevices.has(deviceId)) {
-                "после импорта отсутствует привязанное устройство клиента ${password.take(4)}…"
+            val expectedDevice = sourceDevices.optJSONObject(deviceId)
+                ?: throw IllegalStateException("в бэкапе отсутствует устройство клиента ${password.take(4)}…")
+            val actualDevice = afterDevices.optJSONObject(deviceId)
+                ?: throw IllegalStateException("после импорта отсутствует привязанное устройство клиента ${password.take(4)}…")
+            validateImportedDevice(
+                deviceId = deviceId,
+                expected = expectedDevice,
+                actual = actualDevice,
+                allowIpReassignment = !replace
+            )
+        }
+    }
+
+    if (replace) {
+        require(source.optLong("admin_down_bytes", 0L) == after.optLong("admin_down_bytes", 0L)) {
+            "после импорта изменился входящий трафик владельца"
+        }
+        require(source.optLong("admin_up_bytes", 0L) == after.optLong("admin_up_bytes", 0L)) {
+            "после импорта изменился исходящий трафик владельца"
+        }
+        require(
+            source.optJSONArray("admin_traffic")?.toString().orEmpty() ==
+                after.optJSONArray("admin_traffic")?.toString().orEmpty()
+        ) {
+            "после импорта изменилась история трафика владельца"
+        }
+        require(source.optInt("max_passwords", 50) == after.optInt("max_passwords", 50)) {
+            "после импорта изменился лимит клиентов"
+        }
+
+        val expectedProfile = source.optJSONObject("admin_profile")?.let { JSONObject(it.toString()) }
+        val actualProfile = after.optJSONObject("admin_profile")
+        if (expectedProfile != null) {
+            val targetPorts = after.optString("default_ports", "56000,56001,9000")
+            expectedProfile.put("ports", targetPorts)
+            expectedProfile.put("listen_port", targetPorts.substringAfterLast(",").toInt())
+            listOf(
+                "vk_hashes",
+                "secondary_vk_hash",
+                "profile_name",
+                "protocol",
+                "sni",
+                "ports"
+            ).forEach { field ->
+                require(expectedProfile.optString(field, "") == actualProfile?.optString(field, "").orEmpty()) {
+                    "после импорта изменилось поле $field профиля владельца"
+                }
             }
+            listOf("workers_per_hash", "listen_port").forEach { field ->
+                require(expectedProfile.optInt(field, 0) == actualProfile?.optInt(field, 0)) {
+                    "после импорта изменилось поле $field профиля владельца"
+                }
+            }
+            require(expectedProfile.optBoolean("no_dns", false) == actualProfile?.optBoolean("no_dns", false)) {
+                "после импорта изменилось поле no_dns профиля владельца"
+            }
+            require(expectedProfile.optLong("updated_at", 0L) == actualProfile?.optLong("updated_at", 0L)) {
+                "после импорта изменилось время профиля владельца"
+            }
+            require(
+                expectedProfile.optJSONArray("device_ids")?.toString().orEmpty() ==
+                    actualProfile?.optJSONArray("device_ids")?.toString().orEmpty()
+            ) {
+                "после импорта изменился список устройств владельца"
+            }
+        }
+
+        val purgeableDeviceIds = sourcePasswords.keys()
+            .asSequence()
+            .mapNotNull { sourcePasswords.optJSONObject(it) }
+            .filterNot { passwordShouldRemainAfterImport(it, safeExpiryCutoff) }
+            .mapNotNull { it.optString("device_id", "").takeIf(String::isNotBlank) }
+            .toSet()
+        val retainedDeviceIds = sourcePasswords.keys()
+            .asSequence()
+            .mapNotNull { sourcePasswords.optJSONObject(it) }
+            .filter { passwordShouldRemainAfterImport(it, safeExpiryCutoff) }
+            .mapNotNull { it.optString("device_id", "").takeIf(String::isNotBlank) }
+            .toMutableSet()
+        expectedProfile?.optJSONArray("device_ids")?.let { ids ->
+            for (index in 0 until ids.length()) {
+                ids.optString(index).takeIf(String::isNotBlank)?.let(retainedDeviceIds::add)
+            }
+        }
+        sourceDevices.keys().forEach { deviceId ->
+            if (deviceId in purgeableDeviceIds && deviceId !in retainedDeviceIds) return@forEach
+            val expectedDevice = sourceDevices.optJSONObject(deviceId) ?: return@forEach
+            val actualDevice = afterDevices.optJSONObject(deviceId)
+                ?: throw IllegalStateException("после импорта отсутствует устройство ${deviceId.take(8)}…")
+            validateImportedDevice(deviceId, expectedDevice, actualDevice, allowIpReassignment = false)
         }
     }
 }
@@ -8759,7 +10622,7 @@ private suspend fun performDeploy(
         if (mode == DeployMode.PreserveData || importPlan != null) {
             onProgress(0.055f, "Проверка сохранённых данных...")
             val currentDbJson = readRemotePasswordsJson(ssh)?.also {
-                validatePasswordsDbStructure(JSONObject(it))
+                validatePasswordsDbForPreserving(JSONObject(it), mainPass)
             }
             if (mode == DeployMode.PreserveData) {
                 if (importPlan == null) preservedDbJson = currentDbJson
@@ -8825,10 +10688,11 @@ private suspend fun performDeploy(
 			val verifyOutput = ssh.exec(
 				rootCommand(
 					"sleep 2; printf 'BINARY=%s\\n' \"$([ -x /usr/local/bin/wdtt-server ] && echo 1 || echo 0)\"; " +
-						"printf 'CONFIG=%s\\n' \"$([ -d /etc/wdtt ] && echo 1 || echo 0)\"; " +
-						"printf 'SERVICE=%s\\n' \"$(systemctl is-active wdtt 2>/dev/null || true)\"; " +
-						"printf 'ADMIN_SOCKET=%s\\n' \"$([ -S /run/wdtt/admin.sock ] && echo 1 || echo 0)\"; " +
-						"printf 'SERVER_SHA256=%s\\n' \"$(sha256sum /usr/local/bin/wdtt-server 2>/dev/null | awk '{print ${'$'}1}')\""
+					"printf 'CONFIG=%s\\n' \"$([ -d /etc/wdtt ] && echo 1 || echo 0)\"; " +
+					"printf 'SERVICE=%s\\n' \"$(systemctl is-active wdtt 2>/dev/null || true)\"; " +
+					"printf 'ADMIN_SOCKET=%s\\n' \"$([ -S /run/wdtt/admin.sock ] && echo 1 || echo 0)\"; " +
+					"printf 'SERVER_SHA256=%s\\n' \"$(sha256sum /usr/local/bin/wdtt-server 2>/dev/null | awk '{print ${'$'}1}')\"; " +
+					"printf 'SERVER_VERSION=%s\\n' \"$(/usr/local/bin/wdtt-server --version 2>/dev/null | head -n 1)\""
 				),
                 timeout = 20000L
             )
@@ -8838,8 +10702,10 @@ private suspend fun performDeploy(
 			val adminSocketOk = Regex("^ADMIN_SOCKET=1$", RegexOption.MULTILINE).containsMatchIn(verifyOutput)
 			val installedSha256 = Regex("^SERVER_SHA256=([0-9a-fA-F]{64})$", RegexOption.MULTILINE)
 				.find(verifyOutput)?.groupValues?.getOrNull(1)?.lowercase()
+			val installedServerVersion = Regex("^SERVER_VERSION=([0-9][0-9A-Za-z._-]*)$", RegexOption.MULTILINE)
+				.find(verifyOutput)?.groupValues?.getOrNull(1).orEmpty()
 			val binaryCurrent = installedSha256 == expectedServerSha256
-			if (!binaryOk || !configOk || !serviceActive || !adminSocketOk || !binaryCurrent) {
+			if (!binaryOk || !configOk || !serviceActive || !adminSocketOk || !binaryCurrent || installedServerVersion.isBlank()) {
 				DeployManager.writeError("Deploy verify failed: ${verifyOutput.take(500)}")
 				val missing = buildList {
 					if (!binaryOk) add("бинарник")
@@ -8847,6 +10713,7 @@ private suspend fun performDeploy(
 					if (!serviceActive) add("служба wdtt")
 					if (!adminSocketOk) add("admin-сокет новой версии")
 					if (!binaryCurrent) add("актуальная версия бинарника")
+					if (installedServerVersion.isBlank()) add("версия серверной части")
 				}.joinToString(", ")
 				throw IllegalStateException("скрипт завершился, но проверка не прошла: $missing")
 			}
@@ -8866,8 +10733,9 @@ private suspend fun performDeploy(
 				cleanupServerUpdateRollback(ssh)
 				rollbackPrepared = false
 			}
+			DeployManager.installedServerVersion.value = installedServerVersion
             DeployManager.stopDeploy("success")
-            TunnelManager.addDeploySuccessLog("Деплой успешно завершён. Сервис активен.")
+            TunnelManager.addDeploySuccessLog("Деплой успешно завершён. Серверная часть WDTT Plus $installedServerVersion, сервис активен.")
             return@withContext true
         } else if (output.contains("error:")) {
             DeployManager.writeError("Deploy script output contains error")
@@ -8992,7 +10860,7 @@ private fun ServerImportConfirmDialog(
 ) {
     val portsSpec = "${request.dtlsPort},${request.wgPort},${request.localPort}"
     val dnsValue = listOf(request.dns1, request.dns2).filter { it.isNotBlank() }.joinToString(",")
-    val modeText = if (mode == ServerImportMode.Replace) "Заменить базу сервера бэкапом" else "Добавить отсутствующие пароли и устройства"
+    val modeText = if (mode == ServerImportMode.Replace) "Заменить базу сервера бэкапом" else "Добавить отсутствующих клиентов и устройства"
     val mainPasswordText = when {
         request.mainPass.isNotBlank() -> "из текущих секретов деплоя"
         mode == ServerImportMode.Replace && backup.mainPassword.isNotBlank() -> "из бэкапа"
@@ -9055,7 +10923,7 @@ private fun ServerImportConfirmDialog(
                     ) {
                         ConfirmLine("Режим", modeText)
                         ConfirmLine("Бэкап", "${backup.sourceHost}, ${backup.createdAt}")
-                        ConfirmLine("Данные", "${backup.passwordCount} паролей, ${backup.deviceCount} устройств")
+                        ConfirmLine("Данные", "${backup.passwordCount} клиентов, ${backup.deviceCount} устройств")
                         ConfirmLine("Адрес сервера для ссылок", request.host)
                         ConfirmLine("Порты быстрых ссылок", portsSpec)
                         ConfirmLine("Главный пароль", mainPasswordText)
@@ -9068,7 +10936,7 @@ private fun ServerImportConfirmDialog(
                     if (mode == ServerImportMode.Replace) {
                         "В режиме «Заменить» текущая база паролей и устройств на целевом сервере будет перезаписана. Используйте это для переезда на новый сервер."
                     } else {
-                        "В режиме «Добавить» совпадающие пароли и устройства не перезаписываются. Это безопаснее для уже используемого сервера."
+                        "В режиме «Добавить» совпадающие клиенты и устройства не перезаписываются. Это безопаснее для уже используемого сервера."
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -10079,7 +11947,7 @@ private fun ExistingInstallDialog(
 								Text("Будут заменены серверные значения:", fontWeight = FontWeight.SemiBold)
 								comparison.overwriteLines.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
 								Text(
-									"Если нужны значения сервера, отмените установку и сначала выполните «Подключиться (без установки)». Для выходного IP используйте «Заполнить».",
+									"Если нужны значения сервера, отмените установку и сначала выполните «Подключиться (без установки)». Для выходного IP используйте «Загрузить настройки».",
 									style = MaterialTheme.typography.bodySmall
 								)
 							}

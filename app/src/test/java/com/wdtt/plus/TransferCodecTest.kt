@@ -9,6 +9,24 @@ import org.json.JSONObject
 
 class TransferCodecTest {
     @Test
+    fun connectionLinkCarriesOptionalProfileWorkerPolicy() {
+        val link = WdttTransferCodec.buildConnectionLink(
+            WdttLinkParts(
+                host = "vpn.example.org",
+                dtlsPort = 56000,
+                wgPort = 56001,
+                localPort = 9000,
+                password = "secret",
+                hashes = "1234567890abcdef",
+                maxWorkers = 9
+            )
+        )
+
+        assertEquals(9, WdttDeepLink.parse(link)?.maxWorkers)
+        assertEquals(0, WdttDeepLink.parse(link.replace("&max_workers=9", ""))?.maxWorkers)
+    }
+
+    @Test
     fun modernConnectionLink_roundTripsSpecialCharacters() {
         val original = WdttLinkParts(
             host = "vpn.example.org",
@@ -113,6 +131,14 @@ class TransferCodecTest {
     }
 
     @Test
+    fun invalidConnectionLink_helpShowsModernAndLegacyFormats() {
+        val message = WdttDeepLink.validate("not-a-link").userMessage()
+
+        assertTrue(message.contains("Новый: wdtt://connect?v=1"))
+        assertTrue(message.contains("Старый: wdtt://адрес:"))
+    }
+
+    @Test
     fun onlyRenamedProfileIsPreparedForTransfer() {
         assertEquals("", vpnProfileTransferName(0, listOf("", "", "")))
         assertEquals("", vpnProfileTransferName(1, listOf("", "VPN 2", "")))
@@ -167,6 +193,44 @@ class TransferCodecTest {
     }
 
     @Test
+    fun serverClientLink_withoutVkHashesCanBeSharedAndImportedAsPartialAccess() {
+        val link = buildServerConnectionLink(
+            password = "ABCDEFGHJKLMNPQR",
+            hashes = "",
+            ports = "56000,56001,9000",
+            fallbackHost = "vpn.example.org",
+            publicHost = "",
+            profileName = "Доступ без хеша"
+        )
+
+        assertNotNull(link)
+        assertTrue(link.orEmpty().contains("hashes="))
+        assertFalse(WdttDeepLink.validate(link.orEmpty()).canStartVpn)
+        val partial = WdttDeepLink.parse(link.orEmpty(), allowMissingHashes = true)
+        assertNotNull(partial)
+        assertEquals("", partial?.hashes)
+        assertEquals("Доступ без хеша", partial?.profileName)
+        assertFalse(partial?.hasNonStandardPorts() ?: true)
+    }
+
+    @Test
+    fun importedLinkEnablesCustomPortsOnlyWhenAtLeastOnePortDiffers() {
+        val standard = WdttLinkParts(
+            host = "vpn.example.org",
+            dtlsPort = 56000,
+            wgPort = 56001,
+            localPort = 9000,
+            password = "ABCDEFGHJKLMNPQR",
+            hashes = "hash"
+        )
+
+        assertFalse(standard.hasNonStandardPorts())
+        assertTrue(standard.copy(dtlsPort = 57000).hasNonStandardPorts())
+        assertTrue(standard.copy(wgPort = 57001).hasNonStandardPorts())
+        assertTrue(standard.copy(localPort = 9100).hasNonStandardPorts())
+    }
+
+    @Test
     fun linkCanBeExtractedFromSharedText() {
         val value = "Подключение: wdtt://vpn.example.org:56000:56001:9000:secret:1234567890abcdef\nНе передавайте посторонним"
 
@@ -183,6 +247,38 @@ class TransferCodecTest {
         )
 
         assertFalse(WdttDeepLink.validate(link).canStartVpn)
+    }
+
+    @Test
+    fun connectionLinkWithoutHashes_canBeStoredButCannotStartVpn() {
+        val link = WdttTransferCodec.buildConnectionLink(
+            WdttLinkParts("vpn.example.org", 56000, 56001, 9000, "secret", "")
+        )
+
+        assertFalse(WdttDeepLink.validate(link).canStartVpn)
+        assertNotNull(WdttDeepLink.parse(link, allowMissingHashes = true))
+        assertTrue(
+            WdttDeepLink.validate(link, allowMissingHashes = true)
+                .userMessage()
+                .contains("Добавьте свой VK-хеш")
+        )
+    }
+
+    @Test
+    fun ordinaryLongWordsAreNeverParsedAsVkHashes() {
+        val link = WdttTransferCodec.buildConnectionLink(
+            WdttLinkParts(
+                "vpn.example.org",
+                56000,
+                56001,
+                9000,
+                "secret",
+                "пользовательский,переподключаются",
+            )
+        )
+
+        assertFalse(WdttDeepLink.validate(link).canStartVpn)
+        assertEquals(null, WdttDeepLink.parse(link, allowMissingHashes = true))
     }
 
     @Test

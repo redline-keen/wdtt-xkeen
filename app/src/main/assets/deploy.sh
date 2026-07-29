@@ -2,19 +2,24 @@
 # ==============================================================================
 #  WDTT Plus Server — Универсальный установщик для VPS
 #  Поддержка: Debian 11+, Ubuntu 20.04+, CentOS/RHEL/Fedora/AlmaLinux/Rocky
-#  Версия: 3.3  |  Дата: 2026-07-02
+#  Версия: 3.4  |  Дата: 2026-07-13
 #  NAT:  MASQUERADE через iptables
 #  WG:   порт 56001 (не конфликтует с существующим WG на 51820)
 #  DTLS: порт 56000
 # ==============================================================================
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.3"
+readonly SCRIPT_VERSION="3.4"
 readonly LOG_FILE="/var/log/wdtt-install.log"
 readonly WG_PORT="${WDTT_WG_PORT:-56001}"
 readonly DTLS_PORT="${WDTT_DTLS_PORT:-56000}"
 readonly SSH_PORT="${WDTT_SSH_PORT:-22}"
 readonly MAX_PASSWORDS="${WDTT_MAX_PASSWORDS:-50}"
+readonly MAX_WORKERS_PER_ACCESS="${WDTT_MAX_WORKERS_PER_ACCESS:-0}"
+readonly MAX_HANDSHAKES="${WDTT_MAX_HANDSHAKES:-32}"
+readonly HANDSHAKE_RATE="${WDTT_HANDSHAKE_RATE:-24}"
+readonly MAX_CLIENT_MBPS="${WDTT_MAX_CLIENT_MBPS:-0}"
+readonly WG_BACKEND="${WDTT_WG_BACKEND:-auto}"
 readonly WDTT_ARGS="${WDTT_ARGS:-}"
 readonly WDTT_PRESERVE_DATA="${WDTT_PRESERVE_DATA:-0}"
 readonly WDTT_IFACE="wdtt0"
@@ -32,6 +37,33 @@ validate_port() {
     if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
         die "$name должен быть в диапазоне 1..65535, получено: $value"
     fi
+}
+
+validate_runtime_limits() {
+    for item in \
+        "WDTT_MAX_PASSWORDS:$MAX_PASSWORDS" \
+        "WDTT_MAX_HANDSHAKES:$MAX_HANDSHAKES"; do
+        local name="${item%%:*}" value="${item#*:}"
+        case "$value" in
+            ''|*[!0-9]*) die "$name должен быть положительным целым числом" ;;
+        esac
+        [ "$value" -ge 1 ] || die "$name должен быть не меньше 1"
+    done
+    case "$MAX_WORKERS_PER_ACCESS" in
+        ''|*[!0-9]*) die "WDTT_MAX_WORKERS_PER_ACCESS должен быть целым числом" ;;
+    esac
+    for item in \
+        "WDTT_HANDSHAKE_RATE:$HANDSHAKE_RATE" \
+        "WDTT_MAX_CLIENT_MBPS:$MAX_CLIENT_MBPS"; do
+        local name="${item%%:*}" value="${item#*:}"
+        case "$value" in
+            ''|*[!0-9.]*) die "$name должен быть неотрицательным числом" ;;
+        esac
+    done
+    case "$WG_BACKEND" in
+        auto|kernel|userspace) ;;
+        *) die "WDTT_WG_BACKEND должен быть auto, kernel или userspace" ;;
+    esac
 }
 
 # ─── Цвета ───────────────────────────────────────────────────────────────────
@@ -115,14 +147,20 @@ install_prerequisites() {
         apt)
             pkg_install ca-certificates iproute2 iptables nftables procps psmisc || \
                 log_warn "Часть apt-пакетов не установилась, продолжаю с доступными утилитами"
+            pkg_install wireguard-tools || \
+                log_warn "wireguard-tools не установлен; будет использован userspace WireGuard"
             ;;
         dnf|yum)
             pkg_install ca-certificates iproute iptables nftables procps-ng psmisc || \
                 log_warn "Часть rpm-пакетов не установилась, продолжаю с доступными утилитами"
+            pkg_install wireguard-tools || \
+                log_warn "wireguard-tools не установлен; будет использован userspace WireGuard"
             ;;
         pacman)
             pkg_install ca-certificates iproute2 iptables nftables procps-ng psmisc || \
                 log_warn "Часть pacman-пакетов не установилась, продолжаю с доступными утилитами"
+            pkg_install wireguard-tools || \
+                log_warn "wireguard-tools не установлен; будет использован userspace WireGuard"
             ;;
     esac
 }
@@ -378,7 +416,21 @@ setup_sysctl() {
     mkdir -p /etc/sysctl.d
     cat > /etc/sysctl.d/99-wdtt.conf << 'SYSEOF'
 net.ipv4.ip_forward = 1
+net.core.default_qdisc = fq
+net.core.rmem_max = 25165824
+net.core.wmem_max = 25165824
+net.core.rmem_default = 4194304
+net.core.wmem_default = 4194304
+net.core.netdev_max_backlog = 16384
+net.ipv4.udp_rmem_min = 262144
+net.ipv4.udp_wmem_min = 262144
+net.ipv4.tcp_rmem = 4096 87380 25165824
+net.ipv4.tcp_wmem = 4096 65536 25165824
 SYSEOF
+
+    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        echo 'net.ipv4.tcp_congestion_control = bbr' >> /etc/sysctl.d/99-wdtt.conf
+    fi
 
     sysctl -p /etc/sysctl.d/99-wdtt.conf >/dev/null 2>&1 || true
 
@@ -461,7 +513,7 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=-/usr/bin/env bash -c "ip link show ${WDTT_IFACE} >/dev/null 2>&1 && ip link del ${WDTT_IFACE} 2>/dev/null || true"
 ExecStartPre=-/usr/bin/env bash -c "if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; fi"
-ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} -max-passwords ${MAX_PASSWORDS} ${WDTT_ARGS}
+ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} -max-passwords ${MAX_PASSWORDS} -max-workers-per-access ${MAX_WORKERS_PER_ACCESS} -max-handshakes ${MAX_HANDSHAKES} -handshake-rate ${HANDSHAKE_RATE} -max-client-mbps ${MAX_CLIENT_MBPS} -wg-backend ${WG_BACKEND} ${WDTT_ARGS}
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -572,6 +624,7 @@ main() {
     validate_port "WDTT_DTLS_PORT" "$DTLS_PORT"
     validate_port "WDTT_WG_PORT" "$WG_PORT"
     validate_port "WDTT_SSH_PORT" "$SSH_PORT"
+    validate_runtime_limits
 
     mkdir -p "$(dirname "$LOG_FILE")"
     echo "=== WDTT Plus Installer v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"

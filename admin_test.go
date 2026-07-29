@@ -2,9 +2,141 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"reflect"
+	"regexp"
 	"testing"
+	"time"
 )
+
+func TestAdminServerInfoReportsRunningBinarySHA256(t *testing.T) {
+	sum := runningBinarySHA256()
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(sum) {
+		t.Fatalf("unexpected running binary SHA-256: %q", sum)
+	}
+	info := buildAdminServerInfo(t.TempDir(), &Database{
+		DefaultPorts: "56000,56001,9000",
+		MaxPasswords: 10,
+		Passwords:    make(map[string]*PasswordEntry),
+		Devices:      make(map[string]*ClientDevice),
+	})
+	if info.BinarySHA256 != sum {
+		t.Fatalf("admin server SHA-256 = %q, want %q", info.BinarySHA256, sum)
+	}
+}
+
+func TestAdminServerInfoSeparatesClientAndOwnerDevices(t *testing.T) {
+	loaded := &Database{
+		DefaultPorts: "56000,56001,9000",
+		MaxPasswords: 10,
+		AdminProfile: AdminProfileEntry{
+			DeviceIDs: []string{"owner-phone", "shared-phone", "owner-phone"},
+		},
+		Passwords: map[string]*PasswordEntry{
+			"client-one": {
+				DeviceID: "shared-phone",
+				BindHistory: []BindHistoryEntry{
+					{DeviceID: "shared-phone", BoundAt: 10, Status: "active"},
+					{DeviceID: "old-client-phone", BoundAt: 5, UnboundAt: 9, Status: "unbound"},
+					{DeviceID: "rejected-phone", EventAt: 11, Status: "denied_mismatch"},
+				},
+			},
+			"client-two": {},
+		},
+		Devices: map[string]*ClientDevice{
+			"shared-phone": {DeviceID: "shared-phone"},
+			"owner-phone":  {DeviceID: "owner-phone"},
+			"orphan":       {DeviceID: "orphan"},
+		},
+	}
+
+	info := buildAdminServerInfo(t.TempDir(), loaded)
+	if info.DeviceCount != 2 {
+		t.Fatalf("client device count = %d, want current plus successful history = 2", info.DeviceCount)
+	}
+	if info.OwnerDeviceCount != 2 {
+		t.Fatalf("owner device count = %d, want 2 unique owner devices", info.OwnerDeviceCount)
+	}
+	if info.OrphanDeviceCount != 1 {
+		t.Fatalf("orphan device count = %d, want 1", info.OrphanDeviceCount)
+	}
+}
+
+func TestAdminClientStateMovesTrafficAndBindingHistoryExactlyOnce(t *testing.T) {
+	sourceDir := t.TempDir()
+	targetDir := t.TempDir()
+	password := "ABCDEFGHJKLMNPQR"
+	today := time.Now().Format("2006-01-02")
+	source := &Database{
+		DefaultPorts: "56000,56001,9000",
+		MaxPasswords: 10,
+		Passwords: map[string]*PasswordEntry{
+			password: {
+				DownBytes: 8192,
+				UpBytes:   4096,
+				Traffic: []TrafficBucket{
+					{Date: today, DownBytes: 8192, UpBytes: 4096},
+				},
+				TrafficImports: map[string]TrafficImport{
+					"older-transfer": {DownBytes: 128, UpBytes: 64, AppliedAt: 100},
+				},
+				BindHistory: []BindHistoryEntry{
+					{DeviceID: "old-phone", BoundAt: 10, UnboundAt: 20, Status: "unbound"},
+					{DeviceID: "current-phone", BoundAt: 30, Status: "active"},
+				},
+			},
+		},
+		Devices: make(map[string]*ClientDevice),
+	}
+	exported, err := adminExportClientState(
+		sourceDir,
+		source,
+		[]string{"--password", password},
+	)
+	if err != nil || exported.ClientState == nil {
+		t.Fatalf("export-client-state failed: response=%#v error=%v", exported, err)
+	}
+	raw, err := json.Marshal(exported.ClientState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(raw)
+	target := &Database{
+		DefaultPorts: "56000,56001,9000",
+		MaxPasswords: 10,
+		Passwords: map[string]*PasswordEntry{
+			password: {},
+		},
+		Devices: make(map[string]*ClientDevice),
+	}
+	args := []string{
+		"--password", password,
+		"--operation-id", "client-transfer-row",
+		"--state", encoded,
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := adminImportClientState(targetDir, target, args); err != nil {
+			t.Fatalf("import-client-state attempt %d failed: %v", attempt+1, err)
+		}
+	}
+	entry := target.Passwords[password]
+	if entry.DownBytes != 8192 || entry.UpBytes != 4096 {
+		t.Fatalf("traffic totals changed during import: %#v", entry)
+	}
+	if !reflect.DeepEqual(entry.Traffic, source.Passwords[password].Traffic) {
+		t.Fatalf("daily traffic history was not preserved: %#v", entry.Traffic)
+	}
+	if !reflect.DeepEqual(entry.BindHistory, source.Passwords[password].BindHistory) {
+		t.Fatalf("binding history was not preserved: %#v", entry.BindHistory)
+	}
+	if _, ok := entry.TrafficImports["client-transfer-row"]; !ok {
+		t.Fatal("idempotency marker was not recorded")
+	}
+	if entry.DeviceID != "" || len(target.Devices) != 0 {
+		t.Fatal("live device keys must be rebound on the destination, not copied")
+	}
+}
 
 func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 	configDir := t.TempDir()
@@ -164,6 +296,23 @@ func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 	request("reset-traffic")
 	if db.Passwords[password].DownBytes != 0 || db.Passwords[password].UpBytes != 0 {
 		t.Fatal("traffic counters were not reset")
+	}
+	request(
+		"merge-client-traffic",
+		"--password", password,
+		"--operation-id", "incident-row-return",
+		"--down-bytes", "3072",
+		"--up-bytes", "4096",
+	)
+	request(
+		"merge-client-traffic",
+		"--password", password,
+		"--operation-id", "incident-row-return",
+		"--down-bytes", "3072",
+		"--up-bytes", "4096",
+	)
+	if db.Passwords[password].DownBytes != 3072 || db.Passwords[password].UpBytes != 4096 {
+		t.Fatal("traffic import must be applied exactly once")
 	}
 
 	request("deactivate", "--password", password)

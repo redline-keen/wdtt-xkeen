@@ -6,7 +6,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.wdtt.plus.ui.DeployTab
@@ -62,8 +64,10 @@ private fun InfoTabPreview() {
 )
 @Composable
 private fun TunnelTabPreview() {
+    val context = LocalContext.current
+    val settingsStore = remember { SettingsStore(context) }
     PreviewScreen {
-        SettingsTab()
+        SettingsTab(settingsStore = settingsStore)
     }
 }
 

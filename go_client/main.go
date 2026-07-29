@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -122,14 +124,22 @@ func classifyHashCheckError(err error) (string, string) {
 	switch {
 	case strings.Contains(text, "captcha_required") || strings.Contains(text, "captcha_wait_required"):
 		return "captcha", "VK просит капчу"
-	case strings.Contains(text, "call not found") ||
-		strings.Contains(text, "joinconversationbylink") ||
-		strings.Contains(text, "missing turn_server") ||
-		strings.Contains(text, "9000"):
+	case strings.Contains(text, "invalid_join_link") ||
+		strings.Contains(text, "call not found") ||
+		strings.Contains(text, "join link is not valid") ||
+		strings.Contains(text, "error 9000") ||
+		strings.Contains(text, "error 9008") ||
+		strings.Contains(text, "error_code:9000") ||
+		strings.Contains(text, "error_code:9008"):
 		return "dead", "Звонок не найден или закрыт"
+	case strings.Contains(text, "anon_blocked") || strings.Contains(text, "anonymous join is disabled"):
+		return "blocked", "В звонке запрещён анонимный вход"
+	case strings.Contains(text, "call_full") || strings.Contains(text, "call is full"):
+		return "full", "В звонке сейчас нет свободных мест"
 	case strings.Contains(text, "flood") || strings.Contains(text, "rate limit") || strings.Contains(text, "error_code:29"):
 		return "limited", "VK временно ограничил запросы"
-	case strings.Contains(text, "timeout") || strings.Contains(text, "deadline") || strings.Contains(text, "lookup") || strings.Contains(text, "network"):
+	case strings.Contains(text, "timeout") || strings.Contains(text, "deadline") || strings.Contains(text, "lookup") ||
+		strings.Contains(text, "network") || strings.Contains(text, "vk https"):
 		return "network", "Сетевая ошибка"
 	default:
 		return "error", err.Error()
@@ -257,21 +267,23 @@ func main() {
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
-			if !strings.Contains(line, "error:tunnel stopped") {
-				log.Printf("[STDIN] %s", line)
-			}
 			switch {
 			case line == "PAUSE":
+				log.Printf("[STDIN] Команда PAUSE")
 				atomic.StoreInt32(&pauseFlag, 1)
 			case line == "RESUME":
+				log.Printf("[STDIN] Команда RESUME")
 				atomic.StoreInt32(&pauseFlag, 0)
 			case line == "STOP":
+				log.Printf("[STDIN] Команда STOP")
 				cancel()
 				return
 			case strings.HasPrefix(line, "CAPTCHA_RESULT|"):
 				result := parseCaptchaResultPayload(strings.TrimPrefix(line, "CAPTCHA_RESULT|"))
 				enqueueCaptchaResult(result)
 				log.Printf("[КАПЧА] Результат от Kotlin принят (request=%q)", result.RequestID)
+			default:
+				log.Printf("[STDIN] Неизвестная команда проигнорирована")
 			}
 		}
 	}()
@@ -293,9 +305,20 @@ func main() {
 	peerAddr := flag.String("peer", "", "адрес:порт VPS сервера")
 	numW := flag.Int("n", 24, "количество воркеров (кратно 9)")
 	checkHashes := flag.Bool("check-hashes", false, "проверить VK-хеши и выйти")
+	configFirstStart := flag.Bool(
+		"config-first-start",
+		false,
+		"дождаться GETCONF перед запуском остальных воркеров единственной группы",
+	)
+	hashFallback := flag.Bool(
+		"hash-fallback",
+		false,
+		"использовать остальные VK-хеши как резерв единственной группы",
+	)
 
 	deviceID := flag.String("device-id", "unknown", "уникальный ID устройства")
 	deviceInfo := flag.String("device-info", "", "JSON с безопасной информацией об устройстве")
+	transportSessionFlag := flag.String("transport-session", "", "поколение текущего запуска транспорта")
 	connPassword := flag.String("password", "", "пароль подключения")
 	captchaMode := flag.String("captcha-mode", "auto", "режим обхода капчи (auto/wv/rjs)")
 	vkCallsPreflight := flag.Bool("vkcalls-preflight", true, "пробовать VKCalls до captcha-цепочки")
@@ -303,6 +326,10 @@ func main() {
 	clientIdsFlag := flag.String("client-ids", "", "ID клиентов VK через запятую")
 
 	flag.Parse()
+	transportSession := normalizeTransportSession(*transportSessionFlag)
+	if transportSession == "" {
+		transportSession = newTransportSession()
+	}
 	activeCaptchaMode := setCaptchaMode(*captchaMode)
 	setVKCallsPreflight(*vkCallsPreflight, *deviceID)
 
@@ -313,8 +340,17 @@ func main() {
 	if *fingerprint != "" {
 		SetActiveFingerprint(*fingerprint)
 	}
+	customClientID := os.Getenv("WDTT_CUSTOM_VK_CLIENT_ID")
+	customClientSecret := os.Getenv("WDTT_CUSTOM_VK_CLIENT_SECRET")
+	_ = os.Unsetenv("WDTT_CUSTOM_VK_CLIENT_ID")
+	_ = os.Unsetenv("WDTT_CUSTOM_VK_CLIENT_SECRET")
 	if *clientIdsFlag != "" {
 		SetActiveClientIds(*clientIdsFlag)
+	}
+	if customClientID != "" || customClientSecret != "" {
+		if err := SetCustomVKCredentials(customClientID, customClientSecret); err != nil {
+			log.Fatalf("[КЛИЕНТ] Некорректные пользовательские реквизиты VK: %v", err)
+		}
 	}
 
 	hashes := ParseHashes(*vkHash)
@@ -365,6 +401,8 @@ func main() {
 		*numW = workersPerGroup
 	}
 	*numW = (*numW / workersPerGroup) * workersPerGroup
+	useConfigFirstStart := *configFirstStart && *numW == workersPerGroup
+	useHashFallback := *hashFallback && *numW == workersPerGroup
 
 	tp := &TurnParams{
 		Host:    *host,
@@ -429,7 +467,7 @@ func main() {
 	log.Printf("[КЛИЕНТ] Протокол: UDP")
 	log.Printf("[КЛИЕНТ] WRAP: %s", wrapStatus)
 	log.Printf("[WRAP] Ключ выведен из пароля, режим RTP AEAD активен")
-	log.Printf("[КЛИЕНТ] Device ID: %s", *deviceID)
+	log.Printf("[КЛИЕНТ] Идентификатор устройства инициализирован")
 	log.Printf("[КЛИЕНТ] Captcha: %s", captchaStatus)
 	log.Println("[КЛИЕНТ] ═══════════════════════════════════════")
 
@@ -516,7 +554,8 @@ func main() {
 		go func(groupID int, isFirstGroup bool, configChan chan<- string, workerIds []int, startHashIndex int, waitR <-chan struct{}, sigR chan<- struct{}) {
 			defer wg.Done()
 			WorkerGroup(ctx, cancel, groupID, startHashIndex, tp, peer, disp, localPort,
-				isFirstGroup, configChan, workerIds, &pauseFlag, *deviceID, *connPassword, *deviceInfo, stats, waitR, sigR)
+				isFirstGroup, configChan, workerIds, *numW, useConfigFirstStart, useHashFallback, &pauseFlag,
+				*deviceID, *connPassword, *deviceInfo, transportSession, stats, waitR, sigR)
 		}(gID, isFirst, cc, ids, g, myWaitReady, mySignalReady)
 	}
 
@@ -524,4 +563,29 @@ func main() {
 	close(configCh)
 	<-configDone
 	log.Println("[КЛИЕНТ] Все воркеры завершены")
+}
+
+func newTransportSession() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return hex.EncodeToString(value[:])
+	}
+	return fmt.Sprintf("fallback-%d-%d", time.Now().UnixNano(), os.Getpid())
+}
+
+func normalizeTransportSession(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) < 16 || len(value) > 64 {
+		return ""
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' {
+			continue
+		}
+		return ""
+	}
+	return value
 }

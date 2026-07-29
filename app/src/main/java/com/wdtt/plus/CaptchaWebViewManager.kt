@@ -384,14 +384,8 @@ object CaptchaWebViewManager {
                             handler: android.webkit.SslErrorHandler,
                             error: android.net.http.SslError
                         ) {
-                            // Разрешаем только для доверенных доменов VK/OK
-                            val url = error.url ?: ""
-                            if (url.contains("vk.ru") || url.contains("vk.com") || url.contains("okcdn.ru")) {
-                                handler.proceed()
-                            } else {
-                                handler.cancel()
-                                Log.w(TAG, "SSL error rejected for: $url")
-                            }
+                            handler.cancel()
+                            Log.w(TAG, "Отклонена страница с ошибкой TLS")
                         }
                     }
 

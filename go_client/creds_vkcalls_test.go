@@ -2,10 +2,33 @@ package main
 
 import (
 	"errors"
+	"net/url"
 	"reflect"
 	"testing"
 	"time"
 )
+
+func TestVKCallsUsesVkRuJoinLink(t *testing.T) {
+	encoded := vkCallsJoinURL("join-code")
+	decoded, err := url.QueryUnescape(encoded)
+	if err != nil {
+		t.Fatalf("decode join URL: %v", err)
+	}
+	if decoded != "https://vk.ru/call/join/join-code" {
+		t.Fatalf("join URL = %q", decoded)
+	}
+}
+
+func TestVKCallsUsesVkMeAPIWithCompatibilityFallback(t *testing.T) {
+	got := vkCallsAPIRequestURLs("/method/test?v=5.276")
+	want := []string{
+		"https://api.vk.me/method/test?v=5.276",
+		"https://api.vk.ru/method/test?v=5.276",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("API URLs = %#v, want %#v", got, want)
+	}
+}
 
 func TestStableVKCallsUUID(t *testing.T) {
 	setVKCallsPreflight(true, "device-a")
@@ -30,7 +53,7 @@ func TestParseVKCallsTURNAddresses(t *testing.T) {
 			},
 		},
 	}
-	want := []string{"1.2.3.4:3478", "turn.example:443"}
+	want := []string{"turn:1.2.3.4:3478?transport=udp", "turns:turn.example:443?transport=tcp"}
 	if got := parseVKCallsTURNAddresses(resp); !reflect.DeepEqual(got, want) {
 		t.Fatalf("addresses = %#v, want %#v", got, want)
 	}
@@ -61,6 +84,62 @@ func TestParseVKCallsFloodError(t *testing.T) {
 	})
 	if !isVKCallsFloodError(err) {
 		t.Fatalf("expected VKCalls flood error, got %v", err)
+	}
+}
+
+func TestParseVKCallsAPIFloodError(t *testing.T) {
+	err := parseVKCallsAPIError(map[string]interface{}{
+		"error": map[string]interface{}{
+			"error_code": float64(29),
+			"error_msg":  "Rate limit reached",
+		},
+	})
+	if !isVKCallsFloodError(err) {
+		t.Fatalf("expected VKCalls flood error, got %v", err)
+	}
+}
+
+func TestParseVKCallsTURNLifetime(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	tests := []struct {
+		name     string
+		response map[string]interface{}
+		username string
+		want     time.Duration
+	}{
+		{
+			name: "lifetime",
+			response: map[string]interface{}{
+				"turn_server": map[string]interface{}{"lifetime": float64(600)},
+			},
+			want: 10 * time.Minute,
+		},
+		{
+			name: "ttl",
+			response: map[string]interface{}{
+				"turn_server": map[string]interface{}{"ttl": "300"},
+			},
+			want: 5 * time.Minute,
+		},
+		{
+			name:     "username expiry",
+			response: map[string]interface{}{"turn_server": map[string]interface{}{}},
+			username: "1700000600:participant",
+			want:     10 * time.Minute,
+		},
+		{
+			name:     "unknown",
+			response: map[string]interface{}{},
+			username: "participant",
+			want:     0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := parseVKCallsTURNLifetime(test.response, test.username, now); got != test.want {
+				t.Fatalf("lifetime = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 

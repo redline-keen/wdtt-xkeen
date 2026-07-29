@@ -3,6 +3,7 @@
 .kotlin/
 build/
 local.properties
+/release-audit
 .env
 .env.*
 !.env.example
@@ -44,13 +45,26 @@ server
 *.p12
 *.pfx
 *.mobileprovision
+*.db
+*.sqlite
+*.sqlite3
+*.kdbx
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+known_hosts
+known_hosts.*
 google-services.json
 service-account*.json
 firebase-service-account*.json
 credentials*.json
 secrets*.json
+.codex-local
 .codex-local/
 AGENTS.md
+docs/*.md
+docs/**/*.md
 
 # ===== IDE =====
 .idea/
@@ -73,3 +87,5 @@ Desktop.ini
 *.rej
 msg.txt
 *.bat
+cmd/wdtt-load
+cmd/wdtt-load/

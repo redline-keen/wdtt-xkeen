@@ -340,8 +340,8 @@ object DeviceCompatibility {
             DeviceCheckItem(
                 title = "WebView",
                 status = "не найден",
-                details = "Автоматическая и ручная captcha через WebView могут не работать.",
-                recommendation = "Проверьте системный Android System WebView или браузер-провайдер WebView.",
+                details = "Быстрый VKCalls может работать без WebView, но автоматическая и ручная капча резервного способа будут недоступны.",
+                recommendation = "Обновите или включите Android System WebView либо браузер-провайдер WebView, чтобы резервное подключение могло пройти капчу.",
                 severity = DeviceCheckSeverity.Warning,
                 firstLaunchRelevant = false,
                 action = DeviceCheckAction.WebViewSettings
@@ -350,7 +350,7 @@ object DeviceCompatibility {
             DeviceCheckItem(
                 title = "WebView",
                 status = webView.packageName,
-                details = "Версия: ${webView.versionName}. WebView доступен для captcha-сценариев.",
+                details = "Версия: ${webView.versionName}. WebView доступен для капчи резервного способа.",
                 severity = DeviceCheckSeverity.Ok,
                 firstLaunchRelevant = false
             )
@@ -395,7 +395,7 @@ object DeviceCompatibility {
             return DeviceCheckItem(
                 title = "Сеть Android",
                 status = "активная сеть не найдена",
-                details = "Приложение запустится, но для VKCalls, TURN и обновлений нужна сеть.",
+                details = "Приложение запустится, но для быстрого VKCalls, TURN и обновлений нужна сеть.",
                 recommendation = "Подключитесь к Wi‑Fi или мобильной сети.",
                 severity = DeviceCheckSeverity.Warning,
                 action = DeviceCheckAction.NetworkSettings
@@ -422,7 +422,7 @@ object DeviceCompatibility {
             DeviceCheckItem(
                 title = "Сеть Android",
                 status = "$transports, интернет подтверждён",
-                details = "Активная сеть выглядит пригодной для проверки VK/TURN.",
+                details = "Android подтвердил общий доступ в интернет. Системный DNS, DNS-путь нативного клиента и служебные узлы VK/OK проверяются отдельными пунктами ниже.",
                 severity = DeviceCheckSeverity.Ok
             )
         }

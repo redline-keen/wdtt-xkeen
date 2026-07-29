@@ -13,6 +13,7 @@ import android.provider.Settings
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.ConcurrentHashMap
 
 private const val UNKNOWN_WIFI_SSID = "<unknown ssid>"
 private const val BACKGROUND_LOCATION_PERMISSION = "android.permission.ACCESS_BACKGROUND_LOCATION"
@@ -22,6 +23,50 @@ data class TrustedWifiRuntimeState(
     val ssid: String = "",
     val status: String = ""
 )
+
+internal data class TrustedWifiResumeRetryPlan(
+    val delayMs: Long,
+    val keepCpuAwake: Boolean
+)
+
+internal fun trustedWifiResumeRetryPlan(retryCount: Int): TrustedWifiResumeRetryPlan =
+    if (retryCount.coerceAtLeast(0) < 12) {
+        TrustedWifiResumeRetryPlan(delayMs = 5_000L, keepCpuAwake = true)
+    } else {
+        TrustedWifiResumeRetryPlan(delayMs = 30_000L, keepCpuAwake = false)
+    }
+
+internal class TrustedWifiValidatedNetworkTracker<T : Any> {
+    private val validatedNetworks = ConcurrentHashMap.newKeySet<T>()
+    private val wifiNetworks = ConcurrentHashMap.newKeySet<T>()
+
+    @Synchronized
+    fun update(network: T, validated: Boolean, wifi: Boolean) {
+        if (validated) validatedNetworks.add(network) else validatedNetworks.remove(network)
+        if (wifi) wifiNetworks.add(network) else wifiNetworks.remove(network)
+    }
+
+    @Synchronized
+    fun lost(network: T) {
+        validatedNetworks.remove(network)
+        wifiNetworks.remove(network)
+    }
+
+    @Synchronized
+    fun forgetWifi() {
+        wifiNetworks.forEach { network -> validatedNetworks.remove(network) }
+        wifiNetworks.clear()
+    }
+
+    @Synchronized
+    fun hasUsableNetwork(): Boolean = validatedNetworks.isNotEmpty()
+
+    @Synchronized
+    fun clear() {
+        validatedNetworks.clear()
+        wifiNetworks.clear()
+    }
+}
 
 object TrustedWifiManager {
     private val _state = MutableStateFlow(TrustedWifiRuntimeState())

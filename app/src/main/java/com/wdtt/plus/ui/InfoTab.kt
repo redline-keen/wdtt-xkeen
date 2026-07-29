@@ -52,11 +52,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Info
@@ -65,13 +68,17 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Update
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableIntState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -94,6 +101,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -104,6 +112,11 @@ import com.wdtt.plus.BuildConfig
 import com.wdtt.plus.DeviceCheckAction
 import com.wdtt.plus.DeviceCompatibility
 import com.wdtt.plus.R
+import com.wdtt.plus.RemoteActionCatalogGateway
+import com.wdtt.plus.RemoteActionForm
+import com.wdtt.plus.RemoteContinuationLauncher
+import com.wdtt.plus.RemoteUiAction
+import com.wdtt.plus.RemoteUiActionLauncher
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.TrustedWifiManager
@@ -114,7 +127,9 @@ import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.AppReleaseInfo
 import com.wdtt.plus.AppUpdateCandidate
 import com.wdtt.plus.AppUpdateDownloadProgress
+import com.wdtt.plus.ClientNetworkDiagnosticsReport
 import com.wdtt.plus.canRequestApkInstall
+import com.wdtt.plus.collectClientNetworkDiagnostics
 import com.wdtt.plus.downloadUpdateApk
 import com.wdtt.plus.fetchLatestReleaseInfo
 import com.wdtt.plus.installUpdateApk
@@ -123,6 +138,7 @@ import com.wdtt.plus.resolveAppUpdateCandidate
 import com.wdtt.plus.selectUpdateApkAsset
 import com.wdtt.plus.deviceCheckActionIntent
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -132,6 +148,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.min
@@ -142,7 +159,7 @@ private const val IssuesUrl = "https://github.com/Ivan4537/WDTT-Plus/issues/new/
 private const val DeveloperProfileUrl = "https://github.com/Ivan4537"
 private const val RepositoryUrl = "https://github.com/Ivan4537/WDTT-Plus"
 private const val ChangelogUrl = "$RepositoryUrl/blob/main/CHANGELOG.md"
-private const val DonateUrl = "https://yoomoney.ru/to/410012216336438"
+private const val ProjectDonateFallbackUrl = "https://yoomoney.ru/to/410012216336438"
 private const val OriginalDonateUrl = "https://yoomoney.ru/to/4100119505530465/"
 private val DonateActionButtonColor = Color(0xFF00AEA5)
 
@@ -221,7 +238,9 @@ private fun openDeviceCheckAction(context: Context, action: DeviceCheckAction) {
 fun InfoTab(
     actionsExpandedState: MutableState<Boolean> = rememberSaveable { mutableStateOf(true) },
     projectExpandedState: MutableState<Boolean> = rememberSaveable { mutableStateOf(true) },
-    scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) }
+    scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) },
+    projectSupportDialogRequest: Int = 0,
+    onProjectSupportDialogRequestConsumed: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -238,12 +257,23 @@ fun InfoTab(
     var updateDownloadStatus by rememberSaveable { mutableStateOf("") }
     var updateDownloadBusy by remember { mutableStateOf(false) }
     var pendingUpdateApkPath by rememberSaveable { mutableStateOf<String?>(null) }
-	var showHelpDialog by remember { mutableStateOf(false) }
-	var showSupportDialog by remember { mutableStateOf(false) }
+    var showHelpDialog by remember { mutableStateOf(false) }
+    var showQuestionDialog by remember { mutableStateOf(false) }
+    var showSupportDialog by remember { mutableStateOf(false) }
+    var pendingActionForm by remember { mutableStateOf<RemoteUiAction?>(null) }
+    var actionCatalog by remember { mutableStateOf(RemoteActionCatalogGateway.cached()) }
+    var questionAction by remember { mutableStateOf<RemoteUiAction?>(null) }
+    var questionActionLoading by remember { mutableStateOf(false) }
     var isCheckingDevice by remember { mutableStateOf(false) }
     var deviceCheckReport by remember { mutableStateOf<com.wdtt.plus.DeviceCompatibilityReport?>(null) }
 	var actionsExpanded by actionsExpandedState
-	var projectExpanded by projectExpandedState
+    var projectExpanded by projectExpandedState
+    LaunchedEffect(projectSupportDialogRequest) {
+        if (projectSupportDialogRequest > 0) {
+            showSupportDialog = true
+            onProjectSupportDialogRequestConsumed()
+        }
+    }
     val updateLatestVersion by settingsStore.updateLatestVersion.collectAsStateWithLifecycle(initialValue = "")
     val updateLastError by settingsStore.updateLastError.collectAsStateWithLifecycle(initialValue = "")
     val updateStatus = remember(isCheckingUpdates, updateLatestVersion, updateLastError, currentVersion) {
@@ -274,6 +304,15 @@ fun InfoTab(
             updateDownloadStatus = "Разрешение на установку из WDTT Plus не выдано."
             Toast.makeText(context, updateDownloadStatus, Toast.LENGTH_LONG).show()
         }
+    }
+
+    LaunchedEffect(Unit) {
+        actionCatalog = RemoteActionCatalogGateway.fetch()
+    }
+    LaunchedEffect(Unit) {
+        questionActionLoading = true
+        questionAction = RemoteActionCatalogGateway.fetchQuestionAction()
+        questionActionLoading = false
     }
 
     fun requestDownloadedUpdateInstall(apkFile: File) {
@@ -317,6 +356,25 @@ fun InfoTab(
         val diagnosticsSummary = withContext(Dispatchers.Default) {
             buildSupportReportSummary(context.applicationContext, settingsStore)
         }
+        val clientNetworkDiagnostics = try {
+            collectClientNetworkDiagnostics(context.applicationContext)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            ClientNetworkDiagnosticsReport(
+                summaryLines = listOf("Активная диагностика сети телефона: не выполнена"),
+                items = listOf(
+                    com.wdtt.plus.DeviceCheckItem(
+                        title = "Активная диагностика сети телефона",
+                        status = "не выполнена",
+                        details = error.message?.take(180) ?: error.javaClass.simpleName,
+                        recommendation = "Повторите проверку устройства при активной сети.",
+                        severity = com.wdtt.plus.DeviceCheckSeverity.Warning,
+                        action = DeviceCheckAction.NetworkSettings
+                    )
+                )
+            )
+        }
         val report = withContext(Dispatchers.Default) {
             DeviceCompatibility.check(
                 context = context.applicationContext,
@@ -325,9 +383,10 @@ fun InfoTab(
             )
         }
         return report.copy(
-            summaryLines = diagnosticsSummary,
+            summaryLines = diagnosticsSummary + clientNetworkDiagnostics.summaryLines,
             items = listOf(versionItem) +
-                report.items.filterNot { it.title == DeviceCompatibility.APP_VERSION_ITEM_TITLE }
+                report.items.filterNot { it.title == DeviceCompatibility.APP_VERSION_ITEM_TITLE } +
+                clientNetworkDiagnostics.items
         )
     }
 
@@ -355,7 +414,9 @@ fun InfoTab(
 		InfoHeroCard(
 			currentVersion = currentVersion,
             releaseDate = releaseDate,
-			onSupportClick = { showSupportDialog = true }
+			onSupportClick = {
+                showSupportDialog = true
+            }
 		)
 
         ExpandableSectionCard(
@@ -384,8 +445,17 @@ fun InfoTab(
         ) {
             WideActionTile(
                 title = "Поднять вопрос",
-                subtitle = "Выбрать шаблон GitHub issue",
-                onClick = { openUrlInBrowser(context, IssuesUrl) },
+                subtitle = "Выбрать подходящий способ обращения",
+                onClick = {
+                    showQuestionDialog = true
+                    if (questionAction == null && !questionActionLoading) {
+                        scope.launch {
+                            questionActionLoading = true
+                            questionAction = RemoteActionCatalogGateway.fetchQuestionAction()
+                            questionActionLoading = false
+                        }
+                    }
+                },
                 icon = {
                     Icon(
                         painter = painterResource(id = R.drawable.ic_github),
@@ -672,12 +742,35 @@ fun InfoTab(
 	}
 
 	if (showHelpDialog) ImportantInfoDialog(onDismiss = { showHelpDialog = false })
+    if (showQuestionDialog) {
+        QuestionDestinationDialog(
+            remoteAction = questionAction,
+            remoteActionLoading = questionActionLoading,
+            onDismiss = { showQuestionDialog = false },
+            onGitHubClick = {
+                showQuestionDialog = false
+                openUrlInBrowser(context, IssuesUrl)
+            },
+            onRemoteActionClick = { action ->
+                showQuestionDialog = false
+                scope.launch {
+                    if (!RemoteUiActionLauncher.open(context, action)) {
+                        Toast.makeText(
+                            context,
+                            "Не удалось открыть страницу. Проверьте браузер.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+            },
+        )
+    }
     deviceCheckReport?.let { report ->
         DeviceCompatibilityDialog(
             report = report,
             title = "Проверка устройства",
-            subtitle = "Расширенная проверка не запускает VPN, но показывает совместимость устройства, настройки Android и статус подключения.",
-            note = "Кнопка «Скопировать отчёт» добавит в буфер версию приложения, Android, ABI, память, сеть, WebView, native-клиент и текущие настройки без секретных значений.",
+            subtitle = "Расширенная проверка не запускает VPN, но безопасно проверяет системный DNS, DNS-путь клиента и доступность узлов VK/OK.",
+            note = "Кнопка «Скопировать отчёт» повторит сетевые пробы и добавит их результат без VK-хешей, паролей, токенов и локальных IP-адресов телефона.",
             onDismiss = { deviceCheckReport = null },
             onCopy = {
                 scope.launch {
@@ -696,18 +789,189 @@ fun InfoTab(
         )
     }
 	if (showSupportDialog) {
-		SupportProjectDialog(
+		AdditionalActionsDialog(
 			onDismiss = { showSupportDialog = false },
-			onDonateModClick = { openUrlInBrowser(context, DonateUrl) },
-			onDonateOriginalClick = { openUrlInBrowser(context, OriginalDonateUrl) }
+            primaryAction = actionCatalog.at("about"),
+            secondaryAction = actionCatalog.at("tunnel"),
+            onActionClick = { action ->
+                if (action.form != null) {
+                    showSupportDialog = false
+                    pendingActionForm = action
+                } else {
+                    showSupportDialog = false
+                    scope.launch {
+                        if (!RemoteUiActionLauncher.open(context, action)) {
+                            Toast.makeText(
+                                context,
+                                "Не удалось открыть страницу. Проверьте браузер.",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    }
+                }
+            },
+            onProjectFallbackClick = {
+                showSupportDialog = false
+                openUrlInBrowser(context, ProjectDonateFallbackUrl)
+            },
+			onDonateOriginalClick = {
+                showSupportDialog = false
+                openUrlInBrowser(context, OriginalDonateUrl)
+            }
 		)
 	}
+    pendingActionForm?.form?.let { form ->
+        RemoteActionFormDialog(
+            form = form,
+            onDismiss = {
+                pendingActionForm = null
+                showSupportDialog = true
+            },
+            onComplete = {
+                pendingActionForm = null
+                showSupportDialog = true
+            },
+            onFallbackClick = {
+                openUrlInBrowser(context, ProjectDonateFallbackUrl)
+                pendingActionForm = null
+                showSupportDialog = true
+            },
+        )
+    }
 }
 
 @Composable
-private fun SupportProjectDialog(
+private fun QuestionDestinationDialog(
+    remoteAction: RemoteUiAction?,
+    remoteActionLoading: Boolean,
+    onDismiss: () -> Unit,
+    onGitHubClick: () -> Unit,
+    onRemoteActionClick: (RemoteUiAction) -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize().padding(20.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 8.dp,
+                shadowElevation = 18.dp,
+                modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp),
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(18.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                        ) {
+                            Box(
+                                modifier = Modifier.size(42.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.HelpOutline,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(21.dp),
+                                )
+                            }
+                        }
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                "Поднять вопрос",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                "Выберите подходящий вариант обращения.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        FilledTonalIconButton(onClick = onDismiss) {
+                            Icon(Icons.Default.Close, contentDescription = null)
+                        }
+                    }
+
+                    WideActionTile(
+                        title = "Проблема в приложении",
+                        subtitle = "Открыть шаблоны обращений GitHub",
+                        onClick = onGitHubClick,
+                        icon = {
+                            Icon(
+                                painter = painterResource(id = R.drawable.ic_github),
+                                contentDescription = null,
+                                modifier = Modifier.size(20.dp),
+                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                        },
+                    )
+
+                    remoteAction?.let { action ->
+                        WideActionTile(
+                            title = action.label,
+                            subtitle = action.message,
+                            onClick = { onRemoteActionClick(action) },
+                            icon = {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.HelpOutline,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(20.dp),
+                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                )
+                            },
+                        )
+                    }
+                    if (remoteAction == null && remoteActionLoading) {
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.62f),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 18.dp, vertical = 16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                                Text(
+                                    "Проверяем доступные способы помощи…",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AdditionalActionsDialog(
 	onDismiss: () -> Unit,
-	onDonateModClick: () -> Unit,
+    primaryAction: RemoteUiAction?,
+    secondaryAction: RemoteUiAction?,
+    onActionClick: (RemoteUiAction) -> Unit,
+    onProjectFallbackClick: () -> Unit,
 	onDonateOriginalClick: () -> Unit
 ) {
 	Dialog(
@@ -766,15 +1030,35 @@ private fun SupportProjectDialog(
 						}
 					}
 
-					SupportDonateBlock(
-						title = "WDTT Plus",
-						body = "Поддержка этой версии помогает развивать доработки приложения, серверной части, Telegram-бота и удобство для пользователей.",
-						buttonText = "ЮMoney",
-						onClick = onDonateModClick,
-						emphasized = true
-					)
+                    if (primaryAction?.form != null) {
+                        ExternalSupportBlock(
+                            title = primaryAction.title,
+                            body = primaryAction.message,
+                            buttonText = primaryAction.label,
+                            onClick = { onActionClick(primaryAction) },
+                            emphasized = true,
+                        )
+                    } else {
+                        ExternalSupportBlock(
+                            title = "WDTT Plus",
+                            body = (
+                                "Поддержка помогает развивать приложение, серверную "
+                                    + "часть и Telegram-бота."
+                                ),
+                            buttonText = "ЮMoney",
+                            onClick = onProjectFallbackClick,
+                            emphasized = true,
+                        )
+                    }
 
-					SupportDonateBlock(
+                    secondaryAction?.let { action ->
+                        RemoteInfoActionBlock(
+                            action = action,
+                            onClick = { onActionClick(action) },
+                        )
+                    }
+
+					ExternalSupportBlock(
 						title = "Автор оригинального приложения",
 						body = "Оригинальная основа проекта создана amurcanov. Можно отдельно поддержать автора исходного приложения.",
 						buttonText = "ЮMoney",
@@ -789,7 +1073,285 @@ private fun SupportProjectDialog(
 }
 
 @Composable
-private fun SupportDonateBlock(
+private fun RemoteActionFormDialog(
+    form: RemoteActionForm,
+    onDismiss: () -> Unit,
+    onComplete: () -> Unit,
+    onFallbackClick: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var valueText by rememberSaveable(form.token) { mutableStateOf(form.initialValue) }
+    var requestId by rememberSaveable(form.token) { mutableStateOf(UUID.randomUUID().toString()) }
+    var busy by remember(form.token) { mutableStateOf(false) }
+    var errorMessage by remember(form.token) { mutableStateOf("") }
+    var fallbackAvailable by remember(form.token) { mutableStateOf(false) }
+    val numericValue = valueText.toLongOrNull()
+    val valueValid = numericValue != null && numericValue in form.minimum..form.maximum
+
+    fun selectValue(value: String) {
+        valueText = value
+        requestId = UUID.randomUUID().toString()
+        errorMessage = ""
+        fallbackAvailable = false
+    }
+
+    Dialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 8.dp,
+            shadowElevation = 18.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(18.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                    ) {
+                        Box(Modifier.size(42.dp), contentAlignment = Alignment.Center) {
+                            Icon(
+                                Icons.Default.Favorite,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+                    Text(
+                        form.title,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    FilledTonalIconButton(
+                        onClick = onDismiss,
+                        enabled = !busy,
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                    }
+                }
+
+                Text(
+                    form.message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    lineHeight = 20.sp,
+                )
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    form.choices.chunked(2).forEach { rowChoices ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            rowChoices.forEach { choice ->
+                                OutlinedButton(
+                                    onClick = { selectValue(choice.value) },
+                                    enabled = !busy,
+                                    modifier = Modifier.weight(1f),
+                                    colors = if (valueText == choice.value) {
+                                        ButtonDefaults.outlinedButtonColors(
+                                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        )
+                                    } else {
+                                        ButtonDefaults.outlinedButtonColors()
+                                    },
+                                ) {
+                                    Text(choice.label, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                            if (rowChoices.size == 1) {
+                                Spacer(Modifier.weight(1f))
+                            }
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = valueText,
+                    onValueChange = { raw ->
+                        selectValue(raw.filter(Char::isDigit).take(form.maxCharacters))
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text(form.inputLabel) },
+                    suffix = {
+                        if (form.inputSuffix.isNotBlank()) {
+                            Text(form.inputSuffix)
+                        }
+                    },
+                    singleLine = true,
+                    isError = valueText.isNotEmpty() && !valueValid,
+                    supportingText = {
+                        Text(
+                            if (valueValid || valueText.isEmpty()) {
+                                form.supportingText
+                            } else {
+                                form.invalidText
+                            }
+                        )
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    shape = RoundedCornerShape(16.dp),
+                )
+
+                if (errorMessage.isNotBlank()) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.64f),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text(
+                            errorMessage,
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+
+                Button(
+                    onClick = {
+                        if (!valueValid) return@Button
+                        busy = true
+                        errorMessage = ""
+                        fallbackAvailable = false
+                        scope.launch {
+                            runCatching {
+                                RemoteActionCatalogGateway.execute(
+                                    form = form,
+                                    requestId = requestId,
+                                    value = valueText,
+                                )
+                            }.onSuccess { target ->
+                                RemoteContinuationLauncher.launch(context, target)
+                                onComplete()
+                            }.onFailure { error ->
+                                errorMessage = error.message ?: form.failureMessage
+                                fallbackAvailable = true
+                            }
+                            busy = false
+                        }
+                    },
+                    enabled = valueValid && !busy,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
+                    shape = RoundedCornerShape(17.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = DonateActionButtonColor,
+                        contentColor = Color.White,
+                    ),
+                ) {
+                    if (busy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = Color.White,
+                        )
+                        Spacer(Modifier.width(9.dp))
+                        Text(form.busyLabel, fontWeight = FontWeight.Bold)
+                    } else {
+                        Text(
+                            form.submitLabel.replace("{value}", valueText),
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+
+                if (fallbackAvailable) {
+                    OutlinedButton(
+                        onClick = onFallbackClick,
+                        enabled = !busy,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp),
+                        shape = RoundedCornerShape(16.dp),
+                    ) {
+                        Text(form.fallbackLabel, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.width(6.dp))
+                        Icon(
+                            Icons.AutoMirrored.Filled.OpenInNew,
+                            contentDescription = null,
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteInfoActionBlock(
+    action: RemoteUiAction,
+	onClick: () -> Unit,
+) {
+	Surface(
+		shape = RoundedCornerShape(18.dp),
+		color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.48f),
+		contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+		border = BorderStroke(
+			1.dp,
+			MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
+		)
+	) {
+		Column(
+			modifier = Modifier.fillMaxWidth().padding(14.dp),
+			verticalArrangement = Arrangement.spacedBy(9.dp)
+		) {
+			Row(
+				modifier = Modifier.fillMaxWidth(),
+				verticalAlignment = Alignment.CenterVertically,
+				horizontalArrangement = Arrangement.spacedBy(9.dp)
+			) {
+				Icon(Icons.Default.Cloud, contentDescription = null, modifier = Modifier.size(21.dp))
+				Text(
+					action.title,
+					modifier = Modifier.weight(1f),
+					style = MaterialTheme.typography.titleSmall,
+					fontWeight = FontWeight.SemiBold
+				)
+			}
+			Text(
+				action.message,
+				style = MaterialTheme.typography.bodySmall,
+				color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.86f),
+				lineHeight = 18.sp
+			)
+			OutlinedButton(
+				onClick = onClick,
+				modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+				shape = RoundedCornerShape(14.dp),
+				contentPadding = PaddingValues(horizontal = 10.dp, vertical = 7.dp)
+			) {
+				Text(action.label, fontWeight = FontWeight.SemiBold)
+				Spacer(Modifier.width(6.dp))
+				Icon(
+					Icons.AutoMirrored.Filled.OpenInNew,
+					contentDescription = null,
+					modifier = Modifier.size(17.dp)
+				)
+			}
+		}
+	}
+}
+
+@Composable
+private fun ExternalSupportBlock(
 	title: String,
 	body: String,
 	buttonText: String,
@@ -834,7 +1396,11 @@ private fun SupportDonateBlock(
 				onClick = onClick,
 				shape = RoundedCornerShape(18.dp),
 				colors = ButtonDefaults.buttonColors(
-					containerColor = if (emphasized) DonateActionButtonColor else MaterialTheme.colorScheme.primary,
+					containerColor = if (emphasized) {
+                        DonateActionButtonColor
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
 					contentColor = Color.White
 				),
 				modifier = Modifier
@@ -1428,6 +1994,11 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
         .coerceAtMost(4)
     val hasSecondaryHash = runCatching { settingsStore.secondaryVkHash.first().isNotBlank() }.getOrNull()
     val vkCallsEnabled = runCatching { settingsStore.vkCallsPreflight.first() }.getOrNull()
+    val customVkCredentialsEnabled = runCatching { settingsStore.customVkCredentialsEnabled.first() }.getOrNull()
+    val customVkCredentialsComplete = runCatching { settingsStore.customVkCredentialsComplete.first() }.getOrNull()
+    val builtInVkClientCount = runCatching {
+        settingsStore.activeClientIds.first().split(',').count { it.trim().isNotEmpty() }
+    }.getOrNull()
     val captchaMode = runCatching { settingsStore.captchaMode.first() }.getOrNull()
     val fingerprint = runCatching { settingsStore.selectedFingerprint.first() }.getOrNull()
     val linkMode = runCatching { settingsStore.wdttLinkMode.first() }.getOrNull()
@@ -1447,7 +2018,9 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
     } else {
         "не требуется"
     }
-    val tunnelIssue = TunnelManager.connectionIssue.value?.title.orEmpty().ifBlank { "нет" }
+    val tunnelIssue = TunnelManager.connectionIssue.value?.let { issue ->
+        "${issue.title}: ${issue.action}"
+    }.orEmpty().ifBlank { "нет" }
 
     return buildString {
         appendLine("Версия приложения: ${BuildConfig.VERSION_NAME}")
@@ -1498,8 +2071,12 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
         appendLine("Профиль: ${activeProfile ?: "недоступно"}")
         appendLine("Потоки: ${workers ?: "недоступно"}")
         appendLine("VK-хеши: заполнено $hashCount, запасной=${hasSecondaryHash ?: "недоступно"}")
-        appendLine("VKCalls: ${vkCallsEnabled ?: "недоступно"}")
-        appendLine("Captcha mode: ${captchaMode ?: "недоступно"}")
+        appendLine("Быстрый VKCalls: ${vkCallsEnabled ?: "недоступно"}")
+        appendLine(
+            "Резерв VK: собственные=${customVkCredentialsEnabled ?: "недоступно"}, " +
+                "заполнены=${customVkCredentialsComplete ?: "недоступно"}, встроенных=${builtInVkClientCount ?: "недоступно"}"
+        )
+        appendLine("Captcha mode (legacy): ${captchaMode ?: "недоступно"}")
         appendLine("TLS fingerprint: ${fingerprint ?: "недоступно"}")
         appendLine("Режим ссылки: ${linkMode ?: "недоступно"}")
         appendLine("Роль интерфейса: ${interfaceRole?.ifBlank { "не выбрана" } ?: "недоступно"}")

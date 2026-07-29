@@ -1,5 +1,6 @@
 package com.wdtt.plus
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.Intent
 import android.graphics.drawable.Icon
@@ -33,9 +34,19 @@ class QuickToggleTileService : TileService() {
                     TunnelManager.running,
                     TrustedWifiManager.state,
                     settingsStore.activeProfile,
-                    settingsStore.profileNames
-                ) { running, trustedWifi, activeProfile, profileNames ->
-                    TileUiState(running, trustedWifi, activeProfile, profileNames)
+                    TunnelManager.activeTunnelProfile,
+                    settingsStore.profileNames,
+                ) { running, trustedWifi, selectedProfile, activeTunnelProfile, profileNames ->
+                    TileUiState(
+                        running,
+                        trustedWifi,
+                        selectedProfile,
+                        activeTunnelProfile,
+                        profileNames,
+                        AccessLifecycleUiState.Unmanaged,
+                    )
+                }.combine(settingsStore.activeAccessLifecycle) { state, accessLifecycle ->
+                    state.copy(accessLifecycle = accessLifecycle)
                 }.collect { uiState ->
                     updateTile(uiState)
                 }
@@ -53,39 +64,53 @@ class QuickToggleTileService : TileService() {
     override fun onClick() {
         super.onClick()
         runCatching {
-            if (TunnelManager.running.value || TrustedWifiManager.state.value.waiting) {
-                // Если запущен — останавливаем. Состояние плитки изменится автоматически,
-                // когда TunnelManager остановит процессы и обновит статус running в false.
-                val stopIntent = Intent(this, TunnelService::class.java).apply { action = "STOP" }
-                startService(stopIntent)
-                return
-            }
+            when (
+                tunnelToggleAction(
+                    running = TunnelManager.running.value,
+                    trustedWifiWaiting = TrustedWifiManager.state.value.waiting,
+                    vpnPermissionRequired = VpnService.prepare(this) != null,
+                )
+            ) {
+                TunnelToggleAction.STOP -> {
+                    // Состояние плитки изменится после фактической остановки службы.
+                    startService(
+                        Intent(this, TunnelService::class.java).apply { action = "STOP" }
+                    )
+                }
+                TunnelToggleAction.REQUEST_VPN_PERMISSION -> {
+                    Toast.makeText(
+                        this,
+                        "Откройте WDTT Plus и выдайте VPN-разрешение",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    openMainActivity()
+                }
+                TunnelToggleAction.START -> scope.launch {
+                    try {
+                        val intent = buildTunnelStartIntentFromSettings(this@QuickToggleTileService)
+                        if (intent == null) {
+                            Toast.makeText(
+                                this@QuickToggleTileService,
+                                "Заполните настройки подключения в WDTT Plus",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            openMainActivity()
+                            return@launch
+                        }
 
-            // Проверяем наличие выданного разрешения VPN перед стартом
-            if (VpnService.prepare(this) != null) {
-                Toast.makeText(this, "Откройте WDTT Plus и выдайте VPN-разрешение", Toast.LENGTH_LONG).show()
-                openMainActivity()
-                return
-            }
-
-            // Запускаем старт туннеля в фоне
-            scope.launch {
-                try {
-                    val intent = buildTunnelStartIntentFromSettings(this@QuickToggleTileService)
-                    if (intent == null) {
-                        Toast.makeText(this@QuickToggleTileService, "Заполните настройки подключения в WDTT Plus", Toast.LENGTH_LONG).show()
-                        openMainActivity()
-                        return@launch
+                        if (Build.VERSION.SDK_INT >= 26) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                    } catch (e: Exception) {
+                        Log.e("QuickToggleTile", "Failed to start tunnel via QS tile", e)
+                        Toast.makeText(
+                            this@QuickToggleTileService,
+                            "Ошибка запуска: ${e.localizedMessage}",
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
-
-                    if (Build.VERSION.SDK_INT >= 26) {
-                        startForegroundService(intent)
-                    } else {
-                        startService(intent)
-                    }
-                } catch (e: Exception) {
-                    Log.e("QuickToggleTile", "Failed to start tunnel via QS tile", e)
-                    Toast.makeText(this@QuickToggleTileService, "Ошибка запуска: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
                 }
             }
         }.onFailure { e ->
@@ -102,12 +127,21 @@ class QuickToggleTileService : TileService() {
         runCatching {
             val running = uiState.running
             val waiting = uiState.trustedWifi.waiting
-            val activeProfile = uiState.activeProfile
             val profileNames = uiState.profileNames
-            val profile = activeProfile.coerceIn(0, 2)
+            val profile = displayedTunnelProfile(
+                selectedProfile = uiState.selectedProfile,
+                activeTunnelProfile = uiState.activeTunnelProfile,
+                running = running,
+                trustedWifiWaiting = waiting,
+            )
             val profileLabel = vpnProfileDisplayName(profile, profileNames)
             val defaultProfileLabel = vpnProfileDefaultName(profile)
             val profileIsDefault = profileLabel == defaultProfileLabel
+            val accessBlocked =
+                uiState.accessLifecycle.managed &&
+                    !uiState.accessLifecycle.allowConnect &&
+                    !running &&
+                    !waiting
             qsTile?.apply {
                 label = when {
                     waiting -> "Ожидание"
@@ -121,6 +155,8 @@ class QuickToggleTileService : TileService() {
                     subtitle = when {
                         waiting -> uiState.trustedWifi.ssid.ifBlank { "Wi-Fi" }
                         running -> ""
+                        accessBlocked -> uiState.accessLifecycle.title
+                            .ifBlank { uiState.accessLifecycle.fallbackTitle() }
                         else -> "Отключено"
                     }
                 }
@@ -134,10 +170,13 @@ class QuickToggleTileService : TileService() {
     private data class TileUiState(
         val running: Boolean,
         val trustedWifi: TrustedWifiRuntimeState,
-        val activeProfile: Int,
-        val profileNames: List<String>
+        val selectedProfile: Int,
+        val activeTunnelProfile: Int?,
+        val profileNames: List<String>,
+        val accessLifecycle: AccessLifecycleUiState,
     )
 
+    @SuppressLint("StartActivityAndCollapseDeprecated")
     private fun openMainActivity() {
         runCatching {
             val intent = Intent(this, MainActivity::class.java).apply {

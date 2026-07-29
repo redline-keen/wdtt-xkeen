@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestClassifyTerminalVKJoinError(t *testing.T) {
 	tests := []struct {
@@ -51,5 +54,28 @@ func TestClassifyTerminalVKJoinErrorIgnoresTransient(t *testing.T) {
 	})
 	if got != nil {
 		t.Fatalf("unexpected terminal error: %v", got)
+	}
+}
+
+func TestClassifyHashCheckErrorKeepsTerminalAndTransientStatusesSeparate(t *testing.T) {
+	tests := []struct {
+		errText string
+		status  string
+	}{
+		{errText: "INVALID_JOIN_LINK: VK API error_code:9008", status: "dead"},
+		{errText: "ANON_BLOCKED: anonymous join is disabled", status: "blocked"},
+		{errText: "CALL_FULL: call is full", status: "full"},
+		{errText: "vchat.joinConversationByLink: participant.check.flood", status: "limited"},
+		{errText: "vchat.joinConversationByLink: VK HTTPS api.vk.me: timeout", status: "network"},
+		{errText: "vchat.joinConversationByLink: unexpected response", status: "error"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.status+"_"+test.errText[:4], func(t *testing.T) {
+			status, _ := classifyHashCheckError(errors.New(test.errText))
+			if status != test.status {
+				t.Fatalf("status = %q, want %q", status, test.status)
+			}
+		})
 	}
 }

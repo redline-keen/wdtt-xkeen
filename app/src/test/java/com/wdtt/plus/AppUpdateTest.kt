@@ -3,6 +3,7 @@ package com.wdtt.plus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -87,6 +88,44 @@ class AppUpdateTest {
                 lastCheckAt = now - FOREGROUND_UPDATE_CHECK_MIN_INTERVAL_MS,
                 now = now
             )
+        )
+    }
+
+    @Test
+    fun updateAssetRequiresOfficialUrlSizeAndDigest() {
+        val safe = AppReleaseAsset(
+            name = "WDTT-Plus-v12-universal-release.apk",
+            downloadUrl = (
+                "https://github.com/Ivan4537/WDTT-Plus/releases/download/" +
+                    "v12/WDTT-Plus-v12-universal-release.apk"
+                ),
+            sizeBytes = 42L,
+            digest = "sha256:${"a".repeat(64)}",
+        )
+        val release = AppReleaseInfo(
+            versionTag = "v12",
+            releaseUrl = "https://github.com/Ivan4537/WDTT-Plus/releases/tag/v12",
+            source = RemoteVersionSource.Release,
+            assets = listOf(safe),
+        )
+
+        assertEquals(safe, selectUpdateApkAsset(release))
+        assertNull(
+            selectUpdateApkAsset(
+                release.copy(assets = listOf(safe.copy(digest = ""))),
+            ),
+        )
+        assertFalse(
+            isTrustedUpdateDownloadUrl(
+                "https://github.com/other/project/releases/download/v12/app.apk",
+                initialRequest = true,
+            ),
+        )
+        assertTrue(
+            isTrustedUpdateDownloadUrl(
+                "https://release-assets.githubusercontent.com/opaque",
+                initialRequest = false,
+            ),
         )
     }
 

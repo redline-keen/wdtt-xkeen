@@ -44,6 +44,7 @@ import (
 )
 
 const (
+	wdttServerVersion     = "12"
 	wgIfaceName           = "wdtt0"
 	wgServerAddr          = "10.66.66.1"
 	wgServerCIDR          = wgServerAddr + "/24"
@@ -54,6 +55,15 @@ const (
 	dtlsKeepaliveByte     = 0xFF
 	dtlsClientIdleTimeout = 90 * time.Second
 )
+
+func deviceLogRef(deviceID string) string {
+	clean := strings.TrimSpace(deviceID)
+	if clean == "" {
+		return "unknown"
+	}
+	sum := sha256.Sum256([]byte(clean))
+	return hex.EncodeToString(sum[:6])
+}
 
 // ==================== База данных ====================
 
@@ -78,16 +88,24 @@ type ClientDevice struct {
 }
 
 type PasswordEntry struct {
-	DeviceID      string             `json:"device_id"`  // пусто = ещё не привязан
-	ExpiresAt     int64              `json:"expires_at"` // unix timestamp
-	DownBytes     int64              `json:"down_bytes"` // скачано клиентом
-	UpBytes       int64              `json:"up_bytes"`   // отдано клиентом
-	Traffic       []TrafficBucket    `json:"traffic,omitempty"`
-	Label         string             `json:"label,omitempty"`
-	VkHash        string             `json:"vk_hash,omitempty"`
-	Ports         string             `json:"ports,omitempty"` // "dtls,wg,tun"
-	IsDeactivated bool               `json:"is_deactivated,omitempty"`
-	BindHistory   []BindHistoryEntry `json:"bind_history,omitempty"`
+	DeviceID       string                   `json:"device_id"`  // пусто = ещё не привязан
+	ExpiresAt      int64                    `json:"expires_at"` // unix timestamp
+	PurgeAfter     int64                    `json:"purge_after,omitempty"`
+	DownBytes      int64                    `json:"down_bytes"` // скачано клиентом
+	UpBytes        int64                    `json:"up_bytes"`   // отдано клиентом
+	Traffic        []TrafficBucket          `json:"traffic,omitempty"`
+	TrafficImports map[string]TrafficImport `json:"traffic_imports,omitempty"`
+	Label          string                   `json:"label,omitempty"`
+	VkHash         string                   `json:"vk_hash,omitempty"`
+	Ports          string                   `json:"ports,omitempty"` // "dtls,wg,tun"
+	IsDeactivated  bool                     `json:"is_deactivated,omitempty"`
+	BindHistory    []BindHistoryEntry       `json:"bind_history,omitempty"`
+}
+
+type TrafficImport struct {
+	DownBytes int64 `json:"down_bytes"`
+	UpBytes   int64 `json:"up_bytes"`
+	AppliedAt int64 `json:"applied_at"`
 }
 
 type AdminProfileEntry struct {
@@ -279,8 +297,8 @@ func stripVkUrl(url string) string {
 }
 
 type wrapKeyEntry struct {
-	id  string
-	key []byte
+	identity accessIdentity
+	key      []byte
 }
 
 type wrapKeyStore struct {
@@ -329,7 +347,10 @@ func (s *wrapKeyStore) SetPasswords(mainPassword string, generated []string) err
 		if err != nil {
 			return err
 		}
-		next = append(next, wrapKeyEntry{id: "main", key: key})
+		next = append(next, wrapKeyEntry{
+			identity: accessIdentity{id: "main", password: mainPassword, isMain: true},
+			key:      key,
+		})
 		seen["main"] = struct{}{}
 	}
 
@@ -348,7 +369,10 @@ func (s *wrapKeyStore) SetPasswords(mainPassword string, generated []string) err
 			}
 			return err
 		}
-		next = append(next, wrapKeyEntry{id: id, key: key})
+		next = append(next, wrapKeyEntry{
+			identity: accessIdentity{id: id, password: password},
+			key:      key,
+		})
 		seen[id] = struct{}{}
 	}
 
@@ -373,12 +397,15 @@ func (s *wrapKeyStore) AddPassword(password string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, entry := range s.entries {
-		if entry.id == id {
+		if entry.identity.id == id {
 			zeroBytes(key)
 			return nil
 		}
 	}
-	s.entries = append(s.entries, wrapKeyEntry{id: id, key: key})
+	s.entries = append(s.entries, wrapKeyEntry{
+		identity: accessIdentity{id: id, password: password},
+		key:      key,
+	})
 	return nil
 }
 
@@ -388,7 +415,7 @@ func (s *wrapKeyStore) RemovePassword(password string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, entry := range s.entries {
-		if entry.id != id {
+		if entry.identity.id != id {
 			continue
 		}
 		aeadCache.Delete(string(entry.key))
@@ -406,29 +433,29 @@ func (s *wrapKeyStore) Count() int {
 	return len(s.entries)
 }
 
-func (s *wrapKeyStore) Unwrap(raw, dst []byte) ([]byte, int, error) {
+func (s *wrapKeyStore) Unwrap(raw, dst []byte) ([]byte, accessIdentity, int, error) {
 	if !obfsIsRTPPacket(raw) {
-		return nil, 0, errors.New("wrap: non-obfs packet")
+		return nil, accessIdentity{}, 0, errors.New("wrap: non-obfs packet")
 	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if len(s.entries) == 0 {
-		return nil, 0, errors.New("wrap: no active keys")
+		return nil, accessIdentity{}, 0, errors.New("wrap: no active keys")
 	}
 	for _, entry := range s.entries {
 		m, err := obfsUnwrapPacket(entry.key, raw, dst)
 		if err == nil {
-			return append([]byte(nil), entry.key...), m, nil
+			return append([]byte(nil), entry.key...), entry.identity, m, nil
 		}
 	}
-	return nil, 0, errors.New("wrap: auth failed")
+	return nil, accessIdentity{}, 0, errors.New("wrap: auth failed")
 }
 
 func refreshWrapKeysFromDBLocked() error {
 	passwords := make([]string, 0, len(db.Passwords))
 	for password, entry := range db.Passwords {
-		if !isPasswordExpired(entry) && entry != nil && !entry.IsDeactivated {
+		if entry != nil && !entry.IsDeactivated && !isPasswordPurgeable(entry) {
 			passwords = append(passwords, password)
 		}
 	}
@@ -534,13 +561,61 @@ func saveDB() {
 }
 
 func isPasswordExpired(entry *PasswordEntry) bool {
+	return isPasswordExpiredAt(entry, time.Now().Unix())
+}
+
+func isPasswordExpiredAt(entry *PasswordEntry, nowUnix int64) bool {
 	if entry == nil {
 		return true
 	}
 	if entry.ExpiresAt == 0 {
 		return false // бессрочный
 	}
-	return time.Now().Unix() > entry.ExpiresAt
+	return nowUnix >= entry.ExpiresAt
+}
+
+func passwordPurgeDeadline(entry *PasswordEntry) int64 {
+	if entry == nil || entry.ExpiresAt == 0 {
+		return 0
+	}
+	if entry.PurgeAfter > entry.ExpiresAt {
+		return entry.PurgeAfter
+	}
+	return entry.ExpiresAt
+}
+
+func isPasswordRetainedExpiredAt(entry *PasswordEntry, nowUnix int64) bool {
+	return isPasswordExpiredAt(entry, nowUnix) && !isPasswordPurgeableAt(entry, nowUnix)
+}
+
+func isPasswordPurgeable(entry *PasswordEntry) bool {
+	return isPasswordPurgeableAt(entry, time.Now().Unix())
+}
+
+func isPasswordPurgeableAt(entry *PasswordEntry, nowUnix int64) bool {
+	if entry == nil {
+		return true
+	}
+	if entry.ExpiresAt < 0 {
+		return true
+	}
+	deadline := passwordPurgeDeadline(entry)
+	return deadline > 0 && nowUnix >= deadline
+}
+
+func setPasswordExpiryPreservingRetention(entry *PasswordEntry, expiresAt int64) {
+	if entry == nil {
+		return
+	}
+	retentionDuration := entry.PurgeAfter - entry.ExpiresAt
+	entry.ExpiresAt = expiresAt
+	entry.PurgeAfter = 0
+	if expiresAt > 0 && retentionDuration > 0 {
+		purgeAfter := expiresAt + retentionDuration
+		if purgeAfter >= expiresAt {
+			entry.PurgeAfter = purgeAfter
+		}
+	}
 }
 
 func getNextIP() string {
@@ -557,7 +632,7 @@ func getNextIP() string {
 	return ""
 }
 
-func removePeerFromWG(wgDev *device.Device, dev *ClientDevice) {
+func removePeerFromWG(wgDev wgDevice, dev *ClientDevice) {
 	if wgDev == nil || dev == nil || dev.PubKey == "" {
 		return
 	}
@@ -568,7 +643,7 @@ func removePeerFromWG(wgDev *device.Device, dev *ClientDevice) {
 	wgDev.IpcSet(fmt.Sprintf("public_key=%s\nremove=true\n", pubHex))
 }
 
-func upsertPeerInWG(wgDev *device.Device, dev *ClientDevice) {
+func upsertPeerInWG(wgDev wgDevice, dev *ClientDevice) {
 	if wgDev == nil || dev == nil || dev.PubKey == "" || dev.IP == "" {
 		return
 	}
@@ -579,28 +654,55 @@ func upsertPeerInWG(wgDev *device.Device, dev *ClientDevice) {
 	wgDev.IpcSet(fmt.Sprintf("public_key=%s\nallowed_ip=%s/32\n", pubHex, dev.IP))
 }
 
-func cleanupExpiredPasswordsLocked(wgDev *device.Device) int {
+func cleanupExpiredPasswordsLocked(wgDev wgDevice) int {
+	return cleanupExpiredPasswordsLockedAt(wgDev, time.Now().Unix())
+}
+
+func cleanupExpiredPasswordsLockedAt(wgDev wgDevice, nowUnix int64) int {
 	removed := 0
-	nowUnix := time.Now().Unix()
 	adminDevices := adminDeviceIDSet(db)
+	deviceCandidates := make(map[string]struct{})
 	for p, entry := range db.Passwords {
-		if isPasswordExpired(entry) {
+		if isPasswordPurgeableAt(entry, nowUnix) {
 			if entry != nil && entry.DeviceID != "" {
 				markActiveBindUnbound(entry, entry.DeviceID, nowUnix)
-				if _, isAdminDevice := adminDevices[entry.DeviceID]; !isAdminDevice {
-					removePeerFromWG(wgDev, db.Devices[entry.DeviceID])
-					delete(db.Devices, entry.DeviceID)
-				}
+				deviceCandidates[entry.DeviceID] = struct{}{}
 			}
 			delete(db.Passwords, p)
 			serverWrapKeys.RemovePassword(p)
 			removed++
 		}
 	}
+	for deviceID := range deviceCandidates {
+		if _, isAdminDevice := adminDevices[deviceID]; isAdminDevice || databaseUsesDeviceID(db, deviceID) {
+			continue
+		}
+		removePeerFromWG(wgDev, db.Devices[deviceID])
+		delete(db.Devices, deviceID)
+	}
 	return removed
 }
 
-func cleanupExpiredPasswords(wgDev *device.Device) int {
+func databaseUsesDeviceID(loaded *Database, deviceID string) bool {
+	return databaseUsesDeviceIDExcept(loaded, deviceID, "")
+}
+
+func databaseUsesDeviceIDExcept(loaded *Database, deviceID, excludedPassword string) bool {
+	if loaded == nil || deviceID == "" {
+		return false
+	}
+	for password, entry := range loaded.Passwords {
+		if excludedPassword != "" && password == excludedPassword {
+			continue
+		}
+		if entry != nil && entry.DeviceID == deviceID {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanupExpiredPasswords(wgDev wgDevice) int {
 	dbMutex.Lock()
 	defer dbMutex.Unlock()
 	removed := cleanupExpiredPasswordsLocked(wgDev)
@@ -773,8 +875,8 @@ func markActiveBindUnbound(entry *PasswordEntry, deviceID string, ts int64) {
 	}
 }
 
-func expiredPasswordJanitor(ctx context.Context, wgDev *device.Device) {
-	ticker := time.NewTicker(1 * time.Hour)
+func expiredPasswordJanitor(ctx context.Context, wgDev wgDevice) {
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
@@ -788,7 +890,7 @@ func expiredPasswordJanitor(ctx context.Context, wgDev *device.Device) {
 	}
 }
 
-func syncPersistedPeersToWG(_ *device.Device) {
+func syncPersistedPeersToWG(_ wgDevice) {
 	dbMutex.Lock()
 	defer dbMutex.Unlock()
 	count := 0
@@ -817,24 +919,27 @@ func putBuf(b *[]byte) { bufPool.Put(b) }
 // ==================== Оптимизация ====================
 
 func enableBBR() {
-	log.Println("[SYS] Оптимизация TCP...")
+	log.Println("[SYS] Оптимизация сетевого стека...")
 	out, _ := runCmd("bash", "-c", "sysctl net.ipv4.tcp_congestion_control")
-	if strings.Contains(out, "bbr") {
-		log.Println("[SYS] BBR уже активен ✓")
-		return
-	}
 	cmds := [][]string{
 		{"sysctl", "-w", "net.core.default_qdisc=fq"},
-		{"sysctl", "-w", "net.ipv4.tcp_congestion_control=bbr"},
 		{"sysctl", "-w", "net.core.rmem_max=25165824"},
 		{"sysctl", "-w", "net.core.wmem_max=25165824"},
+		{"sysctl", "-w", "net.core.rmem_default=4194304"},
+		{"sysctl", "-w", "net.core.wmem_default=4194304"},
+		{"sysctl", "-w", "net.core.netdev_max_backlog=16384"},
+		{"sysctl", "-w", "net.ipv4.udp_rmem_min=262144"},
+		{"sysctl", "-w", "net.ipv4.udp_wmem_min=262144"},
 		{"sysctl", "-w", "net.ipv4.tcp_rmem=4096 87380 25165824"},
 		{"sysctl", "-w", "net.ipv4.tcp_wmem=4096 65536 25165824"},
+	}
+	if !strings.Contains(out, "bbr") {
+		cmds = append(cmds, []string{"sysctl", "-w", "net.ipv4.tcp_congestion_control=bbr"})
 	}
 	for _, cmd := range cmds {
 		runCmd(cmd[0], cmd[1:]...)
 	}
-	log.Println("[SYS] BBR включен ✓")
+	log.Println("[SYS] Сетевые буферы, fq и BBR настроены ✓")
 }
 
 // ==================== Статистика ====================
@@ -916,19 +1021,28 @@ func statsLoop(ctx context.Context, configDir string) {
 	statsFile := filepath.Join(configDir, "server.log")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+	defer func() {
+		flushAccessTraffic()
+		dbMutex.Lock()
+		if atomic.SwapInt32(&dbTrafficDirty, 0) == 1 {
+			saveDB()
+		}
+		dbMutex.Unlock()
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			flushAccessTraffic()
 			fromC := atomic.LoadInt64(&totalBytesFromClient)
 			toC := atomic.LoadInt64(&totalBytesToClient)
 			active := atomic.LoadInt32(&activeConns)
 			total := atomic.LoadInt64(&totalConns)
 			uptime := time.Since(serverStartTime)
 
-			log.Printf("[СТАТ] Активных: %d | Всего: %d | NAT: %s | ↑%.2f МБ | ↓%.2f МБ",
-				active, total, natType,
+			log.Printf("[СТАТ] Активных: %d | Всего: %d | CPU: %.1f%% | RAM: %.1f%% | NAT: %s | ↑%.2f МБ | ↓%.2f МБ",
+				active, total, runtimeCPUPercent(), runtimeMemoryPercent(), natType,
 				float64(fromC)/1024/1024,
 				float64(toC)/1024/1024,
 			)
@@ -1240,6 +1354,10 @@ PersistentKeepalive = %d`,
 // ==================== Main ====================
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Println(wdttServerVersion)
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "admin" {
 		os.Exit(runAdminCLI(os.Args[2:]))
 	}
@@ -1252,6 +1370,11 @@ func main() {
 	botToken := flag.String("bot-token", "", "Telegram Bot Token")
 	dnsValue := flag.String("dns", defaultDNS, "DNS для WireGuard-клиентов, через запятую")
 	maxPasswordsFlag := flag.Int("max-passwords", defaultMaxGeneratedPasswords, "максимум активных сгенерированных паролей")
+	maxWorkersFlag := flag.Int("max-workers-per-access", defaultMaxWorkersPerAccess, "максимум одновременных DTLS-воркеров одного доступа; 0 отключает лимит")
+	maxHandshakesFlag := flag.Int("max-handshakes", defaultMaxHandshakes, "максимум одновременных DTLS-рукопожатий")
+	handshakeRateFlag := flag.Float64("handshake-rate", defaultHandshakeRate, "допустимые DTLS-рукопожатия в секунду")
+	clientMbpsFlag := flag.Float64("max-client-mbps", defaultClientMbps, "общий лимит Мбит/с на один доступ; 0 отключает")
+	wgBackendFlag := flag.String("wg-backend", "auto", "WireGuard backend: auto, kernel или userspace")
 	flag.Parse()
 
 	if *maxPasswordsFlag < 1 {
@@ -1263,6 +1386,24 @@ func main() {
 	} else {
 		maxGeneratedPasswords = *maxPasswordsFlag
 	}
+	if *maxWorkersFlag < 0 || *maxWorkersFlag > 128 {
+		log.Printf("[LIMIT] -max-workers-per-access=%d некорректен, использую %d", *maxWorkersFlag, defaultMaxWorkersPerAccess)
+		*maxWorkersFlag = defaultMaxWorkersPerAccess
+	}
+	if *maxHandshakesFlag < 1 || *maxHandshakesFlag > 256 {
+		log.Printf("[LIMIT] -max-handshakes=%d некорректен, использую %d", *maxHandshakesFlag, defaultMaxHandshakes)
+		*maxHandshakesFlag = defaultMaxHandshakes
+	}
+	if *handshakeRateFlag < 1 || *handshakeRateFlag > 1000 {
+		log.Printf("[LIMIT] -handshake-rate=%.1f некорректен, использую %.1f", *handshakeRateFlag, defaultHandshakeRate)
+		*handshakeRateFlag = defaultHandshakeRate
+	}
+	if *clientMbpsFlag < 0 || *clientMbpsFlag > 1000 {
+		log.Printf("[LIMIT] -max-client-mbps=%.1f некорректен, использую %.1f", *clientMbpsFlag, defaultClientMbps)
+		*clientMbpsFlag = defaultClientMbps
+	}
+	configureAccessRuntime(*maxWorkersFlag, *clientMbpsFlag)
+	configureHandshakeLimits(*maxHandshakesFlag, *handshakeRateFlag)
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("══════════════════════════════════════════")
@@ -1290,7 +1431,7 @@ func main() {
 
 	enableBBR()
 
-	wgDev, err := startUserspaceWG(keys, *wgPort)
+	wgDev, err := startWGBackend(*wgBackendFlag, keys, *wgPort, *configDir)
 	if err != nil {
 		log.Fatalf("[WG] Запуск: %v", err)
 	}
@@ -1307,6 +1448,7 @@ func main() {
 	}()
 
 	go statsLoop(ctx, *configDir)
+	go systemMetricsLoop(ctx)
 	go expiredPasswordJanitor(ctx, wgDev)
 	go botLoop(*botToken, *adminID, wgDev)
 
@@ -1356,11 +1498,32 @@ func main() {
 
 // ==================== Обработка соединений ====================
 
-func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgDev *device.Device, keys *wgKeys) {
+func denyExpiredAccess(clientConn net.Conn, identity accessIdentity) {
+	if clientConn == nil || !identity.valid() || identity.isMain {
+		return
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := clientConn.Read(buf)
+	_ = clientConn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return
+	}
+	request := strings.TrimSpace(string(buf[:n]))
+	if !strings.HasPrefix(request, "GETCONF:") {
+		return
+	}
+	parts := strings.Split(strings.TrimSpace(strings.TrimPrefix(request, "GETCONF:")), "|")
+	if len(parts) < 3 || parts[2] != identity.password {
+		_, _ = clientConn.Write([]byte("DENIED:wrong_password"))
+		return
+	}
+	_, _ = clientConn.Write([]byte("DENIED:expired"))
+}
+
+func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgDev wgDevice, keys *wgKeys) {
 	atomic.AddInt64(&totalConns, 1)
 
-	var connPassword string
-	var connIsMainPass bool
 	var connDevice *ClientDevice
 
 	dtlsConn, ok := clientConn.(*dtls.Conn)
@@ -1369,18 +1532,75 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 	}
 
 	hctx, hcancel := context.WithTimeout(ctx, 30*time.Second)
-	if err := dtlsConn.HandshakeContext(hctx); err != nil {
+	releaseHandshake, acquired := acquireHandshake(hctx)
+	if !acquired {
 		hcancel()
 		return
 	}
+	if err := dtlsConn.HandshakeContext(hctx); err != nil {
+		releaseHandshake()
+		failures := atomic.AddInt64(&handshakeFailures, 1)
+		if failures <= 5 || failures%100 == 0 {
+			log.Printf("[DTLS] Рукопожатие от %s не завершено: %v", clientConn.RemoteAddr(), err)
+		}
+		hcancel()
+		return
+	}
+	releaseHandshake()
 	hcancel()
 
-	atomic.AddInt32(&activeConns, 1)
-	defer atomic.AddInt32(&activeConns, -1)
+	// The WRAP identity is selected while DTLS reads its first encrypted packet.
+	// It therefore becomes available only after a successful handshake.
+	identity, ok := wrappedIdentity(clientConn.RemoteAddr())
+	if !ok {
+		failures := atomic.AddInt64(&handshakeFailures, 1)
+		if failures <= 5 || failures%100 == 0 {
+			log.Printf("[WRAP] Не удалось связать соединение %s с доступом", clientConn.RemoteAddr())
+		}
+		return
+	}
+	switch currentAccessIdentityState(identity) {
+	case accessIdentityExpired:
+		denyExpiredAccess(clientConn, identity)
+		return
+	case accessIdentityActive:
+		// Continue with the normal worker path.
+	default:
+		return
+	}
+	sendWorkerPolicy := func() {
+		if maxWorkers := configuredAccessWorkerLimit(); maxWorkers > 0 {
+			_ = clientConn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+			_, _ = clientConn.Write([]byte(fmt.Sprintf("POLICY:max_workers=%d", maxWorkers)))
+			_ = clientConn.SetWriteDeadline(time.Time{})
+		}
+	}
+	var runtimeLease *accessRuntime
+	var workerLease *accessWorkerLease
+	var releaseWorker func()
+	workerAdmitted := false
 
 	buf := make([]byte, 1600)
-	clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	// GETCONF is sent immediately after the client handshake. Give it a short
+	// pre-admission window so a new authenticated transport generation can replace
+	// stale leases even when the old generation has filled the worker quota. Regular
+	// data workers still enter the normal quota before waiting for user traffic.
+	clientConn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
 	n, err := clientConn.Read(buf)
+	if err != nil {
+		if networkError, timedOut := err.(net.Error); timedOut && networkError.Timeout() {
+			runtimeLease, workerLease, releaseWorker, ok =
+				acquireAccessWorkerSession(identity, clientConn)
+			if !ok {
+				sendWorkerPolicy()
+				return
+			}
+			workerAdmitted = true
+			defer releaseWorker()
+			clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			n, err = clientConn.Read(buf)
+		}
+	}
 	if err != nil {
 		return
 	}
@@ -1395,6 +1615,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		deviceID := "unknown"
 		password := ""
 		deviceInfo := deviceInfoPayload{}
+		transportSession := ""
 		if len(parts) > 0 {
 			clientPort = parts[0]
 		}
@@ -1407,8 +1628,18 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		if len(parts) > 3 {
 			deviceInfo = parseDeviceInfoPayload(parts[3])
 		}
+		if len(parts) > 4 {
+			transportSession = strings.TrimSpace(parts[4])
+		}
+		if password != identity.password {
+			atomic.AddInt64(&handshakeFailures, 1)
+			_, _ = clientConn.Write([]byte("DENIED:wrong_password"))
+			return
+		}
 		remoteIP := remoteIPFromAddr(clientConn.RemoteAddr())
 		nowUnix := time.Now().Unix()
+		authorized := false
+		configResponse := ""
 
 		dbMutex.Lock()
 
@@ -1419,7 +1650,11 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 		if valid && isGenPass && entry.IsDeactivated {
 			clientConn.Write([]byte("DENIED:deactivated"))
-			log.Printf("[WG] Отказ: пароль %s деактивирован, запрос от %s", maskPassword(password), deviceID)
+			log.Printf(
+				"[WG] Отказ: пароль %s деактивирован, устройство %s",
+				maskPassword(password),
+				deviceLogRef(deviceID),
+			)
 			dbMutex.Unlock()
 		} else if valid && isGenPass && entry.DeviceID != "" && entry.DeviceID != deviceID {
 			appendBindHistory(entry, BindHistoryEntry{
@@ -1434,18 +1669,25 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			saveDB()
 			// Пароль уже привязан к другому устройству
 			clientConn.Write([]byte("DENIED:device_mismatch"))
-			log.Printf("[WG] Отказ: пароль %s привязан к %s, запрос от %s", maskPassword(password), entry.DeviceID, deviceID)
+			log.Printf(
+				"[WG] Отказ: пароль %s уже привязан; сохранённое устройство %s, запрос %s",
+				maskPassword(password),
+				deviceLogRef(entry.DeviceID),
+				deviceLogRef(deviceID),
+			)
 			dbMutex.Unlock()
 		} else if valid {
-			connPassword = password
-			connIsMainPass = isMainPass
 			newlyBound := false
 
 			// Привязываем пароль к устройству при первом использовании
 			if isGenPass && entry.DeviceID == "" {
 				entry.DeviceID = deviceID
 				newlyBound = true
-				log.Printf("[WG] Пароль %s привязан к устройству %s", maskPassword(password), deviceID)
+				log.Printf(
+					"[WG] Пароль %s привязан к устройству %s",
+					maskPassword(password),
+					deviceLogRef(deviceID),
+				)
 			}
 			if isMainPass {
 				rememberAdminDeviceID(&db.AdminProfile, deviceID)
@@ -1461,7 +1703,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 					applyDeviceInfo(dev, deviceInfo, remoteIP, nowUnix)
 					db.Devices[deviceID] = dev
 					saveDB()
-					log.Printf("[WG] Новое устройство %s (IP: %s)", deviceID, dev.IP)
+					log.Printf("[WG] Новое устройство %s", deviceLogRef(deviceID))
 				} else {
 					dev = nil
 				}
@@ -1485,21 +1727,58 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			}
 			if dev != nil {
 				connDevice = dev
-				clientConn.Write([]byte(buildClientConfig(keys.serverPublic, dev.PrivKey, dev.IP, clientPort)))
+				authorized = true
+				configResponse = buildClientConfig(keys.serverPublic, dev.PrivKey, dev.IP, clientPort)
 			} else {
-				clientConn.Write([]byte("NOCONF"))
+				configResponse = "NOCONF"
 			}
 			dbMutex.Unlock()
 		} else {
 			if isGenPass && isPasswordExpired(entry) {
 				clientConn.Write([]byte("DENIED:expired"))
-				log.Printf("[WG] Отказ: пароль %s истёк, от %s", maskPassword(password), deviceID)
+				log.Printf(
+					"[WG] Отказ: пароль %s истёк, устройство %s",
+					maskPassword(password),
+					deviceLogRef(deviceID),
+				)
 			} else {
 				clientConn.Write([]byte("DENIED:wrong_password"))
-				log.Printf("[WG] Отказ (неверный пароль) от %s", deviceID)
+				log.Printf("[WG] Отказ (неверный пароль), устройство %s", deviceLogRef(deviceID))
 			}
 			dbMutex.Unlock()
 		}
+		if !authorized {
+			if configResponse != "" {
+				_, _ = clientConn.Write([]byte(configResponse))
+			}
+			return
+		}
+
+		if workerAdmitted {
+			if transportSession != "" &&
+				!activateAccessSession(workerLease, deviceID, transportSession) {
+				return
+			}
+		} else if transportSession != "" {
+			runtimeLease, workerLease, releaseWorker, ok = acquireAccessWorkerForSession(
+				identity,
+				clientConn,
+				deviceID,
+				transportSession,
+			)
+		} else {
+			runtimeLease, workerLease, releaseWorker, ok =
+				acquireAccessWorkerSession(identity, clientConn)
+		}
+		if !workerAdmitted && !ok {
+			sendWorkerPolicy()
+			return
+		}
+		if !workerAdmitted {
+			workerAdmitted = true
+			defer releaseWorker()
+		}
+		_, _ = clientConn.Write([]byte(configResponse))
 
 		clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		n, err = clientConn.Read(buf)
@@ -1509,9 +1788,34 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		clientConn.SetReadDeadline(time.Time{})
 		firstPacket = buf[:n]
 		firstStr = string(firstPacket)
+	} else if !workerAdmitted {
+		runtimeLease, workerLease, releaseWorker, ok =
+			acquireAccessWorkerSession(identity, clientConn)
+		if !ok {
+			sendWorkerPolicy()
+			return
+		}
+		workerAdmitted = true
+		defer releaseWorker()
 	}
 
+	switch currentAccessIdentityState(identity) {
+	case accessIdentityExpired:
+		_, _ = clientConn.Write([]byte("DENIED:expired"))
+		return
+	case accessIdentityActive:
+		// Continue with the authenticated request.
+	default:
+		return
+	}
+
+	atomic.AddInt32(&activeConns, 1)
+	defer atomic.AddInt32(&activeConns, -1)
+
 	if firstStr == "READY" {
+		if !accessIdentityIsActive(identity) {
+			return
+		}
 		clientConn.Write([]byte("READY_OK"))
 		clientConn.SetReadDeadline(time.Now().Add(10 * time.Minute))
 		n, err = clientConn.Read(buf)
@@ -1534,25 +1838,54 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		uc.SetWriteBuffer(2 * 1024 * 1024)
 	}
 
+	if !accessIdentityIsActive(identity) {
+		return
+	}
 	if connDevice != nil {
 		upsertPeerInWG(wgDev, connDevice)
 	}
 
+	if err := runtimeLease.upload.wait(ctx, len(firstPacket)); err != nil {
+		return
+	}
 	if _, err := wgConn.Write(firstPacket); err != nil {
 		return
 	}
 	atomic.AddInt64(&totalBytesFromClient, int64(len(firstPacket)))
-	if connPassword != "" {
-		dbMutex.Lock()
-		if !addTrafficLocked(connPassword, connIsMainPass, 0, int64(len(firstPacket))) {
-			dbMutex.Unlock()
-			return
-		}
-		dbMutex.Unlock()
-	}
+	recordAccessTraffic(runtimeLease, 0, int64(len(firstPacket)))
 
 	pctx, pcancel := context.WithCancel(ctx)
 	defer pcancel()
+
+	if _, limited := accessIdentityExpiryUnix(identity); limited {
+		go func() {
+			for {
+				expiresAt, stillLimited := accessIdentityExpiryUnix(identity)
+				if !stillLimited {
+					return
+				}
+				delay := time.Until(time.Unix(expiresAt, 0))
+				if delay < 0 {
+					delay = 0
+				}
+				timer := time.NewTimer(delay)
+				select {
+				case <-pctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				case <-timer.C:
+				}
+				if !accessIdentityIsActive(identity) {
+					pcancel()
+					return
+				}
+				// The access was renewed before the old deadline. Read the new
+				// expiration value and arm the monitor again.
+			}
+		}()
+	}
 
 	context.AfterFunc(pctx, func() {
 		clientConn.SetDeadline(time.Now())
@@ -1568,6 +1901,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		defer pcancel()
 		b := getBuf()
 		defer putBuf(b)
+		lastAccessCheck := time.Now()
 		for {
 			select {
 			case <-pctx.Done():
@@ -1589,18 +1923,20 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				}
 				continue
 			}
-			atomic.AddInt64(&totalBytesFromClient, int64(nn))
-			if connPassword != "" {
-				dbMutex.Lock()
-				if !addTrafficLocked(connPassword, connIsMainPass, 0, int64(nn)) {
-					dbMutex.Unlock()
+			if time.Since(lastAccessCheck) >= 5*time.Second {
+				if !accessIdentityIsActive(identity) {
 					return
 				}
-				dbMutex.Unlock()
+				lastAccessCheck = time.Now()
+			}
+			if err := runtimeLease.upload.wait(pctx, nn); err != nil {
+				return
 			}
 			if _, err := wgConn.Write((*b)[:nn]); err != nil {
 				return
 			}
+			atomic.AddInt64(&totalBytesFromClient, int64(nn))
+			recordAccessTraffic(runtimeLease, 0, int64(nn))
 		}
 	}()
 
@@ -1610,6 +1946,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		defer pcancel()
 		b := getBuf()
 		defer putBuf(b)
+		lastAccessCheck := time.Now()
 		for {
 			select {
 			case <-pctx.Done():
@@ -1627,18 +1964,20 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				}
 				return
 			}
-			atomic.AddInt64(&totalBytesToClient, int64(nn))
-			if connPassword != "" {
-				dbMutex.Lock()
-				if !addTrafficLocked(connPassword, connIsMainPass, int64(nn), 0) {
-					dbMutex.Unlock()
+			if time.Since(lastAccessCheck) >= 5*time.Second {
+				if !accessIdentityIsActive(identity) {
 					return
 				}
-				dbMutex.Unlock()
+				lastAccessCheck = time.Now()
+			}
+			if err := runtimeLease.download.wait(pctx, nn); err != nil {
+				return
 			}
 			if _, err := clientConn.Write((*b)[:nn]); err != nil {
 				return
 			}
+			atomic.AddInt64(&totalBytesToClient, int64(nn))
+			recordAccessTraffic(runtimeLease, int64(nn), 0)
 		}
 	}()
 
@@ -1703,8 +2042,8 @@ func NewObfsState() *ObfsState {
 	}
 }
 
-func obfsBuildNonce(ssrc uint32, seq uint16, ts uint32) []byte {
-	n := make([]byte, 12)
+func obfsBuildNonce(ssrc uint32, seq uint16, ts uint32) [wrapNonceLen]byte {
+	var n [wrapNonceLen]byte
 	binary.BigEndian.PutUint32(n[0:4], ssrc)
 	binary.BigEndian.PutUint16(n[4:6], seq)
 	binary.BigEndian.PutUint32(n[8:12], ts)
@@ -1712,6 +2051,10 @@ func obfsBuildNonce(ssrc uint32, seq uint16, ts uint32) []byte {
 }
 
 func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]byte, error) {
+	return obfsWrapPacketInto(nil, key, payload, cfg, state)
+}
+
+func obfsWrapPacketInto(dst, key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]byte, error) {
 	if len(key) != wrapKeyLen {
 		return nil, fmt.Errorf("obfs: key must be %d bytes (got %d)", wrapKeyLen, len(key))
 	}
@@ -1735,7 +2078,10 @@ func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]b
 	}
 	padTotal := padRand + 1
 	outLen := 12 + len(payload) + chacha20poly1305.Overhead + padTotal
-	out := make([]byte, outLen)
+	if cap(dst) < outLen {
+		dst = make([]byte, outLen)
+	}
+	out := dst[:outLen]
 
 	out[0] = 0x80 | 0x20
 	out[1] = cfg.PayloadType & 0x7F
@@ -1747,7 +2093,7 @@ func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]b
 	if err != nil {
 		return nil, fmt.Errorf("obfs: cipher init: %w", err)
 	}
-	sealed := aead.Seal(out[12:12], nonce, payload, out[:12])
+	sealed := aead.Seal(out[12:12], nonce[:], payload, out[:12])
 	padStart := 12 + len(sealed)
 	if padRand > 0 {
 		rand.Read(out[padStart : padStart+padRand])
@@ -1790,7 +2136,7 @@ func obfsUnwrapPacket(key, wire, dst []byte) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("obfs: cipher init: %w", err)
 	}
-	plain, err := aead.Open(dst[:0], nonce, wire[12:payloadEnd], wire[:12])
+	plain, err := aead.Open(dst[:0], nonce[:], wire[12:payloadEnd], wire[:12])
 	if err != nil {
 		return 0, fmt.Errorf("obfs: auth: %w", err)
 	}
@@ -1812,7 +2158,19 @@ func listenWrapped(addr *net.UDPAddr, keys *wrapKeyStore) (dtlsnet.PacketListene
 	if keys == nil || keys.Count() == 0 {
 		return nil, errors.New("wrap: no active keys")
 	}
-	inner, err := pionudp.Listen("udp", addr)
+	listenConfig := pionudp.ListenConfig{
+		Backlog:         4096,
+		AcceptFilter:    obfsIsRTPPacket,
+		ReadBufferSize:  16 * 1024 * 1024,
+		WriteBufferSize: 16 * 1024 * 1024,
+		Batch: pionudp.BatchIOConfig{
+			Enable:             true,
+			ReadBatchSize:      64,
+			WriteBatchSize:     32,
+			WriteBatchInterval: 200 * time.Microsecond,
+		},
+	}
+	inner, err := listenConfig.Listen("udp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("wrap: udp listen: %w", err)
 	}
@@ -1839,18 +2197,33 @@ func (l *wrapPacketListener) Close() error   { return l.inner.Close() }
 func (l *wrapPacketListener) Addr() net.Addr { return l.inner.Addr() }
 
 type wrapPacketConn struct {
-	inner     net.PacketConn
-	keys      *wrapKeyStore
-	key       []byte
-	selected  int32
-	authLog   int32
-	obfsCfg   *ObfsConfig
-	obfsWrite *ObfsState
+	inner      net.PacketConn
+	keys       *wrapKeyStore
+	key        []byte
+	identity   accessIdentity
+	sessionKey string
+	session    *wrappedSession
+	selected   int32
+	authLog    int32
+	obfsCfg    *ObfsConfig
+	obfsWrite  *ObfsState
+}
+
+var wrapWireBufferPool = sync.Pool{
+	New: func() interface{} {
+		buffer := make([]byte, 2048)
+		return &buffer
+	},
 }
 
 func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	// Extra space for RTP header (12) + AEAD tag (16) + padding.
-	buf := make([]byte, len(p)+80)
+	buffer := wrapWireBufferPool.Get().(*[]byte)
+	if cap(*buffer) < len(p)+80 {
+		*buffer = make([]byte, len(p)+80)
+	}
+	buf := (*buffer)[:len(p)+80]
+	defer wrapWireBufferPool.Put(buffer)
 	n, addr, err := c.inner.ReadFrom(buf)
 	if err != nil {
 		return 0, addr, err
@@ -1858,7 +2231,7 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	raw := buf[:n]
 
 	if atomic.LoadInt32(&c.selected) == 0 {
-		key, m, uErr := c.keys.Unwrap(raw, p)
+		key, identity, m, uErr := c.keys.Unwrap(raw, p)
 		if uErr != nil {
 			if atomic.CompareAndSwapInt32(&c.authLog, 0, 1) {
 				log.Printf("[WRAP] Отказ: RTP AEAD auth failed from %s (keys=%d)", addr.String(), c.keys.Count())
@@ -1866,6 +2239,8 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			return 0, addr, uErr
 		}
 		c.key = key
+		c.identity = identity
+		c.sessionKey, c.session = registerWrappedSession(addr, identity)
 		c.obfsCfg = NewObfsConfig()
 		c.obfsWrite = NewObfsState()
 		atomic.StoreInt32(&c.selected, 1)
@@ -1890,7 +2265,9 @@ func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		c.obfsCfg = NewObfsConfig()
 		c.obfsWrite = NewObfsState()
 	}
-	wrapped, wErr := obfsWrapPacket(c.key, p, c.obfsCfg, c.obfsWrite)
+	buffer := wrapWireBufferPool.Get().(*[]byte)
+	defer wrapWireBufferPool.Put(buffer)
+	wrapped, wErr := obfsWrapPacketInto((*buffer)[:0], c.key, p, c.obfsCfg, c.obfsWrite)
 	if wErr != nil {
 		return 0, fmt.Errorf("obfs wrap: %w", wErr)
 	}
@@ -1900,7 +2277,11 @@ func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return len(p), nil
 }
 
-func (c *wrapPacketConn) Close() error                       { return c.inner.Close() }
+func (c *wrapPacketConn) Close() error {
+	unregisterWrappedSession(c.sessionKey, c.session)
+	zeroBytes(c.key)
+	return c.inner.Close()
+}
 func (c *wrapPacketConn) LocalAddr() net.Addr                { return c.inner.LocalAddr() }
 func (c *wrapPacketConn) SetDeadline(t time.Time) error      { return c.inner.SetDeadline(t) }
 func (c *wrapPacketConn) SetReadDeadline(t time.Time) error  { return c.inner.SetReadDeadline(t) }

@@ -28,7 +28,7 @@
         android:name=".WdttApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
-        android:label="WDTT Plus"
+        android:label="${appLabel}"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.WDTTClient">
@@ -54,8 +54,10 @@
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="image/*" />
+                <data android:mimeType="application/vnd.wdtt.plus" />
                 <data android:mimeType="application/json" />
                 <data android:mimeType="application/vnd.wdtt.plus.transfer" />
+                <data android:mimeType="application/vnd.wdtt.plus.client" />
                 <data android:mimeType="application/octet-stream" />
             </intent-filter>
             <intent-filter>
@@ -64,12 +66,32 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="wdtt" />
             </intent-filter>
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="https"
+                    android:host="${wdttPlusDomain}"
+                    android:pathPrefix="/c/" />
+            </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/vnd.wdtt.plus" />
                 <data android:mimeType="application/json" />
                 <data android:mimeType="application/vnd.wdtt.plus.transfer" />
+                <data android:mimeType="application/vnd.wdtt.plus.client" />
                 <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.wdtt" />
             </intent-filter>
         </activity>
 
@@ -103,7 +125,7 @@
             android:name=".QuickToggleTileService"
             android:exported="true"
             android:icon="@drawable/ic_tile_logo"
-            android:label="WDTT Plus"
+            android:label="${appLabel}"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />

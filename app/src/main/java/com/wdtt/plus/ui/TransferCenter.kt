@@ -64,6 +64,7 @@ import com.journeyapps.barcodescanner.ScanOptions
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TransferFiles
 import com.wdtt.plus.WdttTransferCodec
+import com.wdtt.plus.WdttDocument
 import com.wdtt.plus.QrCaptureActivity
 import com.wdtt.plus.vpnProfileDisplayName
 import kotlinx.coroutines.Dispatchers
@@ -112,7 +113,7 @@ fun TransferCenterDialog(
             onIncomingContent(text)
         }
     }
-    val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+    val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) runCatchingUi {
             val text = withContext(Dispatchers.IO) { TransferFiles.readText(context, uri) }
             onIncomingContent(text)
@@ -129,6 +130,12 @@ fun TransferCenterDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Box(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "Получение/Передача",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.align(androidx.compose.ui.Alignment.CenterStart),
+                    )
                     IconButton(
                         onClick = onDismiss,
                         enabled = !busy,
@@ -137,7 +144,14 @@ fun TransferCenterDialog(
                         Icon(Icons.Default.Close, contentDescription = "Закрыть", modifier = Modifier.size(20.dp))
                     }
                 }
-                Text("Получение VPN", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("Получить профиль", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text(
+                    "Добавьте профиль через камеру, изображение или файл. "
+                        + "Если сервис выдал обновление, приложение применит его "
+                        + "к связанному профилю.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -154,11 +168,13 @@ fun TransferCenterDialog(
                         )
                     }
                     TransferButton("Галерея", Icons.Default.Image, busy) { galleryLauncher.launch("image/*") }
-                    TransferButton("Файл", Icons.Default.FileOpen, busy) { fileLauncher.launch("*/*") }
+                    TransferButton("Файл", Icons.Default.FileOpen, busy) {
+                        fileLauncher.launch(WdttDocument.acceptedMimeTypes())
+                    }
                 }
 
                 HorizontalDivider()
-                Text("Передача $activeProfileLabel", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("Передать $activeProfileLabel", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(
                     "Ссылка содержит пароль подключения и VK-хеши. Передавайте её только тому, кому доверяете.",
                     style = MaterialTheme.typography.bodySmall,
@@ -185,9 +201,15 @@ fun TransferCenterDialog(
                         runCatchingUi {
                             val link = settingsStore.connectionLinkForProfile(activeProfile)
                             val uri = withContext(Dispatchers.IO) {
-                                TransferFiles.writeTransferText(context, "WDTT-Plus-${activeProfileLabel.safeTransferFileName()}.wdtt", link)
+                                TransferFiles.writeTransferText(
+                                    context,
+                                    WdttDocument.fileName(
+                                        "WDTT-Plus-${activeProfileLabel.safeTransferFileName()}"
+                                    ),
+                                    link
+                                )
                             }
-                            shareUri(context, uri, "application/vnd.wdtt.plus.transfer", "Передать подключение WDTT Plus")
+                            shareUri(context, uri, WdttDocument.MIME_TYPE, "Передать подключение WDTT Plus")
                         }
                     }
                 }
@@ -253,7 +275,12 @@ fun TransferCenterDialog(
                             val uri = withContext(Dispatchers.IO) {
                                 TransferFiles.writeTransferText(context, "WDTT-Plus-admin-$stamp.wdtt-backup", encrypted)
                             }
-                            shareUri(context, uri, "application/vnd.wdtt.plus.transfer", "Передать настройки WDTT Plus")
+                            shareUri(
+                                context,
+                                uri,
+                                WdttDocument.LEGACY_TRANSFER_MIME_TYPE,
+                                "Передать настройки WDTT Plus"
+                            )
                         }
                     }
                 }
@@ -279,9 +306,10 @@ fun TransferCenterDialog(
             onSave = {
                 scope.launch {
                     val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+                    val fileName = "WDTT-Plus-QR-${title.safeQrFileName()}-$stamp.png"
                     runCatching {
                         withContext(Dispatchers.IO) {
-                            TransferFiles.saveQrToGallery(context, "WDTT-Plus-QR-$stamp.png", bitmap)
+                            TransferFiles.saveQrToGallery(context, fileName, bitmap)
                         }
                     }.onSuccess {
                         Toast.makeText(context, "QR-код сохранён в галерею.", Toast.LENGTH_SHORT).show()

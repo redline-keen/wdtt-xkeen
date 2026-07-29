@@ -128,6 +128,8 @@ import com.wdtt.plus.ServerClientCreateRequest
 import com.wdtt.plus.ServerClientInfo
 import com.wdtt.plus.ServerTrafficPeriod
 import com.wdtt.plus.TransferFiles
+import com.wdtt.plus.WdttDocument
+import com.wdtt.plus.VkJoinLink
 import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.connectionLink
 import kotlinx.coroutines.Dispatchers
@@ -162,6 +164,21 @@ private enum class ClientExpiryFilter { All, Valid, Expired, Unlimited }
 private enum class ClientVkHashFilter { All, Present, Missing }
 
 private enum class ClientsServerRefreshState { Unknown, Ready, Error }
+
+private data class ClientQrData(
+    val title: String,
+    val bitmap: Bitmap,
+    val missingVkHashes: Boolean
+)
+
+private fun vkHashInputError(value: String): String? {
+    if (value.isBlank()) return null
+    return if (VkJoinLink.normalizeHashes(value) == null) {
+        "Проверьте VK-хеш: допустимы латинские буквы, цифры, _ и - либо ссылка VK-звонка."
+    } else {
+        null
+    }
+}
 
 internal fun serverClientsAccessIssue(
     host: String,
@@ -354,7 +371,7 @@ fun ServerClientsSection(
     var changedPasswordClient by remember { mutableStateOf<ServerClientInfo?>(null) }
     var pendingAction by remember { mutableStateOf<PendingClientAction?>(null) }
     var expiryClient by remember { mutableStateOf<ServerClientInfo?>(null) }
-    var qrData by remember { mutableStateOf<Pair<String, Bitmap>?>(null) }
+    var qrData by remember { mutableStateOf<ClientQrData?>(null) }
     var detailsClient by remember { mutableStateOf<ServerClientInfo?>(null) }
     var showServerTools by rememberSaveable { mutableStateOf(false) }
     var createdClient by remember { mutableStateOf<ServerClientInfo?>(null) }
@@ -814,10 +831,16 @@ fun ServerClientsSection(
                                     scope.launch {
                                         runCatching {
                                             withContext(Dispatchers.IO) {
-                                                TransferFiles.writeTransferText(context, "WDTT-Plus-${selectedClient.safeFileName()}.wdtt", link)
+                                                TransferFiles.writeTransferText(
+                                                    context,
+                                                    WdttDocument.fileName(
+                                                        "WDTT-Plus-${selectedClient.safeFileName()}"
+                                                    ),
+                                                    link
+                                                )
                                             }
                                         }.onSuccess {
-                                            shareUri(context, it, "application/vnd.wdtt.plus.transfer", "Передать подключение WDTT Plus")
+                                            shareUri(context, it, WdttDocument.MIME_TYPE, "Передать подключение WDTT Plus")
                                         }.onFailure {
                                             Toast.makeText(context, it.message ?: "Не удалось создать файл.", Toast.LENGTH_LONG).show()
                                         }
@@ -827,7 +850,13 @@ fun ServerClientsSection(
                                     scope.launch {
                                         runCatching {
                                             withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, link) }
-                                        }.onSuccess { qrData = selectedClient.displayName() to it }
+                                        }.onSuccess {
+                                            qrData = ClientQrData(
+                                                title = selectedClient.displayName(),
+                                                bitmap = it,
+                                                missingVkHashes = selectedClient.vkHash.isBlank()
+                                            )
+                                        }
                                             .onFailure { Toast.makeText(context, it.message ?: "Не удалось создать QR.", Toast.LENGTH_LONG).show() }
                                     }
                                 },
@@ -1039,7 +1068,13 @@ fun ServerClientsSection(
                 onQr = {
                     scope.launch {
                         runCatching { withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, transfer) } }
-                            .onSuccess { qrData = "Перенос: ${client.displayName()}" to it }
+                            .onSuccess {
+                                qrData = ClientQrData(
+                                    title = "Перенос: ${client.displayName()}",
+                                    bitmap = it,
+                                    missingVkHashes = client.vkHash.isBlank()
+                                )
+                            }
                             .onFailure { status = "Ошибка: ${it.message ?: "QR-код не создан"}" }
                     }
                 },
@@ -1050,7 +1085,12 @@ fun ServerClientsSection(
                                 TransferFiles.writeTransferText(context, "WDTT-Plus-${client.safeFileName()}.wdtt-client", transfer)
                             }
                         }.onSuccess {
-                            shareUri(context, it, "application/vnd.wdtt.plus.client", "Передать клиента WDTT Plus")
+                            shareUri(
+                                context,
+                                it,
+                                WdttDocument.LEGACY_CLIENT_MIME_TYPE,
+                                "Передать клиента WDTT Plus"
+                            )
                         }.onFailure { status = "Ошибка: ${it.message ?: "файл клиента не создан"}" }
                     }
                 }
@@ -1119,7 +1159,8 @@ fun ServerClientsSection(
             title = "Клиент создан",
             password = client.password,
             link = link,
-            noLinkText = "VK-хеш не задан. Пароль уже работает; ссылку, QR и файл можно создать после добавления хеша в «Подробнее».",
+            missingVkHashes = client.vkHash.isBlank(),
+            noLinkText = "Не удалось создать ссылку. Проверьте адрес сервера и порты клиента.",
             onDismiss = { createdClient = null },
             onCopyPassword = { copyText(context, "Пароль WDTT", client.password) },
             onCopyLink = { link?.let { copyText(context, "Ссылка WDTT", it) } },
@@ -1128,7 +1169,9 @@ fun ServerClientsSection(
                 link?.let { value ->
                     scope.launch {
                         runCatching { withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, value) } }
-                            .onSuccess { qrData = client.displayName() to it }
+                            .onSuccess {
+                                qrData = ClientQrData(client.displayName(), it, client.vkHash.isBlank())
+                            }
                             .onFailure { Toast.makeText(context, it.message ?: "Не удалось создать QR.", Toast.LENGTH_LONG).show() }
                     }
                 }
@@ -1137,8 +1180,14 @@ fun ServerClientsSection(
                 link?.let { value ->
                     scope.launch {
                         runCatching {
-                            withContext(Dispatchers.IO) { TransferFiles.writeTransferText(context, "WDTT-Plus-${client.safeFileName()}.wdtt", value) }
-                        }.onSuccess { shareUri(context, it, "application/vnd.wdtt.plus.transfer", "Передать подключение WDTT Plus") }
+                            withContext(Dispatchers.IO) {
+                                TransferFiles.writeTransferText(
+                                    context,
+                                    WdttDocument.fileName("WDTT-Plus-${client.safeFileName()}"),
+                                    value
+                                )
+                            }
+                        }.onSuccess { shareUri(context, it, WdttDocument.MIME_TYPE, "Передать подключение WDTT Plus") }
                             .onFailure { Toast.makeText(context, it.message ?: "Не удалось создать файл.", Toast.LENGTH_LONG).show() }
                     }
                 }
@@ -1157,7 +1206,8 @@ fun ServerClientsSection(
             statusText = "Клиент импортирован и найден в списке.",
             password = client.password,
             link = link,
-            noLinkText = "VK-хеш не задан. Клиент добавлен; хеш можно указать в «Подробнее».",
+            missingVkHashes = client.vkHash.isBlank(),
+            noLinkText = "Не удалось создать ссылку. Проверьте адрес сервера и порты клиента.",
             onDismiss = { importedClient = null },
             onCopyPassword = { copyText(context, "Пароль импортированного клиента", client.password) },
             onCopyLink = { link?.let { copyText(context, "Ссылка WDTT", it) } },
@@ -1166,7 +1216,9 @@ fun ServerClientsSection(
                 link?.let { value ->
                     scope.launch {
                         runCatching { withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, value) } }
-                            .onSuccess { qrData = client.displayName() to it }
+                            .onSuccess {
+                                qrData = ClientQrData(client.displayName(), it, client.vkHash.isBlank())
+                            }
                             .onFailure { status = "Ошибка: ${it.message ?: "QR-код не создан"}" }
                     }
                 }
@@ -1175,8 +1227,14 @@ fun ServerClientsSection(
                 link?.let { value ->
                     scope.launch {
                         runCatching {
-                            withContext(Dispatchers.IO) { TransferFiles.writeTransferText(context, "WDTT-Plus-${client.safeFileName()}.wdtt", value) }
-                        }.onSuccess { shareUri(context, it, "application/vnd.wdtt.plus.transfer", "Передать подключение WDTT Plus") }
+                            withContext(Dispatchers.IO) {
+                                TransferFiles.writeTransferText(
+                                    context,
+                                    WdttDocument.fileName("WDTT-Plus-${client.safeFileName()}"),
+                                    value
+                                )
+                            }
+                        }.onSuccess { shareUri(context, it, WdttDocument.MIME_TYPE, "Передать подключение WDTT Plus") }
                             .onFailure { status = "Ошибка: ${it.message ?: "файл не создан"}" }
                     }
                 }
@@ -1194,7 +1252,8 @@ fun ServerClientsSection(
             title = "Пароль изменён",
             password = client.password,
             link = link,
-            noLinkText = "VK-хеш не задан. Новый пароль уже работает; добавьте хеш в «Подробнее», чтобы сформировать ссылку.",
+            missingVkHashes = client.vkHash.isBlank(),
+            noLinkText = "Не удалось создать ссылку. Проверьте адрес сервера и порты клиента.",
             onDismiss = { changedPasswordClient = null },
             onCopyPassword = { copyText(context, "Новый пароль WDTT", client.password) },
             onCopyLink = { link?.let { copyText(context, "Новая ссылка WDTT", it) } },
@@ -1203,7 +1262,9 @@ fun ServerClientsSection(
                 link?.let { value ->
                     scope.launch {
                         runCatching { withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, value) } }
-                            .onSuccess { qrData = client.displayName() to it }
+                            .onSuccess {
+                                qrData = ClientQrData(client.displayName(), it, client.vkHash.isBlank())
+                            }
                             .onFailure { status = "Ошибка: ${it.message ?: "QR-код не создан"}" }
                     }
                 }
@@ -1212,8 +1273,14 @@ fun ServerClientsSection(
                 link?.let { value ->
                     scope.launch {
                         runCatching {
-                            withContext(Dispatchers.IO) { TransferFiles.writeTransferText(context, "WDTT-Plus-${client.safeFileName()}.wdtt", value) }
-                        }.onSuccess { shareUri(context, it, "application/vnd.wdtt.plus.transfer", "Передать новое подключение WDTT Plus") }
+                            withContext(Dispatchers.IO) {
+                                TransferFiles.writeTransferText(
+                                    context,
+                                    WdttDocument.fileName("WDTT-Plus-${client.safeFileName()}"),
+                                    value
+                                )
+                            }
+                        }.onSuccess { shareUri(context, it, WdttDocument.MIME_TYPE, "Передать новое подключение WDTT Plus") }
                             .onFailure { status = "Ошибка: ${it.message ?: "файл не создан"}" }
                     }
                 }
@@ -1287,17 +1354,18 @@ fun ServerClientsSection(
         }
     }
 
-    qrData?.let { (title, bitmap) ->
+    qrData?.let { qr ->
         ClientQrDialog(
-            title = title,
-            bitmap = bitmap,
+            title = qr.title,
+            bitmap = qr.bitmap,
+            missingVkHashes = qr.missingVkHashes,
             onDismiss = { qrData = null },
             onShare = {
                 scope.launch {
                     val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-                    val fileName = "WDTT-Plus-QR-${title.safeQrFileName()}-$stamp.png"
+                    val fileName = "WDTT-Plus-QR-${qr.title.safeQrFileName()}-$stamp.png"
                     runCatching {
-                        withContext(Dispatchers.IO) { TransferFiles.writeQrPng(context, fileName, bitmap) }
+                        withContext(Dispatchers.IO) { TransferFiles.writeQrPng(context, fileName, qr.bitmap) }
                     }.onSuccess { shareUri(context, it, "image/png", "Передать QR-код WDTT Plus") }
                         .onFailure { Toast.makeText(context, it.message ?: "Не удалось поделиться QR.", Toast.LENGTH_LONG).show() }
                 }
@@ -1305,8 +1373,11 @@ fun ServerClientsSection(
             onSave = {
                 scope.launch {
                     val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+                    val fileName = "WDTT-Plus-QR-${qr.title.safeQrFileName()}-$stamp.png"
                     runCatching {
-                        withContext(Dispatchers.IO) { TransferFiles.saveQrToGallery(context, "WDTT-Plus-client-$stamp.png", bitmap) }
+                        withContext(Dispatchers.IO) {
+                            TransferFiles.saveQrToGallery(context, fileName, qr.bitmap)
+                        }
                     }.onSuccess {
                         Toast.makeText(context, "QR-код сохранён.", Toast.LENGTH_SHORT).show()
                     }.onFailure {
@@ -1394,7 +1465,7 @@ private fun ServerClientCard(
             )
             if (client.vkHash.isBlank()) {
                 Text(
-                    "VK-хеш не задан: быструю ссылку/QR создать нельзя, пока не обновить хеш.",
+                    "VK-хеш не задан: доступ можно передать, но клиенту нужно добавить свой перед запуском.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error
                 )
@@ -1684,6 +1755,7 @@ private fun AccessResultDialog(
     statusText: String? = null,
     password: String,
     link: String?,
+    missingVkHashes: Boolean,
     noLinkText: String,
     onDismiss: () -> Unit,
     onCopyPassword: () -> Unit,
@@ -1718,7 +1790,15 @@ private fun AccessResultDialog(
                 if (link == null) {
                     Text(noLinkText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
-                    Text("Ссылка содержит пароль и VK-хеш. Не публикуйте её.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    Text(
+                        if (missingVkHashes) {
+                            "VK-хеш не задан. Передать можно, но клиенту нужно добавить свой перед запуском."
+                        } else {
+                            "Ссылка содержит пароль и VK-хеш. Не публикуйте её."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
                     FlowRow(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
@@ -1754,6 +1834,7 @@ private fun ClientDetailsDialog(
     var hash by rememberSaveable(client.password) { mutableStateOf(client.vkHash) }
     var ports by rememberSaveable(client.password) { mutableStateOf(client.ports) }
     val portsValid = ports.isPortsSpec()
+    val hashError = vkHashInputError(hash)
     val link = remember(client, fallbackHost, publicHost, sourceProfileName) {
         client.connectionLink(fallbackHost, publicHost, sourceProfileName)
     }
@@ -1854,8 +1935,10 @@ private fun ClientDetailsDialog(
                                     )
                                     OutlinedTextField(
                                         value = hash,
-                                        onValueChange = { hash = it },
+                                        onValueChange = { hash = it.take(4096) },
                                         label = { Text("VK-хеш или ссылка") },
+                                        supportingText = { hashError?.let { Text(it) } },
+                                        isError = hashError != null,
                                         minLines = 2,
                                         modifier = Modifier.fillMaxWidth()
                                     )
@@ -1903,7 +1986,10 @@ private fun ClientDetailsDialog(
         },
         confirmButton = {
             if (step == ClientDetailsStep.Edit) {
-                Button(onClick = { onSave(label, hash, ports) }, enabled = !busy && portsValid) { Text("Сохранить") }
+                Button(
+                    onClick = { onSave(label, hash, ports) },
+                    enabled = !busy && portsValid && hashError == null
+                ) { Text("Сохранить") }
             }
         }
     )
@@ -1949,7 +2035,8 @@ private fun ServerToolsDialog(
 	                                ServerToolsStep.Overview -> {
 	                                    Text("Состояние", fontWeight = FontWeight.Bold)
 	                                    InfoLine("Клиенты", "${state.passwordCount}/${state.maxPasswords}")
-                                    InfoLine("Устройства", state.deviceCount.toString())
+                                    InfoLine("Устройства клиентов", state.deviceCount.toString())
+                                    InfoLine("Устройства владельца", state.ownerDeviceCount.toString())
                                     InfoLine("Истёкшие", state.expiredCount.toString())
                                     InfoLine("Забытые устройства", state.orphanDeviceCount.toString())
                                     InfoLine(
@@ -2549,6 +2636,7 @@ private fun CreateClientWizardDialog(
     var customPassword by rememberSaveable { mutableStateOf("") }
     val effectivePorts = if (useDefaultPorts) defaultPorts else customPorts
     val portsValid = effectivePorts.isPortsSpec()
+    val hashError = vkHashInputError(vkHash)
     val passwordError = if (useAutoPassword || customPassword.isEmpty()) null else when {
         ClientPasswordRules.validate(customPassword) != null -> ClientPasswordRules.validate(customPassword)
         customPassword == mainPassword -> "Пароль клиента не должен совпадать с главным паролем."
@@ -2614,11 +2702,16 @@ private fun CreateClientWizardDialog(
                                 }
                                 ClientWizardStep.Hash -> {
                                     Text("VK-хеш", fontWeight = FontWeight.Bold)
-                                    Text("Нужен для быстрой ссылки, QR и файла. Можно вставить сам хеш или ссылку приглашения.", style = MaterialTheme.typography.bodySmall)
+                                    Text(
+                                        "Лучше добавить перед передачей. Без хеша доступ тоже можно отправить, но клиенту придётся добавить свой.",
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
                                     OutlinedTextField(
                                         value = vkHash,
-                                        onValueChange = { vkHash = it },
+                                        onValueChange = { vkHash = it.take(4096) },
                                         label = { Text("Хеш или ссылка") },
+                                        supportingText = { hashError?.let { Text(it) } },
+                                        isError = hashError != null,
                                         minLines = 2,
                                         modifier = Modifier.fillMaxWidth()
                                     )
@@ -2682,6 +2775,13 @@ private fun CreateClientWizardDialog(
                                     Text("VK-хеш: ${if (vkHash.isBlank()) "не задан" else "задан"}")
                                     Text("Порты: $effectivePorts")
                                     Text("Пароль: ${if (useAutoPassword) "будет создан автоматически" else customPassword}")
+                                    if (vkHash.isBlank()) {
+                                        Text(
+                                            "Без VK-хеша клиент добавит свой перед запуском.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                    }
                                     Text(
                                         "Новый доступ начнёт работать сразу, текущие подключения не прервутся.",
                                         style = MaterialTheme.typography.bodySmall,
@@ -2696,6 +2796,7 @@ private fun CreateClientWizardDialog(
         confirmButton = {
             Button(
                 enabled = !busy &&
+                    (step != ClientWizardStep.Hash || hashError == null) &&
                     (step != ClientWizardStep.Ports || portsValid) &&
                     (step != ClientWizardStep.Password || passwordValid),
                 onClick = {
@@ -2811,6 +2912,7 @@ private fun ExtendClientDialog(
 private fun ClientQrDialog(
     title: String,
     bitmap: Bitmap,
+    missingVkHashes: Boolean,
     onDismiss: () -> Unit,
     onShare: () -> Unit,
     onSave: () -> Unit
@@ -2837,7 +2939,15 @@ private fun ClientQrDialog(
                 Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Image(bitmap = bitmap.asImageBitmap(), contentDescription = "QR-код WDTT Plus", modifier = Modifier.fillMaxWidth())
                 }
-                Text("QR содержит пароль и VK-хеш. Не публикуйте изображение.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                Text(
+                    if (missingVkHashes) {
+                        "VK-хеш не задан. Клиенту нужно добавить свой перед запуском."
+                    } else {
+                        "QR содержит пароль и VK-хеш. Не публикуйте изображение."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
                         modifier = Modifier.weight(1f).heightIn(min = 48.dp),

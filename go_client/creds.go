@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"math/rand"
-	"net"
 	neturl "net/url"
 	"strings"
 	"sync"
@@ -29,10 +28,24 @@ type VKCredentials struct {
 	ClientSecret string
 }
 
+type legacyVKCredentialProvider string
+
+const (
+	legacyVKProviderCustom  legacyVKCredentialProvider = "legacy-custom"
+	legacyVKProviderBuiltIn legacyVKCredentialProvider = "legacy-built-in"
+)
+
+type legacyVKCredentialCandidate struct {
+	Credentials VKCredentials
+	Provider    legacyVKCredentialProvider
+}
+
 var vkCredentialsList = []VKCredentials{
 	{ClientID: "6287487", ClientSecret: "MuAxFaKDYDOICzGnEOhp"},
 	{ClientID: "8202606", ClientSecret: "lMRsTiMCyPnp5vfoldmn"},
 }
+
+var customVKCredentials *VKCredentials
 
 // Full list of known credentials to match against when setting active client IDs
 var knownVKCredentials = map[string]VKCredentials{
@@ -54,6 +67,44 @@ func SetActiveClientIds(ids string) {
 	if len(newCreds) > 0 {
 		vkCredentialsList = newCreds
 	}
+}
+
+func SetCustomVKCredentials(clientID, clientSecret string) error {
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" || len(clientID) > 20 {
+		return errors.New("client ID must contain 1 to 20 digits")
+	}
+	for _, char := range clientID {
+		if char < '0' || char > '9' {
+			return errors.New("client ID must contain digits only")
+		}
+	}
+	if strings.TrimSpace(clientSecret) == "" {
+		return errors.New("client secret is empty")
+	}
+	credentials := VKCredentials{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+	}
+	customVKCredentials = &credentials
+	return nil
+}
+
+func legacyVKCredentialCandidates() []legacyVKCredentialCandidate {
+	result := make([]legacyVKCredentialCandidate, 0, len(vkCredentialsList)+1)
+	if customVKCredentials != nil {
+		result = append(result, legacyVKCredentialCandidate{
+			Credentials: *customVKCredentials,
+			Provider:    legacyVKProviderCustom,
+		})
+	}
+	for _, credentials := range vkCredentialsList {
+		result = append(result, legacyVKCredentialCandidate{
+			Credentials: credentials,
+			Provider:    legacyVKProviderBuiltIn,
+		})
+	}
+	return result
 }
 
 func GetActiveClientIdsString() string {
@@ -82,6 +133,14 @@ type TurnCredentials struct {
 	Link        string
 }
 
+type fetchedTurnCredentials struct {
+	Username    string
+	Password    string
+	ServerAddrs []string
+	Lifetime    time.Duration
+	Provider    string
+}
+
 type StreamCredentialsCache struct {
 	creds         TurnCredentials
 	mutex         sync.RWMutex
@@ -95,6 +154,20 @@ const (
 	maxCacheErrors     = 3
 	errorWindow        = 10 * time.Second
 )
+
+func credentialCacheLifetime(reported time.Duration) time.Duration {
+	if reported <= 0 {
+		return credentialLifetime - cacheSafetyMargin
+	}
+	if reported > 24*time.Hour {
+		reported = 24 * time.Hour
+	}
+	margin := cacheSafetyMargin
+	if reported <= 2*cacheSafetyMargin {
+		margin = reported / 5
+	}
+	return reported - margin
+}
 
 var streamsPerCache = 10
 
@@ -325,19 +398,21 @@ func getVkCredsCached(ctx context.Context, link string, streamID int) (string, s
 		return cache.creds.Username, cache.creds.Password, cloneStringSlice(cache.creds.ServerAddrs), nil
 	}
 
-	user, pass, addrs, err := fetchVkCredsSerialized(ctx, link, streamID)
+	fetched, err := fetchVkCredsSerialized(ctx, link, streamID)
 	if err != nil {
 		return "", "", nil, err
 	}
+	cacheLifetime := credentialCacheLifetime(fetched.Lifetime)
 
 	cache.creds = TurnCredentials{
-		Username:    user,
-		Password:    pass,
-		ServerAddrs: addrs,
-		ExpiresAt:   time.Now().Add(credentialLifetime - cacheSafetyMargin),
+		Username:    fetched.Username,
+		Password:    fetched.Password,
+		ServerAddrs: fetched.ServerAddrs,
+		ExpiresAt:   time.Now().Add(cacheLifetime),
 		Link:        link,
 	}
-	return user, pass, cloneStringSlice(addrs), nil
+	log.Printf("[STREAM %d] [VK Provider] %s: TURN-данные сохранены на %v", streamID, fetched.Provider, cacheLifetime.Truncate(time.Second))
+	return fetched.Username, fetched.Password, cloneStringSlice(fetched.ServerAddrs), nil
 }
 
 // ─── Serialized (throttled) fetcher ───
@@ -347,7 +422,7 @@ var (
 	globalLastVkFetchTime time.Time
 )
 
-func fetchVkCredsSerialized(ctx context.Context, link string, streamID int) (string, string, []string, error) {
+func fetchVkCredsSerialized(ctx context.Context, link string, streamID int) (fetchedTurnCredentials, error) {
 	vkRequestMu.Lock()
 	defer vkRequestMu.Unlock()
 
@@ -360,7 +435,7 @@ func fetchVkCredsSerialized(ctx context.Context, link string, streamID int) (str
 		log.Printf("[STREAM %d] [VK Auth] Throttling: waiting %v to prevent rate limit...", streamID, wait.Truncate(time.Millisecond))
 		select {
 		case <-ctx.Done():
-			return "", "", nil, ctx.Err()
+			return fetchedTurnCredentials{}, ctx.Err()
 		case <-time.After(wait):
 		}
 	}
@@ -374,67 +449,89 @@ func fetchVkCredsSerialized(ctx context.Context, link string, streamID int) (str
 
 // ─── Main credential fetcher (rotates through stable credential sets) ───
 
-func fetchVkCreds(ctx context.Context, link string, streamID int) (string, string, []string, error) {
+func fetchVkCreds(ctx context.Context, link string, streamID int) (fetchedTurnCredentials, error) {
 	if vkCallsPreflightEnabled.Load() {
 		if pause := vkCallsFloodPauseRemaining(time.Now()); pause > 0 {
-			log.Printf("[STREAM %d] [VKCalls] preflight временно пропущен после ограничения VK (%v); продолжаем captcha-цепочку", streamID, pause.Truncate(time.Second))
+			log.Printf("[STREAM %d] [VKCalls] preflight временно пропущен после ограничения VK (%v); продолжаем резервную legacy-цепочку", streamID, pause.Truncate(time.Second))
 		} else {
 			log.Printf("[STREAM %d] [VKCalls] preflight", streamID)
-			if user, pass, addrs, err := getVKCredsViaVKCalls(ctx, link, streamID); err == nil {
-				return user, pass, addrs, nil
+			if user, pass, addrs, lifetime, err := getVKCredsViaVKCalls(ctx, link, streamID); err == nil {
+				log.Printf("[STREAM %d] [VK Provider] modern-vkcalls: успешно", streamID)
+				return fetchedTurnCredentials{
+					Username:    user,
+					Password:    pass,
+					ServerAddrs: addrs,
+					Lifetime:    lifetime,
+					Provider:    "modern-vkcalls",
+				}, nil
 			} else if isVKCallsFloodError(err) {
 				startVKCallsFloodPause(time.Now())
-				log.Printf("[STREAM %d] [VKCalls] VK временно ограничил анонимный вход; продолжаем captcha-цепочку", streamID)
+				log.Printf("[STREAM %d] [VKCalls] VK временно ограничил анонимный вход; продолжаем резервную legacy-цепочку", streamID)
 			} else {
-				log.Printf("[STREAM %d] [VKCalls] preflight не сработал: %v; продолжаем captcha-цепочку", streamID, err)
+				log.Printf("[STREAM %d] [VKCalls] preflight не сработал: %v; продолжаем резервную legacy-цепочку", streamID, err)
 			}
 		}
 	}
 
 	if time.Now().Unix() < globalCaptchaLockout.Load() {
-		return "", "", nil, fmt.Errorf("CAPTCHA_WAIT_REQUIRED: global lockout active")
+		return fetchedTurnCredentials{}, fmt.Errorf("CAPTCHA_WAIT_REQUIRED: global lockout active")
 	}
 
+	candidates := legacyVKCredentialCandidates()
+	if len(candidates) == 0 {
+		return fetchedTurnCredentials{}, errors.New("no legacy VK credentials configured")
+	}
+	attemptLimit := vkCredentialAttemptLimit
+	if len(candidates) > attemptLimit {
+		attemptLimit = len(candidates)
+	}
 	var lastErr error
 	jar := tlsclient.NewCookieJar()
 
-	for attempt := 0; attempt < vkCredentialAttemptLimit; attempt++ {
-		creds := vkCredentialsList[attempt%len(vkCredentialsList)]
-		log.Printf("[STREAM %d] [VK Auth] Trying credentials: client_id=%s (attempt %d/%d)", streamID, creds.ClientID, attempt+1, vkCredentialAttemptLimit)
+	for attempt := 0; attempt < attemptLimit; attempt++ {
+		candidate := candidates[attempt%len(candidates)]
+		creds := candidate.Credentials
+		provider := string(candidate.Provider)
+		log.Printf("[STREAM %d] [VK Provider] %s: пробуем client_id=%s (попытка %d/%d)", streamID, provider, creds.ClientID, attempt+1, attemptLimit)
 
 		user, pass, addrs, err := getTokenChain(ctx, link, streamID, creds, jar)
 
 		if err == nil {
-			log.Printf("[STREAM %d] [VK Auth] Success with client_id=%s", streamID, creds.ClientID)
-			return user, pass, addrs, nil
+			log.Printf("[STREAM %d] [VK Provider] %s: успешно", streamID, provider)
+			return fetchedTurnCredentials{
+				Username:    user,
+				Password:    pass,
+				ServerAddrs: addrs,
+				Provider:    provider,
+			}, nil
 		}
 
 		lastErr = err
-		log.Printf("[STREAM %d] [VK Auth] Failed with client_id=%s: %v", streamID, creds.ClientID, err)
+		log.Printf("[STREAM %d] [VK Provider] %s: client_id=%s не сработал: %v", streamID, provider, creds.ClientID, err)
 
 		if strings.Contains(err.Error(), "CAPTCHA_WAIT_REQUIRED") || strings.Contains(err.Error(), "FATAL_CAPTCHA") {
-			return "", "", nil, err
+			return fetchedTurnCredentials{}, err
 		}
 		if strings.Contains(err.Error(), "INVALID_JOIN_LINK") || strings.Contains(err.Error(), "ANON_BLOCKED") || strings.Contains(err.Error(), "CALL_FULL") {
-			return "", "", nil, err
+			return fetchedTurnCredentials{}, err
 		}
 
 		if strings.Contains(err.Error(), "error_code:29") || strings.Contains(err.Error(), "error_code: 29") || strings.Contains(err.Error(), "Rate limit") {
 			log.Printf("[STREAM %d] [VK Auth] Rate limit detected, trying next credentials...", streamID)
 		}
 
-		if attempt%len(vkCredentialsList) == len(vkCredentialsList)-1 && attempt+1 < vkCredentialAttemptLimit {
+		if attempt%len(candidates) == len(candidates)-1 && attempt+1 < attemptLimit {
 			wait := time.Duration(900+rand.Intn(900)) * time.Millisecond
-			log.Printf("[STREAM %d] [VK Auth] Both VK credentials failed, retrying stable pair after %v...", streamID, wait)
+			log.Printf("[STREAM %d] [VK Auth] Все legacy-провайдеры временно не сработали, повтор через %v...", streamID, wait)
 			select {
 			case <-ctx.Done():
-				return "", "", nil, ctx.Err()
+				return fetchedTurnCredentials{}, ctx.Err()
 			case <-time.After(wait):
 			}
 		}
 	}
 
-	return "", "", nil, fmt.Errorf("all VK credentials failed: %w", lastErr)
+	return fetchedTurnCredentials{}, fmt.Errorf("all VK credential providers failed: %w", lastErr)
 }
 
 // ─── Token chain: anon_token → getCallPreview → getAnonymousToken → OK session → joinConversation → TURN creds ───
@@ -485,7 +582,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 
 		httpResp, err := client.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("VK HTTPS %s: %w", domain, err)
 		}
 		defer func() {
 			if closeErr := httpResp.Body.Close(); closeErr != nil {
@@ -680,9 +777,9 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		if !ok {
 			continue
 		}
-		clean := strings.Split(urlStr, "?")[0]
-		address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
-		addresses = append(addresses, address)
+		if normalized := normalizeTURNURL(urlStr); normalized != "" {
+			addresses = append(addresses, normalized)
+		}
 	}
 
 	if len(addresses) == 0 {
@@ -874,52 +971,4 @@ func requestWebViewCaptcha(ctx context.Context, streamID int, captchaErr *VkCapt
 
 func GetCreds(ctx context.Context, link string, streamID int) (string, string, []string, error) {
 	return getVkCredsCached(ctx, link, streamID)
-}
-
-// ─── DNS dialer setup ───
-
-func setupGlobalResolver() {
-	dialer := &net.Dialer{
-		Timeout:   3 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-	yandexDNSServers := []string{"77.88.8.8:53", "77.88.8.1:53"}
-
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			var lastErr error
-			for _, dns := range yandexDNSServers {
-				conn, err := dialer.DialContext(ctx, "udp", dns)
-				if err == nil {
-					return conn, nil
-				}
-				lastErr = err
-				conn, err = dialer.DialContext(ctx, "tcp", dns)
-				if err == nil {
-					return conn, nil
-				}
-				lastErr = err
-			}
-
-			address = strings.TrimSpace(address)
-			if address != "" && !isYandexDNSAddress(address) {
-				conn, err := dialer.DialContext(ctx, network, address)
-				if err == nil {
-					return conn, nil
-				}
-				lastErr = err
-			}
-			return nil, lastErr
-		},
-	}
-}
-
-func isYandexDNSAddress(address string) bool {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		host = address
-	}
-	host = strings.Trim(host, "[]")
-	return host == "77.88.8.8" || host == "77.88.8.1"
 }
