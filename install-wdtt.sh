@@ -135,44 +135,48 @@ chmod +x /opt/usr/bin/wdtt-uninstall
 
 # ─────────────────────────── СКАЧИВАНИЕ БИНАРНИКА ───────────────────────────
 
-if ! command -v jq >/dev/null 2>&1; then
-    echo "jq не установился — без него распарсить JSON релиза не получится." >&2
-    exit 1
-fi
-
 echo "Ищу релиз $GH_TAG в ${GH_OWNER}/${GH_REPO}..."
 RELEASE_JSON="$CONF_DIR/release.json"
 
+# Подготавливаем заголовок авторизации, только если токен реально задан
+AUTH_HEADER=""
+if [ -n "$GH_TOKEN" ]; then
+    AUTH_HEADER="--header=Authorization: token ${GH_TOKEN}"
+fi
+
 wget -q \
-    --header="Authorization: token ${GH_TOKEN}" \
+    $AUTH_HEADER \
     --header="Accept: application/vnd.github+json" \
     -O "$RELEASE_JSON" \
-    "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/tags/${GH_TAG}"
+    "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/tags/${GH_TAG}" || true
 
 if jq -e '.message' "$RELEASE_JSON" >/dev/null 2>&1; then
     echo "GitHub API вернул ошибку вместо релиза:" >&2
     jq -r '.message' "$RELEASE_JSON" >&2
-    exit 1
-fi
+    
+    echo "Пробую скачать напрямую из Releases без API..."
+    DIRECT_URL="https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/${GH_TAG}/${ASSET_NAME}"
+    if wget -q --no-check-certificate -O "$INSTALL_DIR/$BIN_NAME" "$DIRECT_URL"; then
+        echo "Скачано напрямую: $INSTALL_DIR/$BIN_NAME"
+    else
+        echo "Ошибка: Не удалось скачать файл по прямой ссылке $DIRECT_URL" >&2
+        exit 1
+    fi
+else
+    ASSET_ID=$(jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .id' "$RELEASE_JSON")
 
-ASSET_ID=$(jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .id' "$RELEASE_JSON")
+    if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
+        echo "В релизе $GH_TAG не найден ассет с именем '$ASSET_NAME'." >&2
+        exit 1
+    fi
 
-if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
-    echo "В релизе $GH_TAG не найден ассет с именем '$ASSET_NAME'." >&2
-    exit 1
-fi
+    echo "Найден ассет: $ASSET_NAME (id=$ASSET_ID). Скачиваю..."
 
-echo "Найден ассет: $ASSET_NAME (id=$ASSET_ID). Скачиваю..."
-
-wget -q \
-    --header="Authorization: token ${GH_TOKEN}" \
-    --header="Accept: application/octet-stream" \
-    -O "$INSTALL_DIR/$BIN_NAME" \
-    "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/assets/${ASSET_ID}"
-
-if head -n 1 "$INSTALL_DIR/$BIN_NAME" | grep -q '{'; then
-    echo "Ошибка: скачался JSON с ошибкой вместо бинарника." >&2
-    exit 1
+    wget -q \
+        $AUTH_HEADER \
+        --header="Accept: application/octet-stream" \
+        -O "$INSTALL_DIR/$BIN_NAME" \
+        "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/assets/${ASSET_ID}"
 fi
 
 rm -f "$RELEASE_JSON"
