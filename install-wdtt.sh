@@ -23,7 +23,7 @@ run_installer() {
 
     # Вспомогательная функция очистки VK-хеша от ссылок и параметров
     clean_hash() {
-        echo "$1" | sed -E 's|.*vk\.com/call/join/||g' | sed -E 's|.*vk\.me/join/||g' | sed 's/[?#].*//' | tr -d ' \r\n\t'
+        echo "$1" | sed 's|.*vk\.com/call/join/||g; s|.*vk\.me/join/||g; s/[?#].*//' | tr -d ' \r\n\t'
     }
 
     # ─────────────────────────── АРХИТЕКТУРА ───────────────────────────
@@ -36,7 +36,7 @@ detect_arch() {
             ;;
         mips|mipsel|mips32)
             if command -v opkg >/dev/null 2>&1; then
-                oa=$(opkg print-architecture 2>/dev/null | grep -m1 -oE 'mips[a-z0-9_]*' || true)
+                oa=$(opkg print-architecture 2>/dev/null | grep -m1 -o 'mips[a-z0-9_]*' || true)
                 case "$oa" in
                     *mipsel*|*mipsle*) echo "mipsle" ;;
                     *) echo "mipsle" ;;
@@ -170,7 +170,7 @@ wget -q \
     -O "$INSTALL_DIR/$BIN_NAME" \
     "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/assets/${ASSET_ID}"
 
-if head -c 1 "$INSTALL_DIR/$BIN_NAME" | grep -q '{'; then
+if head -n 1 "$INSTALL_DIR/$BIN_NAME" | grep -q '{'; then
     echo "Ошибка: скачался JSON с ошибкой вместо бинарника." >&2
     exit 1
 fi
@@ -409,7 +409,7 @@ cat "$CONF_FILE"
 echo "════════════════════════════════════════════════════"
 echo ""
 echo "🎉 Все компоненты успешно установлены и настроены!"
-echo "   Скопируй содержимое файла конфигурации и сохрани в текстовый файл yamolodec.conf
+echo "   Скопируй содержимое файла конфигурации и сохрани в текстовый файл yamolodec.conf"
 echo "💡 Для полного удаления программы в будущем достаточно выполнить команду: wdtt-uninstall"
 
 }
