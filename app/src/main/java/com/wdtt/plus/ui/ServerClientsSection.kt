@@ -2061,7 +2061,7 @@ private fun ServerToolsDialog(
 	                                    HorizontalDivider()
 	                                    Text("Сохранено на сервере", fontWeight = FontWeight.Bold)
 	                                    InfoLine("Состояние", if (state.adminProfile.hasSavedFields) "сохранён ${formatDateTime(state.adminProfile.updatedAt)}" else "ещё не сохранён")
-	                                    InfoLine("VK-хеши", secretPresenceLabel(state.adminProfile.vkHashes))
+	                                    InfoLine("VK-хеши владельца", secretPresenceLabel(state.adminProfile.vkHashes))
 	                                    InfoLine("Резервный VK-хеш", secretPresenceLabel(state.adminProfile.secondaryVkHash))
 	                                    InfoLine("Порты", state.adminProfile.ports)
 	                                    InfoLine("Потоки", state.adminProfile.workersPerHash.toString())
@@ -2070,7 +2070,7 @@ private fun ServerToolsDialog(
 	                                    InfoLine("No DNS", if (state.adminProfile.noDns) "включено" else "выключено")
 	                                    HorizontalDivider()
 	                                    Text("Будет записано при установке", fontWeight = FontWeight.Bold)
-	                                    InfoLine("VK-хеши", secretPresenceLabel(localAdminProfile.vkHashes))
+	                                    InfoLine("VK-хеши владельца", secretPresenceLabel(localAdminProfile.vkHashes))
 	                                    InfoLine("Резервный VK-хеш", secretPresenceLabel(localAdminProfile.secondaryVkHash))
 	                                    InfoLine("Порты", localAdminProfile.ports)
 	                                    InfoLine("Потоки", localAdminProfile.workersPerHash.toString())
@@ -2701,9 +2701,9 @@ private fun CreateClientWizardDialog(
                                     )
                                 }
                                 ClientWizardStep.Hash -> {
-                                    Text("VK-хеш", fontWeight = FontWeight.Bold)
+                                    Text("Хеши клиентской ссылки", fontWeight = FontWeight.Bold)
                                     Text(
-                                        "Лучше добавить перед передачей. Без хеша доступ тоже можно отправить, но клиенту придётся добавить свой.",
+                                        "VK-хеши владельца не наследуются. Лучше добавить хеши перед передачей. Без них доступ тоже можно отправить, но клиенту придётся добавить свои.",
                                         style = MaterialTheme.typography.bodySmall
                                     )
                                     OutlinedTextField(

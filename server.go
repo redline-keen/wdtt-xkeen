@@ -40,11 +40,10 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 
 	dtlsnet "github.com/pion/dtls/v3/pkg/net"
-	pionudp "github.com/pion/transport/v4/udp"
 )
 
 const (
-	wdttServerVersion     = "12"
+	wdttServerVersion     = "13"
 	wgIfaceName           = "wdtt0"
 	wgServerAddr          = "10.66.66.1"
 	wgServerCIDR          = wgServerAddr + "/24"
@@ -2158,24 +2157,27 @@ func listenWrapped(addr *net.UDPAddr, keys *wrapKeyStore) (dtlsnet.PacketListene
 	if keys == nil || keys.Count() == 0 {
 		return nil, errors.New("wrap: no active keys")
 	}
-	listenConfig := pionudp.ListenConfig{
+	listenConfig := opportunisticUDPListenConfig{
 		Backlog:         4096,
 		AcceptFilter:    obfsIsRTPPacket,
 		ReadBufferSize:  16 * 1024 * 1024,
 		WriteBufferSize: 16 * 1024 * 1024,
-		Batch: pionudp.BatchIOConfig{
-			Enable:             true,
-			ReadBatchSize:      64,
-			WriteBatchSize:     32,
-			WriteBatchInterval: 200 * time.Microsecond,
-		},
+		ReadBatchSize:   opportunisticUDPDefaultReadBatchSize,
+		WriteBatchSize:  opportunisticUDPDefaultWriteBatchSize,
+		WriteQueueSize:  opportunisticUDPDefaultWriteQueueSize,
 	}
-	inner, err := listenConfig.Listen("udp", addr)
+	inner, err := listenOpportunisticUDP("udp", addr, listenConfig)
 	if err != nil {
 		return nil, fmt.Errorf("wrap: udp listen: %w", err)
 	}
+	log.Printf(
+		"[UDP] ReadBatch=%d | WriteBatch=opportunistic/%d | queue=%d",
+		listenConfig.ReadBatchSize,
+		listenConfig.WriteBatchSize,
+		listenConfig.WriteQueueSize,
+	)
 	return &wrapPacketListener{
-		inner: dtlsnet.PacketListenerFromListener(inner),
+		inner: inner,
 		keys:  keys,
 	}, nil
 }
@@ -2207,6 +2209,13 @@ type wrapPacketConn struct {
 	authLog    int32
 	obfsCfg    *ObfsConfig
 	obfsWrite  *ObfsState
+
+	stateMu    sync.Mutex
+	stateCond  *sync.Cond
+	activeOps  int
+	closing    bool
+	closeOnce  sync.Once
+	closeError error
 }
 
 var wrapWireBufferPool = sync.Pool{
@@ -2230,9 +2239,15 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 	raw := buf[:n]
 
+	c.stateMu.Lock()
+	if c.closing {
+		c.stateMu.Unlock()
+		return 0, addr, net.ErrClosed
+	}
 	if atomic.LoadInt32(&c.selected) == 0 {
 		key, identity, m, uErr := c.keys.Unwrap(raw, p)
 		if uErr != nil {
+			c.stateMu.Unlock()
 			if atomic.CompareAndSwapInt32(&c.authLog, 0, 1) {
 				log.Printf("[WRAP] Отказ: RTP AEAD auth failed from %s (keys=%d)", addr.String(), c.keys.Count())
 			}
@@ -2244,13 +2259,19 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		c.obfsCfg = NewObfsConfig()
 		c.obfsWrite = NewObfsState()
 		atomic.StoreInt32(&c.selected, 1)
+		c.stateMu.Unlock()
 		if atomic.CompareAndSwapInt32(&c.authLog, 0, 1) {
 			log.Printf("[WRAP] OK: ключ выбран для %s (keys=%d)", addr.String(), c.keys.Count())
 		}
 		return m, addr, nil
 	}
 
-	m, uErr := obfsUnwrapPacket(c.key, raw, p)
+	key := c.key
+	c.activeOps++
+	c.stateMu.Unlock()
+	defer c.finishOperation()
+
+	m, uErr := obfsUnwrapPacket(key, raw, p)
 	if uErr != nil {
 		return 0, addr, fmt.Errorf("obfs unwrap: %w", uErr)
 	}
@@ -2258,16 +2279,29 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.stateMu.Lock()
+	if c.closing {
+		c.stateMu.Unlock()
+		return 0, net.ErrClosed
+	}
 	if atomic.LoadInt32(&c.selected) == 0 || len(c.key) != wrapKeyLen {
+		c.stateMu.Unlock()
 		return 0, errors.New("wrap: key not selected")
 	}
 	if c.obfsCfg == nil || c.obfsWrite == nil {
 		c.obfsCfg = NewObfsConfig()
 		c.obfsWrite = NewObfsState()
 	}
+	key := c.key
+	obfsCfg := c.obfsCfg
+	obfsWrite := c.obfsWrite
+	c.activeOps++
+	c.stateMu.Unlock()
+	defer c.finishOperation()
+
 	buffer := wrapWireBufferPool.Get().(*[]byte)
 	defer wrapWireBufferPool.Put(buffer)
-	wrapped, wErr := obfsWrapPacketInto((*buffer)[:0], c.key, p, c.obfsCfg, c.obfsWrite)
+	wrapped, wErr := obfsWrapPacketInto((*buffer)[:0], key, p, obfsCfg, obfsWrite)
 	if wErr != nil {
 		return 0, fmt.Errorf("obfs wrap: %w", wErr)
 	}
@@ -2277,10 +2311,42 @@ func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return len(p), nil
 }
 
+func (c *wrapPacketConn) finishOperation() {
+	c.stateMu.Lock()
+	c.activeOps--
+	if c.activeOps == 0 && c.stateCond != nil {
+		c.stateCond.Broadcast()
+	}
+	c.stateMu.Unlock()
+}
+
 func (c *wrapPacketConn) Close() error {
-	unregisterWrappedSession(c.sessionKey, c.session)
-	zeroBytes(c.key)
-	return c.inner.Close()
+	c.closeOnce.Do(func() {
+		c.stateMu.Lock()
+		c.closing = true
+		if c.stateCond == nil {
+			c.stateCond = sync.NewCond(&c.stateMu)
+		}
+		sessionKey := c.sessionKey
+		session := c.session
+		c.stateMu.Unlock()
+
+		unregisterWrappedSession(sessionKey, session)
+		closeError := c.inner.Close()
+
+		c.stateMu.Lock()
+		for c.activeOps > 0 {
+			c.stateCond.Wait()
+		}
+		zeroBytes(c.key)
+		c.key = nil
+		c.closeError = closeError
+		c.stateMu.Unlock()
+	})
+
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.closeError
 }
 func (c *wrapPacketConn) LocalAddr() net.Addr                { return c.inner.LocalAddr() }
 func (c *wrapPacketConn) SetDeadline(t time.Time) error      { return c.inner.SetDeadline(t) }

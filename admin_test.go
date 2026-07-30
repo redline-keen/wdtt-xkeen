@@ -26,6 +26,33 @@ func TestAdminServerInfoReportsRunningBinarySHA256(t *testing.T) {
 	}
 }
 
+func TestAdminServerInfoReportsOpportunisticUDPWriteStats(t *testing.T) {
+	stats := &opportunisticUDPWriteStats{}
+	stats.singleWrites.Store(7)
+	stats.batchCalls.Store(3)
+	stats.batchMessages.Store(11)
+	stats.partialBatchWrites.Store(1)
+	stats.writeErrors.Store(2)
+	stats.queueHighWater.Store(9)
+	previous := activeOpportunisticUDPWriteStats.Swap(stats)
+	defer activeOpportunisticUDPWriteStats.Store(previous)
+
+	info := buildAdminServerInfo(t.TempDir(), &Database{
+		DefaultPorts: "56000,56001,9000",
+		MaxPasswords: 10,
+		Passwords:    make(map[string]*PasswordEntry),
+		Devices:      make(map[string]*ClientDevice),
+	})
+	if info.UDPWriteSingle != 7 ||
+		info.UDPWriteBatchCalls != 3 ||
+		info.UDPWriteBatchMessages != 11 ||
+		info.UDPWritePartialBatches != 1 ||
+		info.UDPWriteErrors != 2 ||
+		info.UDPWriteQueueHighWater != 9 {
+		t.Fatalf("unexpected UDP write stats: %+v", info)
+	}
+}
+
 func TestAdminServerInfoSeparatesClientAndOwnerDevices(t *testing.T) {
 	loaded := &Database{
 		DefaultPorts: "56000,56001,9000",

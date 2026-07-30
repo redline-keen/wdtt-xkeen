@@ -111,6 +111,12 @@ type adminServerInfo struct {
 	HandshakeFailures      int64              `json:"handshake_failures"`
 	HandshakeThrottles     int64              `json:"handshake_throttles"`
 	WorkerLimitRejects     int64              `json:"worker_limit_rejections"`
+	UDPWriteSingle         uint64             `json:"udp_write_single"`
+	UDPWriteBatchCalls     uint64             `json:"udp_write_batch_calls"`
+	UDPWriteBatchMessages  uint64             `json:"udp_write_batch_messages"`
+	UDPWritePartialBatches uint64             `json:"udp_write_partial_batches"`
+	UDPWriteErrors         uint64             `json:"udp_write_errors"`
+	UDPWriteQueueHighWater uint64             `json:"udp_write_queue_high_water"`
 	OrphanDevices          []adminDeviceInfo  `json:"orphan_devices,omitempty"`
 	Traffic                adminTrafficPeriod `json:"traffic"`
 	AdminTraffic           adminTrafficPeriod `json:"admin_traffic"`
@@ -797,6 +803,7 @@ func buildAdminServerInfo(configDir string, loaded *Database) *adminServerInfo {
 		available = 0
 	}
 	maxWorkersPerAccess, maxClientMbps := configuredAccessRuntimeLimits()
+	udpWriteStats := currentOpportunisticUDPWriteStats()
 	return &adminServerInfo{
 		WDTTPlusVersion:        wdttServerVersion,
 		BinarySHA256:           runningBinarySHA256(),
@@ -827,6 +834,12 @@ func buildAdminServerInfo(configDir string, loaded *Database) *adminServerInfo {
 		HandshakeFailures:      atomic.LoadInt64(&handshakeFailures),
 		HandshakeThrottles:     atomic.LoadInt64(&handshakeThrottles),
 		WorkerLimitRejects:     atomic.LoadInt64(&workerLimitRejections),
+		UDPWriteSingle:         udpWriteStats.SingleWrites,
+		UDPWriteBatchCalls:     udpWriteStats.BatchCalls,
+		UDPWriteBatchMessages:  udpWriteStats.BatchMessages,
+		UDPWritePartialBatches: udpWriteStats.PartialBatchWrites,
+		UDPWriteErrors:         udpWriteStats.WriteErrors,
+		UDPWriteQueueHighWater: udpWriteStats.QueueHighWater,
 		OrphanDevices:          orphanDevices,
 		Traffic:                buildAdminDatabaseTraffic(loaded),
 		AdminTraffic:           buildAdminTrafficPeriod(loaded.AdminTraffic, loaded.AdminDownBytes, loaded.AdminUpBytes),

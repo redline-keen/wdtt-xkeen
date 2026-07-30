@@ -104,9 +104,11 @@ import java.time.format.DateTimeFormatter
 import java.util.Base64
 import java.util.Date
 import java.util.Locale
+import org.json.JSONArray
 import org.json.JSONObject
 
 private const val CMD_TIMEOUT = 900000L // 15 minutes
+private const val DEPLOY_READY_HOLD_MS = 800L
 private const val SERVER_BACKUP_FORMAT_VERSION = 2
 private const val MAX_SERVER_BACKUP_FILE_CHARS = 8_000_000
 private const val MAX_SERVER_DATABASE_CHARS = 5_000_000
@@ -1368,7 +1370,7 @@ fun DeployTab(
                             "Поля «Туннеля» стандартные — профиль владельца на сервере не изменяю..."
                         }
                     )
-                    val ownerProfileSaved = syncOwnerProfileToServer(
+                    syncOwnerProfileToServer(
                         requestHost = request.host,
                         requestUser = request.user,
                         requestPassword = request.pass,
@@ -1383,7 +1385,7 @@ fun DeployTab(
                         TunnelManager.addDeployErrorLog("Профиль владельца после деплоя: ${friendlyDeployError(it, "сохранение")}")
                     }
                     DeployManager.updateProgress(0.985f, "Сохраняю профиль выходного IP на сервере...")
-                    val outboundProfileSaved = runCatching {
+                    runCatching {
                         writeOutboundProfileToServer(
                             context = appContext,
                             target = OutboundSshTarget(
@@ -1401,16 +1403,12 @@ fun DeployTab(
                         DeployManager.writeError("Outbound profile sync after deploy error: ${it.message}")
                         TunnelManager.addDeployErrorLog("Профиль выходного IP после деплоя: ${friendlyDeployError(it, "сохранение")}")
                     }
-                    DeployManager.updateProgress(
-                        1f,
-                        when {
-                            ownerProfileSaved.getOrNull() == true && outboundProfileSaved.isSuccess -> "Сервер обновлён, заданные поля профиля владельца и профиль выходного IP сохранены."
-                            ownerProfileSaved.getOrNull() == true -> "Сервер обновлён, заданные поля профиля владельца сохранены."
-                            ownerProfileSaved.isSuccess && outboundProfileSaved.isSuccess -> "Сервер обновлён. Стандартные поля «Туннеля» не меняли профиль владельца на сервере."
-                            ownerProfileSaved.isSuccess -> "Сервер обновлён. Профиль владельца на сервере не изменён."
-                            outboundProfileSaved.isSuccess -> "Сервер обновлён, профиль выходного IP сохранён."
-                            else -> "Сервер обновлён. Дополнительные профили не сохранились автоматически."
-                        }
+                    DeployManager.updateProgress(1f, "Готово!")
+                    kotlinx.coroutines.delay(DEPLOY_READY_HOLD_MS)
+                    DeployManager.stopDeploy("success")
+                    TunnelManager.addDeploySuccessLog(
+                        "Деплой успешно завершён. Серверная часть WDTT Plus " +
+                            "${DeployManager.installedServerVersion.value}, сервис активен."
                     )
                     successCountdown = 5
                     showSuccessBanner = true
@@ -10320,7 +10318,127 @@ private fun rollbackServerUpdate(ssh: SSHClient) {
     }
 }
 
-private fun validatePreservedServerState(beforeJson: String, afterJson: String) {
+private data class PreservedTrafficCounter(
+    val downBytes: Long,
+    val upBytes: Long
+)
+
+private fun trafficCountersByDate(history: JSONArray?): Map<String, PreservedTrafficCounter> {
+    if (history == null) return emptyMap()
+    val result = linkedMapOf<String, PreservedTrafficCounter>()
+    for (index in 0 until history.length()) {
+        val bucket = history.optJSONObject(index) ?: continue
+        val date = bucket.optString("date", "")
+        val previous = result[date] ?: PreservedTrafficCounter(0L, 0L)
+        result[date] = PreservedTrafficCounter(
+            downBytes = Math.addExact(previous.downBytes, bucket.optLong("down_bytes", 0L)),
+            upBytes = Math.addExact(previous.upBytes, bucket.optLong("up_bytes", 0L))
+        )
+    }
+    return result
+}
+
+private fun requireCounterNotRegressed(
+    expected: Long,
+    actual: Long,
+    description: String
+) {
+    require(actual >= expected) { "$description уменьшился" }
+}
+
+private fun requireTrafficHistoryNotRegressed(
+    expected: JSONArray?,
+    actual: JSONArray?,
+    description: String
+) {
+    val actualByDate = trafficCountersByDate(actual)
+    trafficCountersByDate(expected).forEach { (date, expectedCounter) ->
+        val actualCounter = actualByDate[date]
+        require(
+            actualCounter != null &&
+                actualCounter.downBytes >= expectedCounter.downBytes &&
+                actualCounter.upBytes >= expectedCounter.upBytes
+        ) {
+            "$description за $date уменьшилась или пропала"
+        }
+    }
+}
+
+private fun bindHistoryEntries(history: JSONArray?): List<String> {
+    if (history == null) return emptyList()
+    return buildList(history.length()) {
+        for (index in 0 until history.length()) {
+            add(history.getJSONObject(index).toString())
+        }
+    }
+}
+
+private fun requireBindHistoryNotRegressed(
+    expected: JSONArray?,
+    actual: JSONArray?,
+    description: String
+) {
+    val expectedEntries = bindHistoryEntries(expected)
+    if (expectedEntries.isEmpty()) return
+    val actualEntries = bindHistoryEntries(actual)
+
+    if (actualEntries.size >= expectedEntries.size &&
+        actualEntries.subList(0, expectedEntries.size) == expectedEntries
+    ) {
+        return
+    }
+
+    // Сервер хранит последние 50 событий. Новые события могут вытеснить
+    // только начало истории, поэтому требуем непрерывное пересечение:
+    // хвост прежней истории должен стать началом новой.
+    if (actualEntries.size == 50) {
+        val maxOverlap = minOf(expectedEntries.size, actualEntries.size)
+        for (overlap in maxOverlap downTo 1) {
+            if (expectedEntries.takeLast(overlap) == actualEntries.take(overlap)) {
+                return
+            }
+        }
+    }
+
+    throw IllegalArgumentException("$description была изменена или потеряна")
+}
+
+private fun requireStringArrayContainsAll(
+    expected: JSONArray?,
+    actual: JSONArray?,
+    description: String
+) {
+    val actualValues = buildSet {
+        if (actual != null) {
+            for (index in 0 until actual.length()) {
+                actual.optString(index).takeIf(String::isNotBlank)?.let(::add)
+            }
+        }
+    }
+    if (expected != null) {
+        for (index in 0 until expected.length()) {
+            val value = expected.optString(index)
+            require(value.isBlank() || value in actualValues) { "$description был сокращён" }
+        }
+    }
+}
+
+private fun requireDeviceBindingNotRegressed(
+    expectedDeviceId: String,
+    actualDeviceId: String,
+    actualDevices: JSONObject,
+    description: String
+) {
+    if (expectedDeviceId.isNotBlank()) {
+        require(actualDeviceId == expectedDeviceId) { "$description была удалена или заменена" }
+        return
+    }
+    require(actualDeviceId.isBlank() || actualDevices.has(actualDeviceId)) {
+        "$description ссылается на отсутствующее устройство"
+    }
+}
+
+internal fun validatePreservedServerState(beforeJson: String, afterJson: String) {
     val before = JSONObject(beforeJson)
     val after = JSONObject(afterJson)
     validatePasswordsDbStructure(after)
@@ -10333,7 +10451,13 @@ private fun validatePreservedServerState(beforeJson: String, afterJson: String) 
         if (!passwordShouldRemainAfterImport(oldEntry, safeExpiryCutoff)) return@forEach
         val newEntry = afterPasswords.optJSONObject(password)
             ?: throw IllegalStateException("после обновления пропал действующий клиент ${password.take(4)}…")
-        listOf("device_id", "label", "vk_hash", "ports").forEach { field ->
+        requireDeviceBindingNotRegressed(
+            expectedDeviceId = oldEntry.optString("device_id", ""),
+            actualDeviceId = newEntry.optString("device_id", ""),
+            actualDevices = afterDevices,
+            description = "после обновления привязка клиента ${password.take(4)}…"
+        )
+        listOf("label", "vk_hash", "ports").forEach { field ->
             require(oldEntry.optString(field, "") == newEntry.optString(field, "")) {
                 "после обновления изменилось поле $field у клиента ${password.take(4)}…"
             }
@@ -10348,18 +10472,22 @@ private fun validatePreservedServerState(beforeJson: String, afterJson: String) 
             "после обновления изменился статус клиента ${password.take(4)}…"
         }
         listOf("down_bytes", "up_bytes").forEach { field ->
-            require(oldEntry.optLong(field, 0L) == newEntry.optLong(field, 0L)) {
-                "после обновления изменилось поле $field у клиента ${password.take(4)}…"
-            }
+            requireCounterNotRegressed(
+                expected = oldEntry.optLong(field, 0L),
+                actual = newEntry.optLong(field, 0L),
+                description = "после обновления поле $field у клиента ${password.take(4)}…"
+            )
         }
-        listOf("bind_history", "traffic").forEach { field ->
-            require(
-                oldEntry.optJSONArray(field)?.toString().orEmpty() ==
-                    newEntry.optJSONArray(field)?.toString().orEmpty()
-            ) {
-                "после обновления изменилась история $field у клиента ${password.take(4)}…"
-            }
-        }
+        requireTrafficHistoryNotRegressed(
+            expected = oldEntry.optJSONArray("traffic"),
+            actual = newEntry.optJSONArray("traffic"),
+            description = "после обновления история traffic у клиента ${password.take(4)}…"
+        )
+        requireBindHistoryNotRegressed(
+            expected = oldEntry.optJSONArray("bind_history"),
+            actual = newEntry.optJSONArray("bind_history"),
+            description = "после обновления история bind_history у клиента ${password.take(4)}…"
+        )
         require(
             oldEntry.optJSONObject("traffic_imports")?.toString().orEmpty() ==
                 newEntry.optJSONObject("traffic_imports")?.toString().orEmpty()
@@ -10371,6 +10499,18 @@ private fun validatePreservedServerState(beforeJson: String, afterJson: String) 
             require(afterDevices.has(deviceId)) { "после обновления пропала привязка устройства клиента ${password.take(4)}…" }
         }
     }
+    listOf("admin_down_bytes", "admin_up_bytes").forEach { field ->
+        requireCounterNotRegressed(
+            expected = before.optLong(field, 0L),
+            actual = after.optLong(field, 0L),
+            description = "после обновления поле $field владельца"
+        )
+    }
+    requireTrafficHistoryNotRegressed(
+        expected = before.optJSONArray("admin_traffic"),
+        actual = after.optJSONArray("admin_traffic"),
+        description = "после обновления история трафика владельца"
+    )
 }
 
 private fun passwordShouldRemainAfterImport(entry: JSONObject, safeExpiryCutoff: Long): Boolean {
@@ -10386,23 +10526,12 @@ private fun validateImportedDevice(
     actual: JSONObject,
     allowIpReassignment: Boolean
 ) {
-    val stringFields = listOf(
+    val immutableStringFields = listOf(
         "device_id",
         "priv_key",
-        "pub_key",
-        "name",
-        "manufacturer",
-        "brand",
-        "model",
-        "android_version",
-        "abi",
-        "app_version",
-        "locale",
-        "country",
-        "time_zone",
-        "remote_ip"
+        "pub_key"
     )
-    stringFields.forEach { field ->
+    immutableStringFields.forEach { field ->
         require(expected.optString(field, "") == actual.optString(field, "")) {
             "после импорта изменилось поле $field у устройства ${deviceId.take(8)}…"
         }
@@ -10412,11 +10541,40 @@ private fun validateImportedDevice(
             "после импорта изменился внутренний IP устройства ${deviceId.take(8)}…"
         }
     }
-    require(expected.optInt("sdk", 0) == actual.optInt("sdk", 0)) {
-        "после импорта изменилось поле sdk у устройства ${deviceId.take(8)}…"
-    }
-    require(expected.optLong("last_seen_at", 0L) == actual.optLong("last_seen_at", 0L)) {
-        "после импорта изменилось поле last_seen_at у устройства ${deviceId.take(8)}…"
+
+    val expectedLastSeen = expected.optLong("last_seen_at", 0L)
+    val actualLastSeen = actual.optLong("last_seen_at", 0L)
+    requireCounterNotRegressed(
+        expected = expectedLastSeen,
+        actual = actualLastSeen,
+        description = "после импорта last_seen_at устройства ${deviceId.take(8)}…"
+    )
+
+    // После запуска импортированное устройство может сразу переподключиться
+    // и штатно освежить эти сведения. Без нового last_seen они должны
+    // совпадать с резервной копией точно.
+    if (actualLastSeen == expectedLastSeen) {
+        val observedStringFields = listOf(
+            "name",
+            "manufacturer",
+            "brand",
+            "model",
+            "android_version",
+            "abi",
+            "app_version",
+            "locale",
+            "country",
+            "time_zone",
+            "remote_ip"
+        )
+        observedStringFields.forEach { field ->
+            require(expected.optString(field, "") == actual.optString(field, "")) {
+                "после импорта изменилось поле $field у устройства ${deviceId.take(8)}…"
+            }
+        }
+        require(expected.optInt("sdk", 0) == actual.optInt("sdk", 0)) {
+            "после импорта изменилось поле sdk у устройства ${deviceId.take(8)}…"
+        }
     }
 }
 
@@ -10447,24 +10605,42 @@ internal fun validateImportedServerState(
         if (!passwordShouldRemainAfterImport(expected, safeExpiryCutoff)) return@forEach
         val actual = afterPasswords.optJSONObject(password)
             ?: throw IllegalStateException("после импорта не найден клиент ${password.take(4)}…")
-        listOf("device_id", "label", "vk_hash").forEach { field ->
+        requireDeviceBindingNotRegressed(
+            expectedDeviceId = expected.optString("device_id", ""),
+            actualDeviceId = actual.optString("device_id", ""),
+            actualDevices = afterDevices,
+            description = "после импорта привязка клиента ${password.take(4)}…"
+        )
+        listOf("label", "vk_hash").forEach { field ->
             require(expected.optString(field, "") == actual.optString(field, "")) {
                 "после импорта изменилось поле $field у клиента ${password.take(4)}…"
             }
         }
-        listOf("expires_at", "purge_after", "down_bytes", "up_bytes").forEach { field ->
+        listOf("expires_at", "purge_after").forEach { field ->
             require(expected.optLong(field, 0L) == actual.optLong(field, 0L)) {
                 "после импорта изменилось поле $field у клиента ${password.take(4)}…"
             }
         }
+        listOf("down_bytes", "up_bytes").forEach { field ->
+            requireCounterNotRegressed(
+                expected = expected.optLong(field, 0L),
+                actual = actual.optLong(field, 0L),
+                description = "после импорта поле $field у клиента ${password.take(4)}…"
+            )
+        }
         require(expected.optBoolean("is_deactivated", false) == actual.optBoolean("is_deactivated", false)) {
             "после импорта изменился статус клиента ${password.take(4)}…"
         }
-        listOf("bind_history", "traffic").forEach { field ->
-            require(expected.optJSONArray(field)?.toString().orEmpty() == actual.optJSONArray(field)?.toString().orEmpty()) {
-                "после импорта изменилась история $field у клиента ${password.take(4)}…"
-            }
-        }
+        requireTrafficHistoryNotRegressed(
+            expected = expected.optJSONArray("traffic"),
+            actual = actual.optJSONArray("traffic"),
+            description = "после импорта история traffic у клиента ${password.take(4)}…"
+        )
+        requireBindHistoryNotRegressed(
+            expected = expected.optJSONArray("bind_history"),
+            actual = actual.optJSONArray("bind_history"),
+            description = "после импорта история bind_history у клиента ${password.take(4)}…"
+        )
         require(
             expected.optJSONObject("traffic_imports")?.toString().orEmpty() ==
                 actual.optJSONObject("traffic_imports")?.toString().orEmpty()
@@ -10487,18 +10663,18 @@ internal fun validateImportedServerState(
     }
 
     if (replace) {
-        require(source.optLong("admin_down_bytes", 0L) == after.optLong("admin_down_bytes", 0L)) {
-            "после импорта изменился входящий трафик владельца"
+        listOf("admin_down_bytes", "admin_up_bytes").forEach { field ->
+            requireCounterNotRegressed(
+                expected = source.optLong(field, 0L),
+                actual = after.optLong(field, 0L),
+                description = "после импорта поле $field владельца"
+            )
         }
-        require(source.optLong("admin_up_bytes", 0L) == after.optLong("admin_up_bytes", 0L)) {
-            "после импорта изменился исходящий трафик владельца"
-        }
-        require(
-            source.optJSONArray("admin_traffic")?.toString().orEmpty() ==
-                after.optJSONArray("admin_traffic")?.toString().orEmpty()
-        ) {
-            "после импорта изменилась история трафика владельца"
-        }
+        requireTrafficHistoryNotRegressed(
+            expected = source.optJSONArray("admin_traffic"),
+            actual = after.optJSONArray("admin_traffic"),
+            description = "после импорта история трафика владельца"
+        )
         require(source.optInt("max_passwords", 50) == after.optInt("max_passwords", 50)) {
             "после импорта изменился лимит клиентов"
         }
@@ -10532,12 +10708,11 @@ internal fun validateImportedServerState(
             require(expectedProfile.optLong("updated_at", 0L) == actualProfile?.optLong("updated_at", 0L)) {
                 "после импорта изменилось время профиля владельца"
             }
-            require(
-                expectedProfile.optJSONArray("device_ids")?.toString().orEmpty() ==
-                    actualProfile?.optJSONArray("device_ids")?.toString().orEmpty()
-            ) {
-                "после импорта изменился список устройств владельца"
-            }
+            requireStringArrayContainsAll(
+                expected = expectedProfile.optJSONArray("device_ids"),
+                actual = actualProfile?.optJSONArray("device_ids"),
+                description = "после импорта список устройств владельца"
+            )
         }
 
         val purgeableDeviceIds = sourcePasswords.keys()
@@ -10734,8 +10909,6 @@ private suspend fun performDeploy(
 				rollbackPrepared = false
 			}
 			DeployManager.installedServerVersion.value = installedServerVersion
-            DeployManager.stopDeploy("success")
-            TunnelManager.addDeploySuccessLog("Деплой успешно завершён. Серверная часть WDTT Plus $installedServerVersion, сервис активен.")
             return@withContext true
         } else if (output.contains("error:")) {
             DeployManager.writeError("Deploy script output contains error")

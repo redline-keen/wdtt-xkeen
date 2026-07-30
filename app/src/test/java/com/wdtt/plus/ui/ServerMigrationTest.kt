@@ -72,6 +72,121 @@ class ServerMigrationTest {
         validatePasswordsDbForPreserving(db, "new-owner-password")
     }
 
+    @Test
+    fun preserveUpdate_acceptsLiveTrafficAndHistoryGrowth() {
+        val before = database("client-a", "Телефон")
+            .put("admin_down_bytes", 5_000L)
+            .put("admin_up_bytes", 2_000L)
+            .put(
+                "admin_traffic",
+                JSONArray().put(trafficBucket("2026-07-30", 5_000L, 2_000L))
+            )
+        before.getJSONObject("passwords").getJSONObject("client-a")
+            .getJSONArray("bind_history")
+            .put(bindEvent(1))
+
+        val after = JSONObject(before.toString())
+        after.put("admin_down_bytes", 5_200L)
+            .put("admin_up_bytes", 2_100L)
+        after.getJSONArray("admin_traffic")
+            .getJSONObject(0)
+            .put("down_bytes", 5_200L)
+            .put("up_bytes", 2_100L)
+        val afterEntry = after.getJSONObject("passwords").getJSONObject("client-a")
+        afterEntry.put("down_bytes", 1_500L)
+            .put("up_bytes", 2_500L)
+        afterEntry.getJSONArray("traffic")
+            .getJSONObject(0)
+            .put("down_bytes", 1_500L)
+            .put("up_bytes", 2_500L)
+        afterEntry.getJSONArray("traffic")
+            .put(trafficBucket("2026-07-30", 25L, 10L))
+        afterEntry.getJSONArray("bind_history").put(bindEvent(2))
+
+        validatePreservedServerState(before.toString(), after.toString())
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun preserveUpdate_rejectsTrafficCounterRegression() {
+        val before = database("client-a", "Телефон")
+        val after = JSONObject(before.toString())
+        after.getJSONObject("passwords").getJSONObject("client-a")
+            .put("down_bytes", 1_023L)
+
+        validatePreservedServerState(before.toString(), after.toString())
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun preserveUpdate_rejectsTrafficHistoryRegression() {
+        val before = database("client-a", "Телефон")
+        val after = JSONObject(before.toString())
+        val entry = after.getJSONObject("passwords").getJSONObject("client-a")
+        entry.put("down_bytes", 2_048L)
+        entry.getJSONArray("traffic").getJSONObject(0)
+            .put("down_bytes", 1_023L)
+
+        validatePreservedServerState(before.toString(), after.toString())
+    }
+
+    @Test
+    fun preserveUpdate_acceptsAppendAfterCappedBindHistory() {
+        val before = database("client-a", "Телефон")
+        val beforeHistory = before.getJSONObject("passwords")
+            .getJSONObject("client-a")
+            .getJSONArray("bind_history")
+        repeat(50) { beforeHistory.put(bindEvent(it)) }
+
+        val after = JSONObject(before.toString())
+        val afterHistory = JSONArray()
+        for (index in 1 until 50) {
+            afterHistory.put(bindEvent(index))
+        }
+        afterHistory.put(bindEvent(50))
+        after.getJSONObject("passwords").getJSONObject("client-a")
+            .put("bind_history", afterHistory)
+
+        validatePreservedServerState(before.toString(), after.toString())
+    }
+
+    @Test
+    fun preserveUpdate_acceptsFirstDeviceBindingDuringRestart() {
+        val before = database("client-a", "Телефон")
+        val after = JSONObject(before.toString())
+        bindDevice(
+            after,
+            "client-a",
+            "device-a",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        )
+        after.getJSONObject("passwords").getJSONObject("client-a")
+            .getJSONArray("bind_history")
+            .put(
+                JSONObject()
+                    .put("device_id", "device-a")
+                    .put("event_at", 1_700_000_100L)
+                    .put("bound_at", 1_700_000_100L)
+                    .put("status", "active")
+            )
+
+        validatePreservedServerState(before.toString(), after.toString())
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun preserveUpdate_rejectsRemovalOfExistingDeviceBinding() {
+        val before = database("client-a", "Телефон")
+        bindDevice(
+            before,
+            "client-a",
+            "device-a",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        )
+        val after = JSONObject(before.toString())
+        after.getJSONObject("passwords").getJSONObject("client-a")
+            .put("device_id", "")
+
+        validatePreservedServerState(before.toString(), after.toString())
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun backupValidation_rejectsInvalidOwnerProfile() {
         val db = database("client-a", "Телефон")
@@ -85,6 +200,47 @@ class ServerMigrationTest {
         val source = database("client-a", "Телефон")
         val after = JSONObject(source.toString())
         after.getJSONObject("passwords").getJSONObject("client-a").put("ports", "56010,56011,9010")
+
+        validateImportedServerState(source.toString(), null, after.toString(), replace = true)
+    }
+
+    @Test
+    fun replaceImport_acceptsTrafficAndDeviceRefreshAfterServiceStart() {
+        val source = database("client-a", "Телефон")
+            .put("admin_down_bytes", 100L)
+            .put("admin_up_bytes", 200L)
+            .put(
+                "admin_traffic",
+                JSONArray().put(trafficBucket("2026-07-30", 100L, 200L))
+            )
+        bindDevice(
+            source,
+            "client-a",
+            "device-a",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        )
+        source.getJSONObject("devices").getJSONObject("device-a")
+            .put("last_seen_at", 100L)
+            .put("name", "Старое имя")
+            .put("sdk", 34)
+
+        val after = JSONObject(source.toString())
+            .put("admin_down_bytes", 125L)
+            .put("admin_up_bytes", 240L)
+        after.getJSONArray("admin_traffic").getJSONObject(0)
+            .put("down_bytes", 125L)
+            .put("up_bytes", 240L)
+        val afterEntry = after.getJSONObject("passwords").getJSONObject("client-a")
+        afterEntry.put("down_bytes", 1_500L)
+            .put("up_bytes", 2_500L)
+        afterEntry.getJSONArray("traffic").getJSONObject(0)
+            .put("down_bytes", 1_500L)
+            .put("up_bytes", 2_500L)
+        after.getJSONObject("devices").getJSONObject("device-a")
+            .put("last_seen_at", 101L)
+            .put("name", "Обновлённое имя")
+            .put("sdk", 35)
+            .put("remote_ip", "203.0.113.10")
 
         validateImportedServerState(source.toString(), null, after.toString(), replace = true)
     }
@@ -314,4 +470,16 @@ class ServerMigrationTest {
         .put("ip", "10.66.66.2")
         .put("priv_key", privateKey)
         .put("pub_key", "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=")
+
+    private fun trafficBucket(date: String, downBytes: Long, upBytes: Long): JSONObject =
+        JSONObject()
+            .put("date", date)
+            .put("down_bytes", downBytes)
+            .put("up_bytes", upBytes)
+
+    private fun bindEvent(index: Int): JSONObject =
+        JSONObject()
+            .put("device_id", "device-$index")
+            .put("event_at", 1_700_000_000L + index)
+            .put("status", "denied_mismatch")
 }
