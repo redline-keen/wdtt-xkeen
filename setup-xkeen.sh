@@ -37,7 +37,13 @@ fi
 
 echo "=== 3. Загрузка config.yaml ==="
 mkdir -p "$MIHOMO_DIR"
-wget --no-check-certificate -q -O "$MIHOMO_DIR/config.yaml" "$CONFIG_URL"
+
+# Пробуем скачать через curl, а если его нет — через wget с жесткими таймаутами
+if command -v curl >/dev/null 2>&1; then
+    curl -sSL --connect-timeout 10 -o "$MIHOMO_DIR/config.yaml" "$CONFIG_URL"
+else
+    wget --no-check-certificate -T 15 -t 3 -O "$MIHOMO_DIR/config.yaml" "$CONFIG_URL"
+fi
 
 if [ -s "$MIHOMO_DIR/config.yaml" ]; then
     echo "✅ Конфиг успешно загружен в $MIHOMO_DIR/config.yaml"
