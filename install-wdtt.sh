@@ -77,7 +77,7 @@ killall -9 "$BIN_NAME" 2>/dev/null || true
 
 echo "Обновление пакетов и установка зависимостей..."
 opkg update
-opkg install wireguard-tools ca-bundle wget-ssl jq cron 2>/dev/null || true
+opkg install wireguard-tools ca-bundle wget-ssl cron 2>/dev/null || true
 
 mkdir -p "$INSTALL_DIR" "$CONF_DIR"
 
@@ -135,53 +135,18 @@ chmod +x /opt/usr/bin/wdtt-uninstall
 
 # ─────────────────────────── СКАЧИВАНИЕ БИНАРНИКА ───────────────────────────
 
-echo "Ищу релиз $GH_TAG в ${GH_OWNER}/${GH_REPO}..."
-RELEASE_JSON="$CONF_DIR/release.json"
+DOWNLOAD_URL="https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/${GH_TAG}/${ASSET_NAME}"
+echo "Скачиваю бинарник напрямую: ${DOWNLOAD_URL}..."
 
-# Подготавливаем заголовок авторизации, только если токен реально задан
-AUTH_HEADER=""
-if [ -n "$GH_TOKEN" ]; then
-    AUTH_HEADER="--header=Authorization: token ${GH_TOKEN}"
+wget --no-check-certificate -q -O "$INSTALL_DIR/$BIN_NAME" "$DOWNLOAD_URL"
+
+if [ ! -s "$INSTALL_DIR/$BIN_NAME" ]; then
+    echo "Ошибка: Файл не скачался или имеет нулевой размер!" >&2
+    exit 1
 fi
 
-wget -q \
-    $AUTH_HEADER \
-    --header="Accept: application/vnd.github+json" \
-    -O "$RELEASE_JSON" \
-    "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/tags/${GH_TAG}" || true
-
-if jq -e '.message' "$RELEASE_JSON" >/dev/null 2>&1; then
-    echo "GitHub API вернул ошибку вместо релиза:" >&2
-    jq -r '.message' "$RELEASE_JSON" >&2
-    
-    echo "Пробую скачать напрямую из Releases без API..."
-    DIRECT_URL="https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/${GH_TAG}/${ASSET_NAME}"
-    if wget -q --no-check-certificate -O "$INSTALL_DIR/$BIN_NAME" "$DIRECT_URL"; then
-        echo "Скачано напрямую: $INSTALL_DIR/$BIN_NAME"
-    else
-        echo "Ошибка: Не удалось скачать файл по прямой ссылке $DIRECT_URL" >&2
-        exit 1
-    fi
-else
-    ASSET_ID=$(jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .id' "$RELEASE_JSON")
-
-    if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
-        echo "В релизе $GH_TAG не найден ассет с именем '$ASSET_NAME'." >&2
-        exit 1
-    fi
-
-    echo "Найден ассет: $ASSET_NAME (id=$ASSET_ID). Скачиваю..."
-
-    wget -q \
-        $AUTH_HEADER \
-        --header="Accept: application/octet-stream" \
-        -O "$INSTALL_DIR/$BIN_NAME" \
-        "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/assets/${ASSET_ID}"
-fi
-
-rm -f "$RELEASE_JSON"
 chmod +x "$INSTALL_DIR/$BIN_NAME"
-echo "Готово: $INSTALL_DIR/$BIN_NAME"
+echo "Успешно скачан: $INSTALL_DIR/$BIN_NAME"
 
 # ─────────────────────────── ВВОД WDTT-ССЫЛКИ И ИНТЕРАКТИВНЫХ ХЕШЕЙ ───────────────────────────
 
@@ -332,7 +297,7 @@ EOF
 chmod +x "$INIT_SCRIPT"
 echo "Автозапуск настроен: $INIT_SCRIPT"
 
-# ─────────────────────────── НАСТРОЙКА CRON WATCHDOG ───────────────────────────
+# ─────────────────────────── НАСТРОИКА CRON WATCHDOG ───────────────────────────
 
 echo "Настраиваю CRON сторожевой таймер..."
     CRON_DIR="/opt/var/spool/cron/crontabs"
