@@ -7,7 +7,8 @@ MIHOMO_DIR="/opt/etc/mihomo"
 
 echo "=== 1. Установка XKeen ==="
 opkg update && opkg upgrade && opkg install curl tar upx wget-ssl ca-bundle && cd /tmp
-sh -c "$(curl -sSL https://raw.githubusercontent.com/jameszeroX/XKeen/main/install.sh)"
+# Чтение строго с терминала, а не из stdin
+sh -c "$(curl -sSL https://raw.githubusercontent.com/jameszeroX/XKeen/main/install.sh)" < /dev/tty
 
 echo "=== 2. Сжатие бинарника mihomo через UPX ==="
 # Глушим процессы перед сжатием
