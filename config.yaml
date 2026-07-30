@@ -76,14 +76,13 @@ proxy-groups:
   - name: AI
     icon: https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/OneDrive.png
     type: select
-    include-all: true
+    hidden: true
     proxies:
       - VPN
     
   - name: 📺 Youtube
     icon: https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/YouTube.png
     type: select
-    include-all: true
     proxies:
       - 🔓 Без VPN
       - VPN
