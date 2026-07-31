@@ -65,7 +65,7 @@ proxies:
 # --------------------------------------------------------------------
 proxy-groups:
   - name: VPN
-    type: fallback
+    type: select
     icon: https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Global.png
     proxies:
       - WDTT
