@@ -384,6 +384,34 @@ EOF
     ENDPOINT_ADDR=${ENDPOINT_FULL%:*}
     ENDPOINT_PORT=${ENDPOINT_FULL##*:}
 
-    ✅ Конфиг успешно получен! Начинаю настройку KeeneticOS...
-════════════════════════════════════════════════════
-Поиск свободного интерфейса Wireguard...
+    echo "Поиск свободного интерфейса Wireguard (через ядро Linux)..."
+    IFACE_NUM=0
+    
+    while ip link show dev "nwg${IFACE_NUM}" >/dev/null 2>&1; do
+        IFACE_NUM=$((IFACE_NUM+1))
+    done
+
+    WG_IFACE="Wireguard${IFACE_NUM}"
+    echo "Выбран интерфейс: $WG_IFACE"
+
+    echo "Применяю настройки в NDM..."
+    
+    ndmq -p "interface $WG_IFACE description \"WDTT_Turn\"" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard private-key $PRIV_KEY" < /dev/null
+    ndmq -p "interface $WG_IFACE ip address $IP_ADDR $IP_MASK" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY endpoint $ENDPOINT_ADDR $ENDPOINT_PORT" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY allowed-ips 0.0.0.0 0.0.0.0" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY keepalive 25" < /dev/null
+    ndmq -p "interface $WG_IFACE ip global" < /dev/null
+    ndmq -p "interface $WG_IFACE up" < /dev/null
+    ndmq -p "system configuration save" < /dev/null
+
+    echo "════════════════════════════════════════════════════"
+    echo "🎉 Все компоненты установлены, интерфейс $WG_IFACE создан в роутере!"
+    echo "✅ Галочка 'Использовать для выхода в интернет' установлена."
+    echo "💡 В случае удаления клиента, интерфейс $WG_IFACE потребуется удалить в Web-интерфейсе вручную."
+    echo "════════════════════════════════════════════════════"
+}
+
+run_installer "$@"
