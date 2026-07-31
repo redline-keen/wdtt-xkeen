@@ -385,17 +385,14 @@ EOF
     ENDPOINT_PORT=${ENDPOINT_FULL##*:}
 
     echo "Поиск свободного интерфейса Wireguard..."
+    
+    # Делаем ровно один запрос к системе, чтобы не повесить шину
+    ALL_INTERFACES=$(ndmq -p "show interface" 2>/dev/null)
+    
     IFACE_NUM=0
-    while true; do
-        CHECK=$(ndmq -p "show interface Wireguard${IFACE_NUM}" 2>&1)
-        if echo "$CHECK" | grep -q "No such command" || echo "$CHECK" | grep -q "No such interface" || echo "$CHECK" | grep -q "not found"; then
-            break
-        fi
-        if echo "$CHECK" | grep -q "id:"; then
-            IFACE_NUM=$((IFACE_NUM+1))
-        else
-            break
-        fi
+    # Ищем первый свободный номер исключительно в памяти скрипта
+    while echo "$ALL_INTERFACES" | grep -q "Wireguard${IFACE_NUM}"; do
+        IFACE_NUM=$((IFACE_NUM+1))
     done
 
     WG_IFACE="Wireguard${IFACE_NUM}"
