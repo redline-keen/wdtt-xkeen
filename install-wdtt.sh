@@ -28,63 +28,63 @@ run_installer() {
 
     # ─────────────────────────── АРХИТЕКТУРА ───────────────────────────
 
-detect_arch() {
-    m=$(uname -m)
-    case "$m" in
-        aarch64|arm64)
-            echo "arm64"
-            ;;
-        mips|mipsel|mips32)
-            if command -v opkg >/dev/null 2>&1; then
-                oa=$(opkg print-architecture 2>/dev/null | grep -m1 -o 'mips[a-z0-9_]*' || true)
-                case "$oa" in
-                    *mipsel*|*mipsle*) echo "mipsle" ;;
-                    *) echo "mipsle" ;;
-                esac
-            else
-                echo "mipsle"
-            fi
-            ;;
-        *)
-            echo "unknown"
-            ;;
+    detect_arch() {
+        m=$(uname -m)
+        case "$m" in
+            aarch64|arm64)
+                echo "arm64"
+                ;;
+            mips|mipsel|mips32)
+                if command -v opkg >/dev/null 2>&1; then
+                    oa=$(opkg print-architecture 2>/dev/null | grep -m1 -o 'mips[a-z0-9_]*' || true)
+                    case "$oa" in
+                        *mipsel*|*mipsle*) echo "mipsle" ;;
+                        *) echo "mipsle" ;;
+                    esac
+                else
+                    echo "mipsle"
+                fi
+                ;;
+            *)
+                echo "unknown"
+                ;;
+        esac
+    }
+
+    ARCH=$(detect_arch)
+    if [ "$ARCH" = "unknown" ]; then
+        echo "Не удалось определить архитектуру (uname -m: $(uname -m)). Прерываю." >&2
+        exit 1
+    fi
+
+    case "$ARCH" in
+        arm64)  ASSET_NAME="$ASSET_ARM64" ;;
+        mipsle) ASSET_NAME="$ASSET_MIPSLE" ;;
     esac
-}
 
-ARCH=$(detect_arch)
-if [ "$ARCH" = "unknown" ]; then
-    echo "Не удалось определить архитектуру (uname -m: $(uname -m)). Прерываю." >&2
-    exit 1
-fi
+    echo "Архитектура: $ARCH"
+    echo "Ассет:       $ASSET_NAME (релиз $GH_TAG)"
 
-case "$ARCH" in
-    arm64)  ASSET_NAME="$ASSET_ARM64" ;;
-    mipsle) ASSET_NAME="$ASSET_MIPSLE" ;;
-esac
+    # ─────────────────────────── ОЧИСТКА СТАРЫХ ВЕРСИЙ ───────────────────────────
 
-echo "Архитектура: $ARCH"
-echo "Ассет:       $ASSET_NAME (релиз $GH_TAG)"
+    echo "Подготовка системы: проверка и остановка прошлых копий..."
+    if [ -x "$INIT_SCRIPT" ]; then
+        "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
+    fi
+    killall -9 "$BIN_NAME" 2>/dev/null || true
 
-# ─────────────────────────── ОЧИСТКА СТАРЫХ ВЕРСИЙ (PRE-INSTALL CLEANUP) ───────────────────────────
+    # ─────────────────────────── УСТАНОВКА ЗАВИСИМОСТЕЙ  ───────────────────────────
 
-echo "Подготовка системы: проверка и остановка прошлых копий..."
-if [ -x "$INIT_SCRIPT" ]; then
-    "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
-fi
-killall -9 "$BIN_NAME" 2>/dev/null || true
+    echo "Обновление пакетов и установка зависимостей..."
+    opkg update
+    opkg install wireguard-tools ca-bundle wget-ssl cron 2>/dev/null || true
 
-# ─────────────────────────── УСТАНОВКА ЗАВИСИМОСТЕЙ  ───────────────────────────
+    mkdir -p "$INSTALL_DIR" "$CONF_DIR"
 
-echo "Обновление пакетов и установка зависимостей..."
-opkg update
-opkg install wireguard-tools ca-bundle wget-ssl cron 2>/dev/null || true
+    # ─────────────────────────── СОЗДАНИЕ СКРИПТА WDTT-UNINSTALL ───────────────────────────
 
-mkdir -p "$INSTALL_DIR" "$CONF_DIR"
-
-# ─────────────────────────── СОЗДАНИЕ СКРИПТА WDTT-UNINSTALL ───────────────────────────
-
-echo "Создание скрипта удаления /opt/usr/bin/wdtt-uninstall..."
-cat << 'EOF' > /opt/usr/bin/wdtt-uninstall
+    echo "Создание скрипта удаления /opt/usr/bin/wdtt-uninstall..."
+    cat << 'EOF' > /opt/usr/bin/wdtt-uninstall
 #!/bin/sh
 set -e
 
@@ -127,103 +127,104 @@ echo "✓ Файлы программы и конфигурации удален
 rm -f /opt/usr/bin/wdtt-uninstall
 
 echo "════════════════════════════════════════════════════"
-echo "✅ WDTT-клиент полностью снесён с роутера!"
+echo "✅ WDTT-клиент снесён с роутера!"
+echo "Внимание: Интерфейс WireGuard в настройках Keenetic необходимо удалить вручную."
 echo "════════════════════════════════════════════════════"
 EOF
 
-chmod +x /opt/usr/bin/wdtt-uninstall
+    chmod +x /opt/usr/bin/wdtt-uninstall
 
-# ─────────────────────────── СКАЧИВАНИЕ БИНАРНИКА ───────────────────────────
+    # ─────────────────────────── СКАЧИВАНИЕ БИНАРНИКА ───────────────────────────
 
-DOWNLOAD_URL="https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/${GH_TAG}/${ASSET_NAME}"
-echo "Скачиваю бинарник напрямую: ${DOWNLOAD_URL}..."
+    DOWNLOAD_URL="https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/${GH_TAG}/${ASSET_NAME}"
+    echo "Скачиваю бинарник напрямую: ${DOWNLOAD_URL}..."
 
-wget --no-check-certificate -q -O "$INSTALL_DIR/$BIN_NAME" "$DOWNLOAD_URL"
+    wget --no-check-certificate -q -O "$INSTALL_DIR/$BIN_NAME" "$DOWNLOAD_URL"
 
-if [ ! -s "$INSTALL_DIR/$BIN_NAME" ]; then
-    echo "Ошибка: Файл не скачался или имеет нулевой размер!" >&2
-    exit 1
-fi
-
-chmod +x "$INSTALL_DIR/$BIN_NAME"
-echo "Успешно скачан: $INSTALL_DIR/$BIN_NAME"
-
-# ─────────────────────────── ВВОД WDTT-ССЫЛКИ И ИНТЕРАКТИВНЫХ ХЕШЕЙ ───────────────────────────
-
-while :; do
-    printf "\nВставьте ссылку вида:\n"
-    printf "wdtt://connect?v=1&host=IP&dtls=PORT&wg=PORT&local=PORT&password=XXX&hashes=YYY\n> "
-    
-    if ! read WDTT_LINK < /dev/tty; then
-        echo "Ошибка чтения с /dev/tty. Повторяем попытку..."
-        sleep 1
-        continue
+    if [ ! -s "$INSTALL_DIR/$BIN_NAME" ]; then
+        echo "Ошибка: Файл не скачался или имеет нулевой размер!" >&2
+        exit 1
     fi
 
-    HOST=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]host=\([^&]*\).*/\1/p')
-    DTLS=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]dtls=\([^&]*\).*/\1/p')
-    LOCAL=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]local=\([^&]*\).*/\1/p')
-    PASSWORD=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]password=\([^&]*\).*/\1/p')
-    RAW_HASH=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]hashes=\([^&]*\).*/\1/p')
+    chmod +x "$INSTALL_DIR/$BIN_NAME"
+    echo "Успешно скачан: $INSTALL_DIR/$BIN_NAME"
 
-    if [ -z "$HOST" ] || [ -z "$DTLS" ] || [ -z "$LOCAL" ] || [ -z "$PASSWORD" ] || [ -z "$RAW_HASH" ]; then
-        echo "❌ Не удалось распарсить ссылку (отсутствуют обязательные параметры). Проверьте ссылку!"
-        continue
-    fi
+    # ─────────────────────────── ВВОД WDTT-ССЫЛКИ ───────────────────────────
 
-    MAIN_HASH=$(clean_hash "$RAW_HASH")
-    FINAL_HASHES="$MAIN_HASH"
+    while :; do
+        printf "\nВставьте ссылку вида:\n"
+        printf "wdtt://connect?v=1&host=IP&dtls=PORT&wg=PORT&local=PORT&password=XXX&hashes=YYY\n> "
+        
+        if ! read WDTT_LINK < /dev/tty; then
+            echo "Ошибка чтения с /dev/tty. Повторяем попытку..."
+            sleep 1
+            continue
+        fi
 
-    echo ""
-    echo "================================================================="
-    echo "✓ Основной хеш [1/4]: $MAIN_HASH"
-    echo "================================================================="
-    printf "Хотите добавить дополнительные хеши VK для ускорения? [y/N]: "
-    read -r ADD_MORE < /dev/tty || true
+        HOST=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]host=\([^&]*\).*/\1/p')
+        DTLS=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]dtls=\([^&]*\).*/\1/p')
+        LOCAL=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]local=\([^&]*\).*/\1/p')
+        PASSWORD=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]password=\([^&]*\).*/\1/p')
+        RAW_HASH=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]hashes=\([^&]*\).*/\1/p')
 
-    case "$ADD_MORE" in
-        [Yy]*|[Дд]*)
-            count=2
-            while [ $count -le 4 ]; do
-                echo ""
-                printf "Введите хеш #%d (или нажмите Enter, чтобы пропустить): " "$count"
-                read -r INPUT_HASH < /dev/tty || true
+        if [ -z "$HOST" ] || [ -z "$DTLS" ] || [ -z "$LOCAL" ] || [ -z "$PASSWORD" ] || [ -z "$RAW_HASH" ]; then
+            echo "❌ Не удалось распарсить ссылку (отсутствуют обязательные параметры). Проверьте ссылку!"
+            continue
+        fi
 
-                CLEANED=$(clean_hash "$INPUT_HASH")
+        MAIN_HASH=$(clean_hash "$RAW_HASH")
+        FINAL_HASHES="$MAIN_HASH"
 
-                if [ -z "$CLEANED" ]; then
-                    echo "⏩ Пропущено."
-                    break
-                fi
+        echo ""
+        echo "================================================================="
+        echo "✓ Основной хеш [1/4]: $MAIN_HASH"
+        echo "================================================================="
+        printf "Хотите добавить дополнительные хеши VK для ускорения? [y/N]: "
+        read -r ADD_MORE < /dev/tty || true
 
-                FINAL_HASHES="${FINAL_HASHES},${CLEANED}"
-                echo "✓ Добавлен хеш #$count: $CLEANED"
+        case "$ADD_MORE" in
+            [Yy]*|[Дд]*)
+                count=2
+                while [ $count -le 4 ]; do
+                    echo ""
+                    printf "Введите хеш #%d (или нажмите Enter, чтобы пропустить): " "$count"
+                    read -r INPUT_HASH < /dev/tty || true
 
-                count=$((count + 1))
-            done
-            ;;
-        *)
-            echo "Используется 1 основной хеш."
-            ;;
-    esac
+                    CLEANED=$(clean_hash "$INPUT_HASH")
 
-    echo "================================================================="
-    echo "Параметры: host=$HOST dtls=$DTLS local=$LOCAL"
-    echo "Итоговые VK-хеши: $FINAL_HASHES"
-    echo "Проверяю VK-хеши..."
+                    if [ -z "$CLEANED" ]; then
+                        echo "⏩ Пропущено."
+                        break
+                    fi
 
-    if "$INSTALL_DIR/$BIN_NAME" -check-hashes -vk "$FINAL_HASHES"; then
-        echo "✅ Хеши валидны, продолжаю установку."
-        break
-    else
-        echo "❌ Хеши не прошли проверку (звонок завершен или ссылка устарела)."
-        echo "Сгенерируйте новую ссылку и вставьте её заново."
-    fi
-done
+                    FINAL_HASHES="${FINAL_HASHES},${CLEANED}"
+                    echo "✓ Добавлен хеш #$count: $CLEANED"
 
-# ─────────────────────────── INIT.D СКРИПТ (ENTWARE) ───────────────────────────
+                    count=$((count + 1))
+                done
+                ;;
+            *)
+                echo "Используется 1 основной хеш."
+                ;;
+        esac
 
-cat > "$INIT_SCRIPT" << EOF
+        echo "================================================================="
+        echo "Параметры: host=$HOST dtls=$DTLS local=$LOCAL"
+        echo "Итоговые VK-хеши: $FINAL_HASHES"
+        echo "Проверяю VK-хеши..."
+
+        if "$INSTALL_DIR/$BIN_NAME" -check-hashes -vk "$FINAL_HASHES"; then
+            echo "✅ Хеши валидны, продолжаю установку."
+            break
+        else
+            echo "❌ Хеши не прошли проверку (звонок завершен или ссылка устарела)."
+            echo "Сгенерируйте новую ссылку и вставьте её заново."
+        fi
+    done
+
+    # ─────────────────────────── INIT.D СКРИПТ (ENTWARE) ───────────────────────────
+
+    cat > "$INIT_SCRIPT" << EOF
 #!/bin/sh
 # Автозапуск wdtt-client на Entware (Keenetic)
 
@@ -237,11 +238,9 @@ start() {
     mkdir -p "\$CONF_DIR"
     cd "\$CONF_DIR"
     
-    # КРИТИЧНО: Явно задаем PATH для Entware
     PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/bin:/usr/bin:/sbin
     export PATH
 
-    # Проверяем ТОЛЬКО наличие самого процесса wdtt-client в памяти
     if pidof wdtt-client >/dev/null 2>&1; then
         echo "wdtt-client уже запущен в системе"
         exit 0
@@ -264,14 +263,8 @@ start() {
 
 stop() {
     echo "Stopping wdtt-client..."
-    
-    # 1. Глушим ВСЕ процессы с этим именем без разбора PID-файлов
     killall -9 wdtt-client 2>/dev/null || true
-    
-    # 2. Чистим PID-файл
     rm -f "\$PIDFILE"
-    
-    # 3. Даем 2 секунды ядру ОС на сброс сетевых сокетов
     sleep 2
 }
 
@@ -294,27 +287,24 @@ case "\$1" in
 esac
 EOF
 
-chmod +x "$INIT_SCRIPT"
-echo "Автозапуск настроен: $INIT_SCRIPT"
+    chmod +x "$INIT_SCRIPT"
+    echo "Автозапуск настроен: $INIT_SCRIPT"
 
-# ─────────────────────────── НАСТРОИКА CRON WATCHDOG ───────────────────────────
+    # ─────────────────────────── НАСТРОИКА CRON WATCHDOG ───────────────────────────
 
-echo "Настраиваю CRON сторожевой таймер..."
+    echo "Настраиваю CRON сторожевой таймер..."
     CRON_DIR="/opt/var/spool/cron/crontabs"
     CRON_FILE="$CRON_DIR/root"
     
-    # Экранируем и жестко прописываем команду проверки порта
     CRON_CMD="*/2 * * * * PATH=/opt/bin:/opt/sbin:/opt/usr/bin:\$PATH pidof wdtt-client >/dev/null 2>&1 || /opt/etc/init.d/S99wdtt-client start"
 
     mkdir -p "$CRON_DIR"
     chmod 755 "$CRON_DIR"
 
-    # Если была сломанная задача — очищаем её перед записью
     if [ -f "$CRON_FILE" ]; then
         sed -i '/S99wdtt-client/d' "$CRON_FILE" 2>/dev/null || true
     fi
 
-    # Записываем чистую корректную команду
     echo "$CRON_CMD" >> "$CRON_FILE"
     chmod 600 "$CRON_FILE"
     echo "✓ Задача успешно добавлена в cron."
@@ -323,64 +313,105 @@ echo "Настраиваю CRON сторожевой таймер..."
         /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true
     fi
 
-# ─────────────────────────── ПЕРВЫЙ ЗАПУСК И ОЖИДАНИЕ С ВЫВОДОМ ЛОГА (60 сек) ───────────────────────────
+    # ─────────────────────────── ОЖИДАНИЕ КОНФИГА ───────────────────────────
 
-CONF_FILE="$CONF_DIR/wg-turn.conf"
-LOG_FILE="$CONF_DIR/wdtt-client.log"
+    CONF_FILE="$CONF_DIR/wg-turn.conf"
+    LOG_FILE="$CONF_DIR/wdtt-client.log"
 
-rm -f "$CONF_FILE"
+    rm -f "$CONF_FILE"
 
-wait_for_conf_with_log() {
-    touch "$LOG_FILE"
-    
-    tail -f -n 0 "$LOG_FILE" &
-    TAIL_PID=$!
+    wait_for_conf_with_log() {
+        touch "$LOG_FILE"
+        
+        tail -f -n 0 "$LOG_FILE" &
+        TAIL_PID=$!
 
-    i=0
-    while [ ! -f "$CONF_FILE" ] && [ "$i" -lt 60 ]; do
-        sleep 1
-        i=$((i + 1))
-    done
+        i=0
+        while [ ! -f "$CONF_FILE" ] && [ "$i" -lt 60 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
 
-    kill $TAIL_PID 2>/dev/null || true
-    wait $TAIL_PID 2>/dev/null || true
+        kill $TAIL_PID 2>/dev/null || true
+        wait $TAIL_PID 2>/dev/null || true
 
-    [ -f "$CONF_FILE" ]
-}
+        [ -f "$CONF_FILE" ]
+    }
 
-echo ""
-echo "Запуск 1/2: Запускаю клиент для получения wg-turn.conf (вывод логов в реальном времени)..."
-echo "────────────────────────────────────────────────────────────────────────────"
-"$INIT_SCRIPT" start
-
-if ! wait_for_conf_with_log; then
+    echo ""
+    echo "Запуск 1/2: Запускаю клиент для получения wg-turn.conf (вывод логов в реальном времени)..."
     echo "────────────────────────────────────────────────────────────────────────────"
-    echo "⚠️ Попытка 1: Конфиг не появился за 60 секунд. Пробую перезапуск (2/2)..."
-    echo "────────────────────────────────────────────────────────────────────────────"
-    "$INIT_SCRIPT" restart
-    
+    "$INIT_SCRIPT" start
+
     if ! wait_for_conf_with_log; then
         echo "────────────────────────────────────────────────────────────────────────────"
-        echo "⚠️ Внимание: Конфиг wg-turn.conf пока не получен за 2 минуты."
-        echo "Установка завершена. Cron уже настроен и будет автоматически перезапускать процесс каждые 2 минуты."
-        exit 0
+        echo "⚠️ Попытка 1: Конфиг не появился за 60 секунд. Пробую перезапуск (2/2)..."
+        echo "────────────────────────────────────────────────────────────────────────────"
+        "$INIT_SCRIPT" restart
+        
+        if ! wait_for_conf_with_log; then
+            echo "────────────────────────────────────────────────────────────────────────────"
+            echo "⚠️ Внимание: Конфиг wg-turn.conf пока не получен за 2 минуты."
+            echo "Установка завершена. Cron настроен."
+            exit 0
+        fi
     fi
-fi
-echo "────────────────────────────────────────────────────────────────────────────"
+    echo "────────────────────────────────────────────────────────────────────────────"
 
-# ─────────────────────────── УСПЕХ: ОТОБРАЖЕНИЕ КОНФИГА ───────────────────────────
+    # ─────────────────────────── АВТОМАТИЧЕСКАЯ НАСТРОЙКА KEENETIC ───────────────────────────
 
-echo ""
-echo "════════════════════════════════════════════════════"
-echo "✅ Конфиг успешно получен: $CONF_FILE"
-echo "════════════════════════════════════════════════════"
-cat "$CONF_FILE"
-echo "════════════════════════════════════════════════════"
-echo ""
-echo "🎉 Все компоненты успешно установлены и настроены!"
-echo "   Скопируй содержимое файла конфигурации и сохрани в текстовый файл yamolodec.conf"
-echo "💡 Для полного удаления программы в будущем достаточно выполнить команду: wdtt-uninstall"
+    echo ""
+    echo "════════════════════════════════════════════════════"
+    echo "✅ Конфиг успешно получен! Начинаю настройку KeeneticOS..."
+    echo "════════════════════════════════════════════════════"
 
+    PRIV_KEY=$(grep -i '^PrivateKey' "$CONF_FILE" | cut -d '=' -f 2 | tr -d ' \r')
+    PUB_KEY=$(grep -i '^PublicKey' "$CONF_FILE" | cut -d '=' -f 2 | tr -d ' \r')
+    ADDRESS_CIDR=$(grep -i '^Address' "$CONF_FILE" | cut -d '=' -f 2 | tr -d ' \r' | cut -d ',' -f 1)
+    ENDPOINT_FULL=$(grep -i '^Endpoint' "$CONF_FILE" | cut -d '=' -f 2 | tr -d ' \r')
+
+    IP_ADDR=${ADDRESS_CIDR%/*}
+    CIDR=${ADDRESS_CIDR#*/}
+
+    if [ "$CIDR" = "32" ]; then
+        IP_MASK="255.255.255.255"
+    elif [ "$CIDR" = "24" ]; then
+        IP_MASK="255.255.255.0"
+    else
+        IP_MASK="255.255.255.0"
+    fi
+
+    ENDPOINT_ADDR=${ENDPOINT_FULL%:*}
+    ENDPOINT_PORT=${ENDPOINT_FULL##*:}
+
+    echo "Поиск свободного интерфейса Wireguard (через ядро Linux)..."
+    IFACE_NUM=0
+    
+    while ip link show dev "nwg${IFACE_NUM}" >/dev/null 2>&1; do
+        IFACE_NUM=$((IFACE_NUM+1))
+    done
+
+    WG_IFACE="Wireguard${IFACE_NUM}"
+    echo "Выбран интерфейс: $WG_IFACE"
+
+    echo "Применяю настройки в NDM..."
+    
+    ndmq -p "interface $WG_IFACE description \"WDTT_Turn\"" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard private-key $PRIV_KEY" < /dev/null
+    ndmq -p "interface $WG_IFACE ip address $IP_ADDR $IP_MASK" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY endpoint $ENDPOINT_ADDR $ENDPOINT_PORT" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY allowed-ips 0.0.0.0 0.0.0.0" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY keepalive 25" < /dev/null
+    ndmq -p "interface $WG_IFACE ip global" < /dev/null
+    ndmq -p "interface $WG_IFACE up" < /dev/null
+    ndmq -p "system configuration save" < /dev/null
+
+    echo "════════════════════════════════════════════════════"
+    echo "🎉 Все компоненты установлены, интерфейс $WG_IFACE создан в роутере!"
+    echo "✅ Галочка 'Использовать для выхода в интернет' установлена."
+    echo "💡 В случае удаления клиента, интерфейс $WG_IFACE потребуется удалить в Web-интерфейсе вручную."
+    echo "════════════════════════════════════════════════════"
 }
 
 run_installer "$@"
