@@ -80,7 +80,6 @@ run_installer() {
 
     echo "Обновление пакетов и установка зависимостей..."
     opkg update >/dev/null 2>&1 || true
-    # ДОБАВЛЕН NDMQ НА ВСЯКИЙ СЛУЧАЙ ДЛЯ ЧИСТЫХ УСТАНОВОК
     opkg install wireguard-tools ca-bundle wget-ssl cron ndmq >/dev/null 2>&1 || true
 
     mkdir -p "$INSTALL_DIR" "$CONF_DIR"
@@ -419,7 +418,6 @@ EOF
 
     ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY keepalive 25" < /dev/null
 
-    # === ДОБАВЛЯЕМ DNS ===
     if [ -n "$DNS_CONF" ]; then
         DNS_1=$(echo "$DNS_CONF" | cut -d ',' -f 1)
         DNS_2=$(echo "$DNS_CONF" | cut -d ',' -f 2)
@@ -445,6 +443,15 @@ EOF
     echo "❌ Удаление клиента осуществляется командой wdtt-uninstall."
     echo "💡 В случае удаления клиента (через wdtt-uninstall), интерфейс $WG_IFACE потребуется удалить в Web-интерфейсе вручную."
     echo "════════════════════════════════════════════════════"
+    echo ""
+    echo "📁 Файл конфигурации WireGuard сохранен по пути:"
+    echo "   👉 $CONF_FILE"
+    echo ""
+    echo "📄 Содержимое файла (на случай, если захотите сохранить его вручную):"
+    echo "----------------------------------------------------------------"
+    cat "$CONF_FILE"
+    echo "----------------------------------------------------------------"
+    echo ""
 
 }
 
