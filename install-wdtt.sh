@@ -21,7 +21,7 @@ run_installer() {
     BIN_NAME="wdtt-client"
     INIT_SCRIPT="/opt/etc/init.d/S99wdtt-client"
 
-    WORKERS="9"
+    WORKERS="24"
     DEVICE_ID="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo keenetic)"
 
     # Вспомогательная функция очистки VK-хеша от ссылок и параметров
