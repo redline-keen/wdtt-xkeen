@@ -20,6 +20,7 @@ run_installer() {
     CONF_DIR="/opt/etc/wdtt"
     BIN_NAME="wdtt-client"
     INIT_SCRIPT="/opt/etc/init.d/S99wdtt-client"
+    WATCHDOG_SCRIPT="$CONF_DIR/wdtt-watchdog.sh"
 
     WORKERS="12"
     DEVICE_ID="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo keenetic)"
@@ -34,9 +35,7 @@ run_installer() {
     detect_arch() {
         m=$(uname -m)
         case "$m" in
-            aarch64|arm64)
-                echo "arm64"
-                ;;
+            aarch64|arm64) echo "arm64" ;;
             mips|mipsel|mips32)
                 if command -v opkg >/dev/null 2>&1; then
                     oa=$(opkg print-architecture 2>/dev/null | grep -m1 -o 'mips[a-z0-9_]*' || true)
@@ -48,9 +47,7 @@ run_installer() {
                     echo "mipsle"
                 fi
                 ;;
-            *)
-                echo "unknown"
-                ;;
+            *) echo "unknown" ;;
         esac
     }
 
@@ -109,8 +106,8 @@ killall -9 "$BIN_NAME" 2>/dev/null || true
 echo "✓ Процессы остановлены."
 
 # 2. Очистка cron
-if [ -f "$CRON_FILE" ] && grep -q "wdtt-client" "$CRON_FILE"; then
-    grep -v "wdtt-client" "$CRON_FILE" > "${CRON_FILE}.tmp" || true
+if [ -f "$CRON_FILE" ] && grep -E -q "wdtt-client|wdtt-watchdog" "$CRON_FILE"; then
+    grep -E -v "wdtt-client|wdtt-watchdog" "$CRON_FILE" > "${CRON_FILE}.tmp" || true
     mv "${CRON_FILE}.tmp" "$CRON_FILE"
     chmod 600 "$CRON_FILE"
     [ -x /opt/etc/init.d/S10cron ] && /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true
@@ -152,23 +149,62 @@ EOF
     chmod +x "$INSTALL_DIR/$BIN_NAME"
     echo "Успешно скачан: $INSTALL_DIR/$BIN_NAME"
 
-    # ─────────────────────────── ВВОД WDTT-ССЫЛКИ ───────────────────────────
+    # ─────────────────────────── ВВОД И ПАРСИНГ WDTT-ССЫЛКИ ───────────────────────────
 
     while :; do
-        printf "\nВставьте ссылку вида:\n"
-        printf "wdtt://connect?v=1&host=IP&dtls=PORT&wg=PORT&local=PORT&password=XXX&hashes=YYY\n> "
+        printf "\nВставьте ссылку конфигурации WDTT/QWDTT:\n> "
         
         if ! read WDTT_LINK < /dev/tty; then
-            echo "Ошибка чтения с /dev/tty. Повторяем попытку..."
             sleep 1
             continue
         fi
 
-        HOST=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]host=\([^&]*\).*/\1/p')
-        DTLS=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]dtls=\([^&]*\).*/\1/p')
-        LOCAL=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]local=\([^&]*\).*/\1/p')
-        PASSWORD=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]password=\([^&]*\).*/\1/p')
-        RAW_HASH=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]hashes=\([^&]*\).*/\1/p')
+        HOST=""
+        DTLS=""
+        LOCAL=""
+        PASSWORD=""
+        RAW_HASH=""
+
+        case "$WDTT_LINK" in
+            wdtt://connect\?*)
+                # Формат 1: wdtt://connect?host=...&dtls=...&local=...
+                HOST=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]host=\([^&]*\).*/\1/p')
+                DTLS=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]dtls=\([^&]*\).*/\1/p')
+                LOCAL=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]local=\([^&]*\).*/\1/p')
+                PASSWORD=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]password=\([^&]*\).*/\1/p')
+                RAW_HASH=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]hashes=\([^&]*\).*/\1/p')
+                ;;
+            qwdtt://config\?*)
+                # Формат 2: qwdtt://config?peer=...&port=...&pass=...
+                peer_enc=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]peer=\([^&]*\).*/\1/p')
+                peer=$(echo "$peer_enc" | sed 's/%3A/:/g; s/%3a/:/g') # Декодируем %3A в :
+                
+                HOST=$(echo "$peer" | cut -d':' -f1)
+                DTLS=$(echo "$peer" | cut -d':' -f2)
+                LOCAL=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]port=\([^&]*\).*/\1/p')
+                PASSWORD=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]pass=\([^&]*\).*/\1/p')
+                RAW_HASH=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]hashes=\([^&]*\).*/\1/p')
+                
+                req_workers=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]workers=\([^&]*\).*/\1/p')
+                if [ -n "$req_workers" ]; then
+                    WORKERS="$req_workers"
+                fi
+                ;;
+            wdtt://*:*:*:*:*:*)
+                # Формат 3: wdtt://ip:port:wg_port:local_port:password:hash
+                temp_link=$(echo "$WDTT_LINK" | sed 's|^wdtt://||')
+                HOST=$(echo "$temp_link" | cut -d':' -f1)
+                DTLS=$(echo "$temp_link" | cut -d':' -f2)
+                # Третий параметр WG порт мы пропускаем (не используется для старта)
+                LOCAL=$(echo "$temp_link" | cut -d':' -f4)
+                PASSWORD=$(echo "$temp_link" | cut -d':' -f5)
+                RAW_HASH=$(echo "$temp_link" | cut -d':' -f6-)
+                ;;
+            *)
+                echo "❌ Неизвестный формат ссылки. Поддерживаются форматы wdtt://connect?..., qwdtt://config?..., wdtt://ip:port:..."
+                continue
+                ;;
+        esac
 
         if [ -z "$HOST" ] || [ -z "$DTLS" ] || [ -z "$LOCAL" ] || [ -z "$PASSWORD" ] || [ -z "$RAW_HASH" ]; then
             echo "❌ Не удалось распарсить ссылку (отсутствуют обязательные параметры). Проверьте ссылку!"
@@ -178,7 +214,6 @@ EOF
         MAIN_HASH=$(clean_hash "$RAW_HASH")
         FINAL_HASHES="$MAIN_HASH"
 
-        echo ""
         echo "================================================================="
         echo "✓ Основной хеш [1/4]: $MAIN_HASH"
         echo "================================================================="
@@ -189,41 +224,35 @@ EOF
             [Yy]*|[Дд]*)
                 count=2
                 while [ $count -le 4 ]; do
-                    echo ""
-                    printf "Введите хеш #%d (или нажмите Enter, чтобы пропустить): " "$count"
+                    printf "Введите хеш #%d (или Enter, чтобы пропустить): " "$count"
                     read -r INPUT_HASH < /dev/tty || true
-
                     CLEANED=$(clean_hash "$INPUT_HASH")
-
-                    if [ -z "$CLEANED" ]; then
-                        echo "⏩ Пропущено."
-                        break
-                    fi
-
+                    if [ -z "$CLEANED" ]; then break; fi
                     FINAL_HASHES="${FINAL_HASHES},${CLEANED}"
                     echo "✓ Добавлен хеш #$count: $CLEANED"
-
                     count=$((count + 1))
                 done
                 ;;
-            *)
-                echo "Используется 1 основной хеш."
-                ;;
         esac
-
-        echo "================================================================="
-        echo "Параметры: host=$HOST dtls=$DTLS local=$LOCAL"
-        echo "Итоговые VK-хеши: $FINAL_HASHES"
-        echo "Проверяю VK-хеши..."
 
         if "$INSTALL_DIR/$BIN_NAME" -check-hashes -vk "$FINAL_HASHES"; then
             echo "✅ Хеши валидны, продолжаю установку."
             break
         else
-            echo "❌ Хеши не прошли проверку (звонок завершен или ссылка устарела)."
-            echo "Сгенерируйте новую ссылку и вставьте её заново."
+            echo "❌ Хеши не прошли проверку."
         fi
     done
+
+    # ─────────────────────────── ОПРЕДЕЛЕНИЕ ИНТЕРФЕЙСА ───────────────────────────
+    
+    echo "Поиск свободного интерфейса Wireguard (через ядро Linux)..."
+    IFACE_NUM=0
+    while ip link show dev "nwg${IFACE_NUM}" >/dev/null 2>&1; do
+        IFACE_NUM=$((IFACE_NUM+1))
+    done
+    WG_IFACE="Wireguard${IFACE_NUM}"
+    KERNEL_WG_IFACE="nwg${IFACE_NUM}"
+    echo "Выбран интерфейс: $WG_IFACE (ядро: $KERNEL_WG_IFACE)"
 
     # ─────────────────────────── INIT.D СКРИПТ (ENTWARE) ───────────────────────────
 
@@ -243,6 +272,10 @@ start() {
     
     PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/bin:/usr/bin:/sbin
     export PATH
+
+    while ! ping -c 1 -W 2 77.88.8.8 >/dev/null 2>&1; do
+        sleep 5
+    done
 
     if pidof wdtt-client >/dev/null 2>&1; then
         echo "wdtt-client уже запущен в системе"
@@ -272,46 +305,73 @@ stop() {
 }
 
 case "\$1" in
-    start)
-        start
-        ;;
-    stop)
-        stop
-        ;;
-    restart)
-        stop
-        sleep 10
-        start
-        ;;
-    *)
-        echo "Usage: \$0 {start|stop|restart}"
-        exit 1
-        ;;
+    start) start ;;
+    stop) stop ;;
+    restart) stop; sleep 10; start ;;
+    *) echo "Usage: \$0 {start|stop|restart}"; exit 1 ;;
 esac
 EOF
 
     chmod +x "$INIT_SCRIPT"
-    echo "Автозапуск настроен: $INIT_SCRIPT"
+
+    # ─────────────────────────── СКРИПТ WATCHDOG ───────────────────────────
+
+    echo "Создание скрипта watchdog..."
+    cat > "$WATCHDOG_SCRIPT" << EOF
+#!/bin/sh
+
+PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/bin:/usr/bin:/sbin
+export PATH
+
+LOG_FILE="${CONF_DIR}/wdtt-client.log"
+MAX_SIZE_KB=1024
+WG_IFACE="${KERNEL_WG_IFACE}"
+INIT_SCRIPT="${INIT_SCRIPT}"
+PING_TARGET="77.88.8.8"
+
+# 1. БЕЗУСЛОВНАЯ РОТАЦИЯ ЛОГА
+if [ -f "\$LOG_FILE" ]; then
+    FILE_SIZE=\$(du -k "\$LOG_FILE" | awk '{print \$1}')
+    if [ "\$FILE_SIZE" -gt "\$MAX_SIZE_KB" ]; then
+        tail -n 500 "\$LOG_FILE" > "\$LOG_FILE.tmp" && mv "\$LOG_FILE.tmp" "\$LOG_FILE"
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') [WATCHDOG] Лог превысил \$MAX_SIZE_KB КБ и был обрезан." >> "\$LOG_FILE"
+    fi
+fi
+
+# 2. ПРОВЕРКА: Запущен ли процесс вообще?
+if ! pidof wdtt-client >/dev/null 2>&1; then
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [WATCHDOG] Процесс не найден. Запуск..." >> /opt/var/log/watchdog.log
+    \$INIT_SCRIPT start
+else
+    # 3. ПРОВЕРКА: Если процесс жив, идет ли через него трафик?
+    if ! ping -c 2 -W 3 -I "\$WG_IFACE" "\$PING_TARGET" > /dev/null 2>&1; then
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') [WATCHDOG] Процесс висит (пинг до Яндекса через \$WG_IFACE не прошел). Перезапуск..." >> /opt/var/log/watchdog.log
+        \$INIT_SCRIPT restart
+    fi
+fi
+EOF
+
+    chmod +x "$WATCHDOG_SCRIPT"
 
     # ─────────────────────────── НАСТРОЙКА CRON WATCHDOG ───────────────────────────
 
-    echo "Настраиваю CRON сторожевой таймер..."
+    echo "Настраиваю CRON для watchdog..."
     CRON_DIR="/opt/var/spool/cron/crontabs"
     CRON_FILE="$CRON_DIR/root"
     
-    CRON_CMD="*/2 * * * * PATH=/opt/bin:/opt/sbin:/opt/usr/bin:\$PATH pidof wdtt-client >/dev/null 2>&1 || /opt/etc/init.d/S99wdtt-client start"
+    CRON_CMD="*/2 * * * * $WATCHDOG_SCRIPT"
 
     mkdir -p "$CRON_DIR"
     chmod 755 "$CRON_DIR"
 
     if [ -f "$CRON_FILE" ]; then
-        sed -i '/S99wdtt-client/d' "$CRON_FILE" 2>/dev/null || true
+        sed -i '/wdtt-watchdog/d' "$CRON_FILE" 2>/dev/null || true
+        sed -i '/wdtt-client/d' "$CRON_FILE" 2>/dev/null || true
     fi
 
     echo "$CRON_CMD" >> "$CRON_FILE"
     chmod 600 "$CRON_FILE"
-    echo "✓ Задача успешно добавлена в cron."
-
+    
     if [ -x /opt/etc/init.d/S10cron ]; then
         /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true
     fi
@@ -325,52 +385,36 @@ EOF
 
     wait_for_conf_with_log() {
         touch "$LOG_FILE"
-        
         tail -f -n 0 "$LOG_FILE" &
         TAIL_PID=$!
-
         i=0
         while [ ! -f "$CONF_FILE" ] && [ "$i" -lt 60 ]; do
             sleep 1
             i=$((i + 1))
         done
-
         kill $TAIL_PID 2>/dev/null || true
         wait $TAIL_PID 2>/dev/null || true
-
         [ -f "$CONF_FILE" ]
     }
 
-    echo ""
-    echo "Запуск 1/2: Запускаю клиент для получения wg-turn.conf (вывод логов в реальном времени)..."
-    echo "────────────────────────────────────────────────────────────────────────────"
+    echo "Запуск 1/2: Запускаю клиент для получения wg-turn.conf..."
     "$INIT_SCRIPT" start
 
     if ! wait_for_conf_with_log; then
-        echo "────────────────────────────────────────────────────────────────────────────"
         echo "⚠️ Попытка 1: Конфиг не появился за 60 секунд. Пробую перезапуск (2/2)..."
-        echo "────────────────────────────────────────────────────────────────────────────"
         "$INIT_SCRIPT" restart
-        
         if ! wait_for_conf_with_log; then
-            echo "────────────────────────────────────────────────────────────────────────────"
-            echo "⚠️ Внимание: Конфиг wg-turn.conf пока не получен за 2 минуты."
-            echo "Установка завершена. Cron настроен."
+            echo "⚠️ Внимание: Конфиг wg-turn.conf пока не получен."
             exit 0
         fi
     fi
-    echo "────────────────────────────────────────────────────────────────────────────"
 
     # ─────────────────────────── АВТОМАТИЧЕСКАЯ НАСТРОЙКА KEENETIC ───────────────────────────
 
-    echo ""
-    echo "════════════════════════════════════════════════════"
     echo "✅ Конфиг успешно получен! Начинаю настройку KeeneticOS..."
-    echo "════════════════════════════════════════════════════"
 
     PRIV_KEY=$(grep -i '^PrivateKey' "$CONF_FILE" | sed 's/^[^=]*=//' | tr -d ' \r\n\t')
     PUB_KEY=$(grep -i '^PublicKey' "$CONF_FILE" | sed 's/^[^=]*=//' | tr -d ' \r\n\t')
-
     ADDRESS_CIDR=$(grep -i '^Address' "$CONF_FILE" | sed 's/^[^=]*=//' | cut -d ',' -f 1 | tr -d ' \r\n\t')
     ENDPOINT_FULL=$(grep -i '^Endpoint' "$CONF_FILE" | sed 's/^[^=]*=//' | tr -d ' \r\n\t')
     ALLOWED_IPS_CONF=$(grep -i '^AllowedIPs' "$CONF_FILE" | sed 's/^[^=]*=//' | cut -d ',' -f 1 | tr -d ' \r\n\t')
@@ -392,41 +436,26 @@ EOF
     elif [ "$A_CIDR" = "24" ]; then A_MASK="255.255.255.0"
     else A_MASK="0.0.0.0"; fi
 
-    echo "Поиск свободного интерфейса Wireguard (через ядро Linux)..."
-    IFACE_NUM=0
-    while ip link show dev "nwg${IFACE_NUM}" >/dev/null 2>&1; do
-        IFACE_NUM=$((IFACE_NUM+1))
-    done
-    WG_IFACE="Wireguard${IFACE_NUM}"
-    echo "Выбран интерфейс: $WG_IFACE"
-
     echo "Применяю настройки в NDM..."
-
     ndmq -p "interface $WG_IFACE" < /dev/null
     ndmq -p "interface $WG_IFACE description \"WDTT_Turn\"" < /dev/null
     ndmq -p "interface $WG_IFACE wireguard private-key $PRIV_KEY" < /dev/null
     ndmq -p "interface $WG_IFACE ip address $IP_ADDR $IP_MASK" < /dev/null
-
     ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY" < /dev/null
-
     ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY endpoint $ENDPOINT_ADDR $ENDPOINT_PORT" < /dev/null
     ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY endpoint $ENDPOINT_FULL" < /dev/null
     ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY endpoint $ENDPOINT_ADDR port $ENDPOINT_PORT" < /dev/null
-
     ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY allow-ips $A_IP $A_MASK" < /dev/null
     ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY allowed-ips $A_IP $A_MASK" < /dev/null
-
     ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY keepalive 25" < /dev/null
 
     if [ -n "$DNS_CONF" ]; then
         DNS_1=$(echo "$DNS_CONF" | cut -d ',' -f 1)
         DNS_2=$(echo "$DNS_CONF" | cut -d ',' -f 2)
-        
         if [ -n "$DNS_1" ]; then
             ndmq -p "ip name-server $DNS_1 \"\" on $WG_IFACE" < /dev/null
             ndmq -p "ip name-server $DNS_1 on $WG_IFACE" < /dev/null
         fi
-        
         if [ -n "$DNS_2" ] && [ "$DNS_2" != "$DNS_1" ]; then
             ndmq -p "ip name-server $DNS_2 \"\" on $WG_IFACE" < /dev/null
             ndmq -p "ip name-server $DNS_2 on $WG_IFACE" < /dev/null
@@ -438,21 +467,8 @@ EOF
     ndmq -p "system configuration save" < /dev/null
 
     echo "════════════════════════════════════════════════════"
-    echo "🎉 Все компоненты установлены, интерфейс $WG_IFACE создан в роутере!"
-    echo "✅ Конфигурация Wireguard настроена."
-    echo "❌ Удаление клиента осуществляется командой wdtt-uninstall."
-    echo "💡 В случае удаления клиента (через wdtt-uninstall), интерфейс $WG_IFACE потребуется удалить в Web-интерфейсе вручную."
+    echo "🎉 Все компоненты установлены, интерфейс $WG_IFACE создан!"
     echo "════════════════════════════════════════════════════"
-    echo ""
-    echo "📁 Файл конфигурации WireGuard сохранен по пути:"
-    echo "   👉 $CONF_FILE"
-    echo ""
-    echo "📄 Содержимое файла (на случай, если захотите сохранить его вручную):"
-    echo "----------------------------------------------------------------"
-    cat "$CONF_FILE"
-    echo "----------------------------------------------------------------"
-    echo ""
-
 }
 
 run_installer "$@"
