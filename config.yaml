@@ -58,7 +58,7 @@ sniffer:
 proxies:
   - name: WDTT
     type: direct
-    interface-name: nwg0
+    interface-name: wdtt0
 
 # --------------------------------------------------------------------
 # --- Секция 2: ГРУППЫ ПРОКСИ ---
