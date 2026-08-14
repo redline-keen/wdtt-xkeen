@@ -1,5 +1,5 @@
 #!/bin/sh
-# install-wdtt-raw.sh — установка WDTT-клиента в RAW-режиме (rawtun + TCP) на Entware/Keenetic
+# install-wdtt.sh — установка WDTT-клиента (wdtt-client) на Entware/Keenetic с автонастройкой
 set -e
 
 run_installer() {
@@ -11,7 +11,7 @@ run_installer() {
 
     GH_OWNER="redline-keen"
     GH_REPO="wdtt-xkeen"
-    GH_TAG="1.1"
+    GH_TAG="1.0"
 
     ASSET_MIPSLE="wdtt-client-mipsle"
     ASSET_ARM64="wdtt-client-arm64"
@@ -22,8 +22,7 @@ run_installer() {
     INIT_SCRIPT="/opt/etc/init.d/S99wdtt-client"
     WATCHDOG_SCRIPT="$CONF_DIR/wdtt-watchdog.sh"
 
-    WORKERS="36"
-    RAW_PORT="56003"
+    WORKERS="12"
     DEVICE_ID="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo keenetic)"
 
     # Вспомогательная функция очистки VK-хеша от ссылок и параметров
@@ -73,13 +72,12 @@ run_installer() {
         "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
     fi
     killall -9 "$BIN_NAME" 2>/dev/null || true
-    ip link del wdtt0 2>/dev/null || true
 
-    # ─────────────────────────── УСТАНОВКА ЗАВИСИМОСТЕЙ ───────────────────────────
+    # ─────────────────────────── УСТАНОВКА ЗАВИСИМОСТЕЙ  ───────────────────────────
 
     echo "Обновление пакетов и установка зависимостей..."
     opkg update >/dev/null 2>&1 || true
-    opkg install ca-bundle wget-ssl cron nano >/dev/null 2>&1 || true
+    opkg install wireguard-tools ca-bundle wget-ssl cron ndmq >/dev/null 2>&1 || true
 
     mkdir -p "$INSTALL_DIR" "$CONF_DIR"
 
@@ -91,7 +89,7 @@ run_installer() {
 set -e
 
 echo "════════════════════════════════════════════════════"
-echo " Начинаю полное удаление WDTT-клиента (RAW)..."
+echo " Начинаю полное удаление WDTT-клиента..."
 echo "════════════════════════════════════════════════════"
 
 CONF_DIR="/opt/etc/wdtt"
@@ -100,13 +98,12 @@ BIN_NAME="wdtt-client"
 INIT_SCRIPT="/opt/etc/init.d/S99wdtt-client"
 CRON_FILE="/opt/var/spool/cron/crontabs/root"
 
-# 1. Остановка процессов и удаление интерфейса
+# 1. Остановка процессов
 if [ -x "$INIT_SCRIPT" ]; then
     "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
 fi
 killall -9 "$BIN_NAME" 2>/dev/null || true
-ip link del wdtt0 2>/dev/null || true
-echo "✓ Процессы остановлены, интерфейс wdtt0 удален."
+echo "✓ Процессы остановлены."
 
 # 2. Очистка cron
 if [ -f "$CRON_FILE" ] && grep -E -q "wdtt-client|wdtt-watchdog" "$CRON_FILE"; then
@@ -130,7 +127,8 @@ echo "✓ Файлы программы и конфигурации удален
 rm -f /opt/usr/bin/wdtt-uninstall
 
 echo "════════════════════════════════════════════════════"
-echo "✅ WDTT-клиент (RAW) полностью снесён с роутера!"
+echo "✅ WDTT-клиент снесён с роутера!"
+echo "Внимание: Интерфейс WireGuard в настройках Keenetic необходимо удалить вручную."
 echo "════════════════════════════════════════════════════"
 EOF
 
@@ -162,19 +160,28 @@ EOF
         fi
 
         HOST=""
+        DTLS=""
+        LOCAL=""
         PASSWORD=""
         RAW_HASH=""
 
         case "$WDTT_LINK" in
             wdtt://connect\?*)
+                # Формат 1: wdtt://connect?host=...&dtls=...&local=...
                 HOST=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]host=\([^&]*\).*/\1/p')
+                DTLS=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]dtls=\([^&]*\).*/\1/p')
+                LOCAL=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]local=\([^&]*\).*/\1/p')
                 PASSWORD=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]password=\([^&]*\).*/\1/p')
                 RAW_HASH=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]hashes=\([^&]*\).*/\1/p')
                 ;;
             qwdtt://config\?*)
+                # Формат 2: qwdtt://config?peer=...&port=...&pass=...
                 peer_enc=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]peer=\([^&]*\).*/\1/p')
-                peer=$(echo "$peer_enc" | sed 's/%3A/:/g; s/%3a/:/g')
+                peer=$(echo "$peer_enc" | sed 's/%3A/:/g; s/%3a/:/g') # Декодируем %3A в :
+                
                 HOST=$(echo "$peer" | cut -d':' -f1)
+                DTLS=$(echo "$peer" | cut -d':' -f2)
+                LOCAL=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]port=\([^&]*\).*/\1/p')
                 PASSWORD=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]pass=\([^&]*\).*/\1/p')
                 RAW_HASH=$(echo "$WDTT_LINK" | sed -n 's/.*[?&]hashes=\([^&]*\).*/\1/p')
                 
@@ -184,18 +191,22 @@ EOF
                 fi
                 ;;
             wdtt://*:*:*:*:*:*)
+                # Формат 3: wdtt://ip:port:wg_port:local_port:password:hash
                 temp_link=$(echo "$WDTT_LINK" | sed 's|^wdtt://||')
                 HOST=$(echo "$temp_link" | cut -d':' -f1)
+                DTLS=$(echo "$temp_link" | cut -d':' -f2)
+                # Третий параметр WG порт мы пропускаем (не используется для старта)
+                LOCAL=$(echo "$temp_link" | cut -d':' -f4)
                 PASSWORD=$(echo "$temp_link" | cut -d':' -f5)
                 RAW_HASH=$(echo "$temp_link" | cut -d':' -f6-)
                 ;;
             *)
-                echo "❌ Неизвестный формат ссылки."
+                echo "❌ Неизвестный формат ссылки. Поддерживаются форматы wdtt://connect?..., qwdtt://config?..., wdtt://ip:port:..."
                 continue
                 ;;
         esac
 
-        if [ -z "$HOST" ] || [ -z "$PASSWORD" ] || [ -z "$RAW_HASH" ]; then
+        if [ -z "$HOST" ] || [ -z "$DTLS" ] || [ -z "$LOCAL" ] || [ -z "$PASSWORD" ] || [ -z "$RAW_HASH" ]; then
             echo "❌ Не удалось распарсить ссылку (отсутствуют обязательные параметры). Проверьте ссылку!"
             continue
         fi
@@ -232,11 +243,22 @@ EOF
         fi
     done
 
+    # ─────────────────────────── ОПРЕДЕЛЕНИЕ ИНТЕРФЕЙСА ───────────────────────────
+    
+    echo "Поиск свободного интерфейса Wireguard (через ядро Linux)..."
+    IFACE_NUM=0
+    while ip link show dev "nwg${IFACE_NUM}" >/dev/null 2>&1; do
+        IFACE_NUM=$((IFACE_NUM+1))
+    done
+    WG_IFACE="Wireguard${IFACE_NUM}"
+    KERNEL_WG_IFACE="nwg${IFACE_NUM}"
+    echo "Выбран интерфейс: $WG_IFACE (ядро: $KERNEL_WG_IFACE)"
+
     # ─────────────────────────── INIT.D СКРИПТ (ENTWARE) ───────────────────────────
 
     cat > "$INIT_SCRIPT" << EOF
 #!/bin/sh
-# Автозапуск wdtt-client (RAW mode) на Entware (Keenetic)
+# Автозапуск wdtt-client на Entware (Keenetic)
 
 ENABLED=yes
 PROG="/opt/usr/bin/wdtt-client"
@@ -255,19 +277,20 @@ start() {
         sleep 5
     done
 
-    killall -9 wdtt-client 2>/dev/null || true
+    if pidof wdtt-client >/dev/null 2>&1; then
+        echo "wdtt-client уже запущен в системе"
+        exit 0
+    fi
 
-    echo "Starting wdtt-client (RAW mode)..."
+    echo "Starting wdtt-client..."
     
     \$PROG \\
-        -mode rawtun \\
-        -turn-tcp \\
-        -peer ${HOST}:${RAW_PORT} \\
+        -listen 127.0.0.1:${LOCAL} \\
+        -peer ${HOST}:${DTLS} \\
         -password '${PASSWORD}' \\
         -vk '${FINAL_HASHES}' \\
         -device-id '${DEVICE_ID}' \\
         -n ${WORKERS} \\
-        -tun-name wdtt0 \\
         < /dev/null >> "\$LOGFILE" 2>&1 &
 
     echo \$! > "\$PIDFILE"
@@ -276,17 +299,15 @@ start() {
 
 stop() {
     echo "Stopping wdtt-client..."
-    start-stop-daemon -K -q -p "\$PIDFILE" 2>/dev/null || true
     killall -9 wdtt-client 2>/dev/null || true
     rm -f "\$PIDFILE"
-    ip link del wdtt0 2>/dev/null || true
-    sleep 1
+    sleep 2
 }
 
 case "\$1" in
     start) start ;;
     stop) stop ;;
-    restart) stop; sleep 2; start ;;
+    restart) stop; sleep 10; start ;;
     *) echo "Usage: \$0 {start|stop|restart}"; exit 1 ;;
 esac
 EOF
@@ -304,7 +325,7 @@ export PATH
 
 LOG_FILE="${CONF_DIR}/wdtt-client.log"
 MAX_SIZE_KB=1024
-WG_IFACE="wdtt0"
+WG_IFACE="${KERNEL_WG_IFACE}"
 INIT_SCRIPT="${INIT_SCRIPT}"
 PING_TARGET="77.88.8.8"
 
@@ -317,14 +338,14 @@ if [ -f "\$LOG_FILE" ]; then
     fi
 fi
 
-# 2. ПРОВЕРКА: Запущен ли процесс и поднят ли интерфейс?
-if ! pidof wdtt-client >/dev/null 2>&1 || ! ip link show wdtt0 2>/dev/null | grep -q "UP"; then
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') [WATCHDOG] Клиент неактивен или интерфейс упал. Перезапуск..." >> /opt/var/log/watchdog.log
-    \$INIT_SCRIPT restart
+# 2. ПРОВЕРКА: Запущен ли процесс вообще?
+if ! pidof wdtt-client >/dev/null 2>&1; then
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [WATCHDOG] Процесс не найден. Запуск..." >> /opt/var/log/watchdog.log
+    \$INIT_SCRIPT start
 else
-    # 3. ПРОВЕРКА: Пинг через интерфейс
+    # 3. ПРОВЕРКА: Если процесс жив, идет ли через него трафик?
     if ! ping -c 2 -W 3 -I "\$WG_IFACE" "\$PING_TARGET" > /dev/null 2>&1; then
-        echo "\$(date '+%Y-%m-%d %H:%M:%S') [WATCHDOG] Пинг через \$WG_IFACE не прошел. Перезапуск..." >> /opt/var/log/watchdog.log
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') [WATCHDOG] Процесс висит (пинг до Яндекса через \$WG_IFACE не прошел). Перезапуск..." >> /opt/var/log/watchdog.log
         \$INIT_SCRIPT restart
     fi
 fi
@@ -355,25 +376,98 @@ EOF
         /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true
     fi
 
-    # ─────────────────────────── ЗАПУСК И ПРОВЕРКА ───────────────────────────
+    # ─────────────────────────── ОЖИДАНИЕ КОНФИГА ───────────────────────────
 
-    echo "Запуск службы wdtt-client..."
+    CONF_FILE="$CONF_DIR/wg-turn.conf"
+    LOG_FILE="$CONF_DIR/wdtt-client.log"
+
+    rm -f "$CONF_FILE"
+
+    wait_for_conf_with_log() {
+        touch "$LOG_FILE"
+        tail -f -n 0 "$LOG_FILE" &
+        TAIL_PID=$!
+        i=0
+        while [ ! -f "$CONF_FILE" ] && [ "$i" -lt 60 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        kill $TAIL_PID 2>/dev/null || true
+        wait $TAIL_PID 2>/dev/null || true
+        [ -f "$CONF_FILE" ]
+    }
+
+    echo "Запуск 1/2: Запускаю клиент для получения wg-turn.conf..."
     "$INIT_SCRIPT" start
 
-    echo "Ожидание поднятия интерфейса wdtt0..."
-    i=0
-    while ! ip link show wdtt0 2>/dev/null | grep -q "UP" && [ "$i" -lt 30 ]; do
-        sleep 1
-        i=$((i + 1))
-    done
+    if ! wait_for_conf_with_log; then
+        echo "⚠️ Попытка 1: Конфиг не появился за 60 секунд. Пробую перезапуск (2/2)..."
+        "$INIT_SCRIPT" restart
+        if ! wait_for_conf_with_log; then
+            echo "⚠️ Внимание: Конфиг wg-turn.conf пока не получен."
+            exit 0
+        fi
+    fi
+
+    # ─────────────────────────── АВТОМАТИЧЕСКАЯ НАСТРОЙКА KEENETIC ───────────────────────────
+
+    echo "✅ Конфиг успешно получен! Начинаю настройку KeeneticOS..."
+
+    PRIV_KEY=$(grep -i '^PrivateKey' "$CONF_FILE" | sed 's/^[^=]*=//' | tr -d ' \r\n\t')
+    PUB_KEY=$(grep -i '^PublicKey' "$CONF_FILE" | sed 's/^[^=]*=//' | tr -d ' \r\n\t')
+    ADDRESS_CIDR=$(grep -i '^Address' "$CONF_FILE" | sed 's/^[^=]*=//' | cut -d ',' -f 1 | tr -d ' \r\n\t')
+    ENDPOINT_FULL=$(grep -i '^Endpoint' "$CONF_FILE" | sed 's/^[^=]*=//' | tr -d ' \r\n\t')
+    ALLOWED_IPS_CONF=$(grep -i '^AllowedIPs' "$CONF_FILE" | sed 's/^[^=]*=//' | cut -d ',' -f 1 | tr -d ' \r\n\t')
+    DNS_CONF=$(grep -i '^DNS' "$CONF_FILE" | sed 's/^[^=]*=//' | tr -d ' \r\n\t')
+
+    IP_ADDR=${ADDRESS_CIDR%/*}
+    CIDR=${ADDRESS_CIDR#*/}
+    if [ "$CIDR" = "32" ]; then IP_MASK="255.255.255.255"
+    elif [ "$CIDR" = "24" ]; then IP_MASK="255.255.255.0"
+    else IP_MASK="255.255.255.0"; fi
+
+    ENDPOINT_ADDR=${ENDPOINT_FULL%:*}
+    ENDPOINT_PORT=${ENDPOINT_FULL##*:}
+
+    A_IP=${ALLOWED_IPS_CONF%/*}
+    A_CIDR=${ALLOWED_IPS_CONF#*/}
+    if [ "$A_CIDR" = "0" ]; then A_MASK="0.0.0.0"
+    elif [ "$A_CIDR" = "32" ]; then A_MASK="255.255.255.255"
+    elif [ "$A_CIDR" = "24" ]; then A_MASK="255.255.255.0"
+    else A_MASK="0.0.0.0"; fi
+
+    echo "Применяю настройки в NDM..."
+    ndmq -p "interface $WG_IFACE" < /dev/null
+    ndmq -p "interface $WG_IFACE description \"WDTT_Turn\"" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard private-key $PRIV_KEY" < /dev/null
+    ndmq -p "interface $WG_IFACE ip address $IP_ADDR $IP_MASK" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY endpoint $ENDPOINT_ADDR $ENDPOINT_PORT" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY endpoint $ENDPOINT_FULL" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY endpoint $ENDPOINT_ADDR port $ENDPOINT_PORT" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY allow-ips $A_IP $A_MASK" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY allowed-ips $A_IP $A_MASK" < /dev/null
+    ndmq -p "interface $WG_IFACE wireguard peer $PUB_KEY keepalive 25" < /dev/null
+
+    if [ -n "$DNS_CONF" ]; then
+        DNS_1=$(echo "$DNS_CONF" | cut -d ',' -f 1)
+        DNS_2=$(echo "$DNS_CONF" | cut -d ',' -f 2)
+        if [ -n "$DNS_1" ]; then
+            ndmq -p "ip name-server $DNS_1 \"\" on $WG_IFACE" < /dev/null
+            ndmq -p "ip name-server $DNS_1 on $WG_IFACE" < /dev/null
+        fi
+        if [ -n "$DNS_2" ] && [ "$DNS_2" != "$DNS_1" ]; then
+            ndmq -p "ip name-server $DNS_2 \"\" on $WG_IFACE" < /dev/null
+            ndmq -p "ip name-server $DNS_2 on $WG_IFACE" < /dev/null
+        fi
+    fi
+
+    ndmq -p "interface $WG_IFACE ip global 10000" < /dev/null
+    ndmq -p "interface $WG_IFACE up" < /dev/null
+    ndmq -p "system configuration save" < /dev/null
 
     echo "════════════════════════════════════════════════════"
-    if ip link show wdtt0 2>/dev/null | grep -q "UP"; then
-        echo "🎉 Установка завершена успешно! Интерфейс wdtt0 активен."
-    else
-        echo "⚠️ Внимание: Интерфейс wdtt0 еще поднимается или требует проверки логов."
-        echo "Посмотреть логи можно командой: cat /opt/etc/wdtt/wdtt-client.log"
-    fi
+    echo "🎉 Все компоненты установлены, интерфейс $WG_IFACE создан!"
     echo "════════════════════════════════════════════════════"
 }
 
