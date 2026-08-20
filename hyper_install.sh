@@ -15,9 +15,10 @@ opkg install wget-ssl ca-bundle curl >/dev/null 2>&1 || true
 echo "Выберите вариант установки WDTT:"
 echo "  1) RAW-режим (v1.1 — интерфейс wdtt0, прямое TCP/rawtun)"
 echo "  2) Classic WireGuard (v1.0 — автонастройка через Keenetic NDM)"
+echo "  3) Пропустить установку WDTT"
 
 while :; do
-    printf "\nВаш выбор [1-2] (по умолчанию: 1): "
+    printf "\nВаш выбор [1-3] (по умолчанию: 1): "
     read -r WDTT_CHOICE < /dev/tty || true
     [ -z "$WDTT_CHOICE" ] && WDTT_CHOICE="1"
 
@@ -34,8 +35,12 @@ while :; do
             sh /tmp/install-wdtt-old.sh < /dev/tty
             break
             ;;
+        3)
+            echo "Пропуск установки WDTT."
+            break
+            ;;
         *)
-            echo "❌ Неверный ввод, введите 1 или 2."
+            echo "❌ Неверный ввод, введите 1, 2 или 3."
             ;;
     esac
 done
