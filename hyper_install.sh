@@ -1,20 +1,44 @@
 #!/bin/sh
-# hyper_install.sh — Единый скрипт установки WDTT + nfqws2 + XKeen + Mihomo (Entware)
+# hyper-install.sh — Единый скрипт установки WDTT + nfqws2 + XKeen + Mihomo (Entware)
 set -e
 
 REPO_URL="https://raw.githubusercontent.com/redline-keen/wdtt-xkeen/main"
 WG_CONF="/opt/etc/wdtt/wg-turn.conf"
 
 echo "════════════════════════════════════════════════════"
-echo " 🚀 ЭТАП 1/2: Запуск установки WDTT-клиента"
+echo " 🚀 ЭТАП 1/2: Установка WDTT-клиента"
 echo "════════════════════════════════════════════════════"
 
-opkg update
-opkg install wget-ssl ca-bundle curl
+opkg update >/dev/null 2>&1 || true
+opkg install wget-ssl ca-bundle curl >/dev/null 2>&1 || true
 
-echo "Скачиваю install-wdtt.sh..."
-wget --no-check-certificate -O /tmp/install-wdtt.sh "${REPO_URL}/install-wdtt.sh"
-sh /tmp/install-wdtt.sh < /dev/tty
+echo "Выберите вариант установки WDTT:"
+echo "  1) RAW-режим (v1.1 — интерфейс wdtt0, прямое TCP/rawtun)"
+echo "  2) Classic WireGuard (v1.0 — автонастройка через Keenetic NDM)"
+
+while :; do
+    printf "\nВаш выбор [1-2] (по умолчанию: 1): "
+    read -r WDTT_CHOICE < /dev/tty || true
+    [ -z "$WDTT_CHOICE" ] && WDTT_CHOICE="1"
+
+    case "$WDTT_CHOICE" in
+        1)
+            echo "Скачиваю install-wdtt.sh (RAW режим)..."
+            wget --no-check-certificate -q -O /tmp/install-wdtt.sh "${REPO_URL}/install-wdtt.sh"
+            sh /tmp/install-wdtt.sh < /dev/tty
+            break
+            ;;
+        2)
+            echo "Скачиваю install-wdtt-old.sh (WireGuard режим)..."
+            wget --no-check-certificate -q -O /tmp/install-wdtt-old.sh "${REPO_URL}/install-wdtt-old.sh"
+            sh /tmp/install-wdtt-old.sh < /dev/tty
+            break
+            ;;
+        *)
+            echo "❌ Неверный ввод, введите 1 или 2."
+            ;;
+    esac
+done
 
 echo ""
 echo "════════════════════════════════════════════════════"
@@ -31,11 +55,19 @@ echo "🎉 ГИПЕР-УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!"
 echo "════════════════════════════════════════════════════"
 
 echo ""
-if [ -f "$WG_CONF" ]; then
-    echo "📋 Скопируйте WireGuard конфиг для Keenetic:"
-    echo "────────────────────────────────────────────────────"
-    cat "$WG_CONF"
-    echo "────────────────────────────────────────────────────"
-else
-    echo "⚠️ Файл конфигурации $WG_CONF не найден."
+if [ "$WDTT_CHOICE" = "1" ]; then
+    if ip link show wdtt0 >/dev/null 2>&1; then
+        echo "✅ Интерфейс wdtt0 (RAW) активен и готов к работе."
+    else
+        echo "⚠️ Интерфейс wdtt0 не обнаружен. Проверьте: cat /opt/etc/wdtt/wdtt-client.log"
+    fi
+elif [ "$WDTT_CHOICE" = "2" ]; then
+    if [ -f "$WG_CONF" ]; then
+        echo "📋 Конфигурация WireGuard для Keenetic:"
+        echo "────────────────────────────────────────────────────"
+        cat "$WG_CONF"
+        echo "────────────────────────────────────────────────────"
+    else
+        echo "⚠️ Файл конфигурации $WG_CONF не найден."
+    fi
 fi
