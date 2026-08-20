@@ -12,8 +12,8 @@ echo "════════════════════════�
 opkg update
 opkg install wget-ssl ca-bundle curl
 
-echo "Скачиваю install-wdtt.sh..."
-wget --no-check-certificate -O /tmp/install-wdtt.sh "${REPO_URL}/install-wdtt.sh"
+echo "Скачиваю install-wdtt-old.sh..."
+wget --no-check-certificate -O /tmp/install-wdtt.sh "${REPO_URL}/install-wdtt-old.sh"
 sh /tmp/install-wdtt.sh < /dev/tty
 
 echo ""
