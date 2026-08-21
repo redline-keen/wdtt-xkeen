@@ -5,15 +5,22 @@ set -e
 REPO_URL="https://raw.githubusercontent.com/redline-keen/wdtt-xkeen/main"
 
 echo "════════════════════════════════════════════════════"
-echo " 🚀 ЭТАП 1/2: Запуск установки WDTT-RAW клиента"
+echo " 🚀 ЭТАП 1/2: Установка qWDTT-RAW клиента"
 echo "════════════════════════════════════════════════════"
 
-opkg update
-opkg install wget-ssl ca-bundle curl
+printf "Устанавливать qWDTT? [Y/n]: "
+read INSTALL_WDTT < /dev/tty
+# Если ничего не ввели или нажали Y/y — выполняем установку
+if [ -z "$INSTALL_WDTT" ] || [ "$INSTALL_WDTT" = "Y" ] || [ "$INSTALL_WDTT" = "y" ]; then
+    opkg update
+    opkg install wget-ssl ca-bundle curl
 
-echo "Скачиваю install-wdtt.sh..."
-wget --no-check-certificate -O /tmp/install-wdtt.sh "${REPO_URL}/install-wdtt.sh"
-sh /tmp/install-wdtt.sh < /dev/tty
+    echo "Скачиваю install-wdtt.sh..."
+    wget --no-check-certificate -O /tmp/install-wdtt.sh "${REPO_URL}/install-wdtt.sh"
+    sh /tmp/install-wdtt.sh < /dev/tty
+else
+    echo "⏭️ Установка WDTT пропущена пользователем."
+fi
 
 echo ""
 echo "════════════════════════════════════════════════════"
@@ -28,4 +35,3 @@ echo ""
 echo "════════════════════════════════════════════════════"
 echo "🎉 Установка qWDTT+Xkeen УСПЕШНО ЗАВЕРШЕНА!"
 echo "════════════════════════════════════════════════════"
-
