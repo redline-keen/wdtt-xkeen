@@ -55,6 +55,6 @@ echo "src/gz nfqws2-keenetic https://nfqws.github.io/nfqws2-keenetic/all" > /opt
 opkg_update_retry
 opkg_install_retry nfqws2-keenetic
 
-echo "=== 3. Загрузка и запуск основного скрипта setup-xkeen-raw.sh ==="
-curl -sSL --retry 3 --retry-delay 2 -o /tmp/setup-xkeen.sh https://raw.githubusercontent.com/redline-keen/wdtt-xkeen/main/setup-xkeen-raw.sh
-sh /tmp/setup-xkeen-raw.sh < /dev/tty
+echo "=== 3. Загрузка и запуск основного скрипта setup-xkeen.sh ==="
+curl -sSL --retry 3 --retry-delay 2 -o /tmp/setup-xkeen.sh https://raw.githubusercontent.com/redline-keen/wdtt-xkeen/main/setup-xkeen.sh
+sh /tmp/setup-xkeen.sh < /dev/tty
