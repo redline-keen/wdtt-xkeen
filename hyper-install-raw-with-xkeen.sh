@@ -8,7 +8,7 @@ echo "════════════════════════�
 echo " 🚀 ЭТАП 1/2: Установка qWDTT-RAW клиента"
 echo "════════════════════════════════════════════════════"
 
-printf "Устанавливать qWDTT? [Y/n]: "
+printf "Устанавливать qWDTT? [Y (Enter)/n]: "
 read INSTALL_WDTT < /dev/tty
 # Если ничего не ввели или нажали Y/y — выполняем установку
 if [ -z "$INSTALL_WDTT" ] || [ "$INSTALL_WDTT" = "Y" ] || [ "$INSTALL_WDTT" = "y" ]; then
