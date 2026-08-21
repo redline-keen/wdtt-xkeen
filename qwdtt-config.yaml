@@ -86,7 +86,18 @@ proxy-groups:
     proxies:
       - 🔓 Без VPN
       - VPN
-
+      
+  - name: Github
+    icon: https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/YouTube.png
+    type: fallback
+    proxies:
+      - 🔓 Без VPN
+      - VPN
+    url: https://github.com
+    interval: 60
+    lazy: true
+    hidden: true
+    
   - name: 💬 Discord
     icon: https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Discord.png
     type: select
@@ -337,7 +348,7 @@ rules:
   - RULE-SET,youtube,📺 Youtube
   - RULE-SET,telegram-domains,VPN
   - RULE-SET,telegram-ips,VPN
-  - RULE-SET,github,VPN
+  - RULE-SET,github,Github
   - RULE-SET,epicgames,🎮 Игры
   - RULE-SET,origin,🎮 Игры
   - RULE-SET,riot,🎮 Игры
