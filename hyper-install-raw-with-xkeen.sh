@@ -21,7 +21,7 @@ echo " 🚀 ЭТАП 2/2: Запуск установки nfqws2 + XKeen/Mihomo"
 echo "════════════════════════════════════════════════════"
 
 echo "Скачиваю install_all-raw.sh..."
-curl -sSL -o /tmp/install_all.sh "${REPO_URL}/install_all-raw.sh"
+curl -sSL -o /tmp/install_all-raw.sh "${REPO_URL}/install_all-raw.sh"
 sh /tmp/install_all-raw.sh < /dev/tty
 
 echo ""
