@@ -1,4 +1,5 @@
 #!/bin/sh
+tr -d '\r' < "$0" > "$0.clean" && mv "$0.clean" "$0" && chmod +x "$0"
 # install-wdtt-raw.sh — установка WDTT-клиента в RAW-режиме (rawtun + TCP) на Entware/Keenetic
 set -e
 
