@@ -64,7 +64,7 @@ run_installer() {
     esac
 
     echo "Архитектура: $ARCH"
-    echo "Ассет:       $ASSET_NAME (релиз $GH_TAG)"
+    echo "Ассет:        $ASSET_NAME (релиз $GH_TAG)"
 
     # ─────────────────────────── ОЧИСТКА СТАРЫХ ВЕРСИЙ ───────────────────────────
 
@@ -200,6 +200,23 @@ EOF
             continue
         fi
 
+        # Интерактивный ввод количества воркеров
+        printf "Введите количество воркеров [текущее/по умолчанию: %s]: " "$WORKERS"
+        read -r INPUT_WORKERS < /dev/tty || true
+        if [ -n "$INPUT_WORKERS" ]; then
+            case "$INPUT_WORKERS" in
+                ''|*[!0-9]*)
+                    echo "⚠️ Введено не число, оставляем значение: $WORKERS"
+                    ;;
+                *)
+                    WORKERS="$INPUT_WORKERS"
+                    echo "✓ Установлено воркеров: $WORKERS"
+                    ;;
+            end
+        else
+            echo "✓ Используется значение по умолчанию: $WORKERS"
+        fi
+
         MAIN_HASH=$(clean_hash "$RAW_HASH")
         FINAL_HASHES="$MAIN_HASH"
 
@@ -234,6 +251,66 @@ EOF
 
     # ─────────────────────────── INIT.D СКРИПТ (ENTWARE) ───────────────────────────
 
+    cat > "$INIT_SCRIPT" << EOF
+#!/bin/sh
+# Автозапуск wdtt-client (RAW mode) на Entware (Keenetic)
+
+ENABLED=yes
+PROG="/opt/usr/bin/wdtt-client"
+CONF_DIR="/opt/etc/wdtt"
+PIDFILE="\$CONF_DIR/wdtt-client.pid"
+LOGFILE="\$CONF_DIR/wdtt-client.log"
+
+start() {
+    mkdir -p "\$CONF_DIR"
+    cd "\$CONF_DIR"
+    
+    PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/bin:/usr/bin:/sbin
+    export PATH
+
+    while ! ping -c 1 -W 2 77.88.8.8 >/dev/null 2>&1; do
+        sleep 5
+    done
+
+    killall -9 wdtt-client 2>/dev/null || true
+
+    echo "Starting wdtt-client (RAW mode)..."
+    
+    \$PROG \\
+        -mode rawtun \\
+        -turn-tcp \\
+        -peer ${HOST}:${RAW_PORT} \\
+        -password '${PASSWORD}' \\
+        -vk '${FINAL_HASHES}' \\
+        -device-id '${DEVICE_ID}' \\
+        -n ${WORKERS} \\
+        -tun-name wdtt0 \\
+        < /dev/null >> "\$LOGFILE" 2>&1 &
+
+    echo \$! > "\$PIDFILE"
+    echo "wdtt-client запущен (PID: \$!)"
+}
+
+stop() {
+    echo "Stopping wdtt-client..."
+    start-stop-daemon -K -q -p "\$PIDFILE" 2>/dev/null || true
+    killall -9 wdtt-client 2>/dev/null || true
+    rm -f "\$PIDFILE"
+    ip link del wdtt0 2>/dev/null || true
+    sleep 1
+}
+
+case "\$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; sleep 2; start ;;
+    *) echo "Usage: \$0 {start|stop|restart}"; exit 1 ;;
+es:
+EOF
+    # Заменяем случайно попавшее двоеточие в конце case на esac
+    sed -i 's/^es:$/esac/' "$INIT_SCRIPT" 2>/dev/null || true
+
+    # Исправим закрытие case на всякий случай пересозданием блока init-скрипта чище:
     cat > "$INIT_SCRIPT" << EOF
 #!/bin/sh
 # Автозапуск wdtt-client (RAW mode) на Entware (Keenetic)
