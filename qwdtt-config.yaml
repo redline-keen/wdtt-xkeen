@@ -72,6 +72,18 @@ proxy-groups:
     url: http://www.gstatic.com/generate_204
     interval: 120
     tolerance: 50
+    
+  - name: RU
+    icon: https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/YouTube.png
+    type: fallback
+    proxies:
+      - 🔓 Без VPN
+      - VPN
+    url: https://overclockers.ru
+    interval: 60
+    lazy: true
+    hidden: true
+    
 
   - name: AI
     icon: https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/OneDrive.png
@@ -359,7 +371,7 @@ rules:
   - RULE-SET,microsoft,VPN
   - RULE-SET,apple,DIRECT
   - RULE-SET,pinterest,DIRECT
-  - RULE-SET,category-ru,DIRECT
+  - RULE-SET,category-ru,RU
   - RULE-SET,whitelist,DIRECT
-  - RULE-SET,direct-ips,DIRECT
+  - RULE-SET,direct-ips,RU
   - MATCH,VPN
