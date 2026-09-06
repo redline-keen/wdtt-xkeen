@@ -348,30 +348,32 @@ rule-providers:
 rules:
   - RULE-SET,private-ips,DIRECT
   - RULE-SET,private-domains,DIRECT
-  - RULE-SET,category-ads,REJECT
-  - RULE-SET,win-spy,REJECT
-  - RULE-SET,torrent-domains,DIRECT
+  - DOMAIN-SUFFIX,vk.ru,DIRECT
+  - DOMAIN-KEYWORD,vk,DIRECT
   - DOMAIN-SUFFIX,yandex.ru,DIRECT
   - DOMAIN-SUFFIX,ya.ru,DIRECT
   - DOMAIN-KEYWORD,yandex,DIRECT
-  - RULE-SET,ai,AI
-  - RULE-SET,google-play,VPN
-  - RULE-SET,twitch-ads,VPN
-  - RULE-SET,youtube,📺 Youtube
-  - RULE-SET,telegram-domains,VPN
-  - RULE-SET,telegram-ips,VPN
-  - RULE-SET,github,Github
+  - RULE-SET,whitelist,DIRECT
+  - RULE-SET,category-ads,REJECT
+  - RULE-SET,win-spy,REJECT
+  - RULE-SET,torrent-domains,DIRECT
   - RULE-SET,epicgames,🎮 Игры
   - RULE-SET,origin,🎮 Игры
   - RULE-SET,riot,🎮 Игры
   - RULE-SET,escapefromtarkov,🎮 Игры
   - RULE-SET,steam,🎮 Игры
   - RULE-SET,faceit,🎮 Игры
+  - RULE-SET,ai,AI
+  - RULE-SET,youtube,📺 Youtube
+  - RULE-SET,github,Github
+  - RULE-SET,telegram-domains,VPN
+  - RULE-SET,telegram-ips,VPN
+  - RULE-SET,twitch-ads,VPN
   - RULE-SET,twitch,VPN
+  - RULE-SET,google-play,VPN
   - RULE-SET,microsoft,VPN
-  - RULE-SET,apple,DIRECT
-  - RULE-SET,pinterest,DIRECT
+  - RULE-SET,apple,RU
+  - RULE-SET,pinterest,RU
   - RULE-SET,category-ru,RU
-  - RULE-SET,whitelist,DIRECT
   - RULE-SET,direct-ips,RU
   - MATCH,VPN
