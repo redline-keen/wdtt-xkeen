@@ -7,7 +7,8 @@
 #  /tmp и запустится; бинарник скачается с GitHub-релиза
 #  redline-keen/wdtt-xkeen (тег 1.2), при недоступности GitHub —
 #  из файла wdtt-client-arm64/wdtt-client-mipsle в текущем каталоге.
-#  Всё ставится в /opt/etc/wdtt (бинарник, uninstall — там же).
+#  Всё ставится в /opt/etc/wdtt; wdtt-uninstall доступен по имени
+#  через симлинк в /opt/bin.
 #  Дальше отвечайте интерактивно: VK-токен → ссылка → звонков в пуле
 #  (Enter = 2) → воркеров (Enter = 36). Сессию не закрывает.
 # ═══════════════════════════════════════════════════════════════════
@@ -157,6 +158,7 @@ echo "✓ Служба автозапуска удалена."
 # 4. Самоудаление (деинсталлятор лежит в $CONF_DIR — удаляем себя
 #    до rm -rf; работающий скрипт продолжит выполняться)
 rm -f "$CONF_DIR/wdtt-uninstall"
+rm -f /opt/bin/wdtt-uninstall
 
 # 5. Удаление бинарника и конфигураций (включая пул и токен)
 rm -f "$INSTALL_DIR/$BIN_NAME"
@@ -169,6 +171,10 @@ echo "════════════════════════�
 EOF
 
     chmod +x /opt/etc/wdtt/wdtt-uninstall
+    # Симлинк в PATH (/opt/bin): команда wdtt-uninstall работает, при этом
+    # сам файл живёт в /opt/etc/wdtt (в PATH не входит).
+    mkdir -p /opt/bin
+    ln -sf /opt/etc/wdtt/wdtt-uninstall /opt/bin/wdtt-uninstall
 
     # ─────────────────────────── СКАЧИВАНИЕ БИНАРНИКА ───────────────────────────
 
