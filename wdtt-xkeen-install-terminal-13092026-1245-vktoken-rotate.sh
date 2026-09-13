@@ -229,8 +229,26 @@ EOF
         fi
         chmod 600 "$TOKEN_FILE"
 
+        # Валидация с ретраями: на роутере с малым объёмом RAM первая попытка
+        # может быть убита OOM-killer'ом ("Killed") — Go-рантайму помогает
+        # жёсткий лимит памяти (GOMEMLIMIT) и сброс страничного кэша.
+        drop_caches() {
+            sync 2>/dev/null || true
+            [ -w /proc/sys/vm/drop_caches ] && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+        }
         echo "Проверяю токен (создаётся один тестовый звонок VK)..."
-        if "$INSTALL_DIR/$BIN_NAME" -vk-regen-call -vk-token "$TOKEN_FILE" 2>/dev/null | grep -q "^CALL_HASH:"; then
+        drop_caches
+        TOKEN_OK=""
+        for vk_try in 1 2 3; do
+            if GOMEMLIMIT=60MiB GOGC=50 "$INSTALL_DIR/$BIN_NAME" -vk-regen-call -vk-token "$TOKEN_FILE" 2>/dev/null | grep -q "^CALL_HASH:"; then
+                TOKEN_OK=1
+                break
+            fi
+            echo "  ⏳ Попытка $vk_try/3 не удалась (нехватка памяти или сеть), повтор через 5с…"
+            sleep 5
+            drop_caches
+        done
+        if [ -n "$TOKEN_OK" ]; then
             echo "✅ Токен принят. Хеши VK клиент будет создавать сам из этого токена."
             break
         else
@@ -363,6 +381,9 @@ start() {
 
     echo "Starting wdtt-client (RAW-TUN + VK-токен)..."
 
+    # GOMEMLIMIT/GOGC: держим RSS Go-рантайма в узких рамках — на роутерах
+    # с малым RAM ядро иначе убивает клиента по OOM при пиках аллокаций.
+    GOMEMLIMIT=80MiB GOGC=50 \\
     \$PROG \\
         -mode rawtun \\
         -turn-tcp \\
