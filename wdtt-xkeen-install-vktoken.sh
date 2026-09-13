@@ -28,7 +28,7 @@ run_installer() {
     ASSET_MIPSLE="wdtt-client-mipsle"
     ASSET_ARM64="wdtt-client-arm64"
 
-    INSTALL_DIR="/opt/usr/bin"
+    INSTALL_DIR="/opt/etc/wdtt"
     CONF_DIR="/opt/etc/wdtt"
     BIN_NAME="wdtt-client"
     INIT_SCRIPT="/opt/etc/init.d/S99wdtt-client"
