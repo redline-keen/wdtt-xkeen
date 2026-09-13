@@ -100,7 +100,7 @@ run_installer() {
 
     # ─────────────────────────── СКРИПТ WDTT-UNINSTALL ───────────────────────────
 
-    echo "Создание скрипта удаления /opt/usr/bin/wdtt-uninstall..."
+    echo "Создание скрипта удаления /opt/etc/wdtt/wdtt-uninstall..."
     cat << 'EOF' > /opt/etc/wdtt/wdtt-uninstall
 #!/bin/sh
 set -e
