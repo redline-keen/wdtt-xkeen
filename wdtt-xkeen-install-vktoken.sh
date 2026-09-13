@@ -101,7 +101,7 @@ run_installer() {
     # ─────────────────────────── СКРИПТ WDTT-UNINSTALL ───────────────────────────
 
     echo "Создание скрипта удаления /opt/usr/bin/wdtt-uninstall..."
-    cat << 'EOF' > /opt/usr/bin/wdtt-uninstall
+    cat << 'EOF' > /opt/etc/wdtt/wdtt-uninstall
 #!/bin/sh
 set -e
 
@@ -110,7 +110,7 @@ echo " Начинаю полное удаление WDTT-клиента (RAW + V
 echo "════════════════════════════════════════════════════"
 
 CONF_DIR="/opt/etc/wdtt"
-INSTALL_DIR="/opt/usr/bin"
+INSTALL_DIR="/opt/etc/wdtt"
 BIN_NAME="wdtt-client"
 INIT_SCRIPT="/opt/etc/init.d/S99wdtt-client"
 CRON_FILE="/opt/var/spool/cron/crontabs/root"
@@ -142,14 +142,14 @@ rm -rf "$CONF_DIR"
 echo "✓ Файлы программы и конфигурации удалены."
 
 # 5. Самоудаление
-rm -f /opt/usr/bin/wdtt-uninstall
+rm -f /opt/etc/wdtt/wdtt-uninstall
 
 echo "════════════════════════════════════════════════════"
 echo "✅ WDTT-клиент (RAW + VK-токен) полностью снесён с роутера!"
 echo "════════════════════════════════════════════════════"
 EOF
 
-    chmod +x /opt/usr/bin/wdtt-uninstall
+    chmod +x /opt/etc/wdtt/wdtt-uninstall
 
     # ─────────────────────────── СКАЧИВАНИЕ БИНАРНИКА ───────────────────────────
 
@@ -323,7 +323,7 @@ EOF
 # Автозапуск wdtt-client (RAW-TUN + VK-токен) на Entware (Keenetic)
 
 ENABLED=yes
-PROG="/opt/usr/bin/wdtt-client"
+PROG="/opt/etc/wdtt/wdtt-client"
 CONF_DIR="/opt/etc/wdtt"
 PIDFILE="\$CONF_DIR/wdtt-client.pid"
 LOGFILE="\$CONF_DIR/wdtt-client.log"
