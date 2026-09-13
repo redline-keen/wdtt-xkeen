@@ -38,7 +38,7 @@ run_installer() {
 
     GH_OWNER="redline-keen"
     GH_REPO="wdtt-xkeen"
-    GH_TAG="1.2"
+    GH_TAG="1.3"
 
     ASSET_MIPSLE="wdtt-client-mipsle"
     ASSET_ARM64="wdtt-client-arm64"
